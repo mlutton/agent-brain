@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 6bd114c1cefce6269653bcd2e43e95e60ac59302d51cee335a594264563c2cbb
+Version: f5237ea5540b63a27feec27b23da968bbe75f7d31fb8b21b0c61b29b7304daab
 Publication: published — draft pull request for review; proposed, not accepted
 Status: **Proposed.** The beta is being specified, not implemented. Nothing described here exists yet.
 
@@ -47,7 +47,7 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 
 7. As a user, I want every managed document to carry the `kb` marker and the base fields, so that any document can be validated and discovered consistently.
 8. As an operator, I want validation to fail loudly, naming every invalid field of every invalid document, so that a problem is never silently skipped.
-9. As a user, I want uncertainty recorded field by field (`created: unknown`, `reviewed: never`, absent `fresh_until`, `kind: unknown`, `type: unclassified`, empty summary) independently of origin, so that a document with a known origin can still say what is unknown.
+9. As a user, I want uncertainty recorded field by field (`created: unknown`, `reviewed: never`, `kind: unknown`, `type: unclassified`, empty summary, with freshness unknown when `fresh_until` is absent) independently of origin, so that a document with a known origin can still say what is unknown.
 10. As a user, I want `needs_review` to list exactly the fields that hold uncertainty values, so that open questions about a document are visible in one place.
 11. As a user, I want `origin` to be one or more references with retrieval dates, or `authored`, or `unknown`, where only audit correction or an explicit human statement may set `unknown`, so that where content came from is always recorded honestly.
 12. As a user, I want type definitions to be data files read from the brain root, so that custom document types validate without code changes.
@@ -129,14 +129,14 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 
 ## Implementation Decisions
 
-Each decision is numbered (C1…C17) so stories can reference it. Field names, outcome names and command names below are part of the contract.
+Each decision is numbered (C1…C17, with C5a) so stories can reference it. Field names, outcome names and command names below are part of the contract.
 
 ### C1. Runtime and packaging
 
 - Supporting code is Python 3.11+ using only the standard library, plus the `git` command (2.30+) for git-backed brains. No package installation, daemon, network service, MCP server or Obsidian dependency.
-- One command-line entry point, `brain`, with subcommands `setup`, `validate`, `persist`, `recover`, `rebuild`, `discover`, `read`, `audit`, `ingest`, `grant`. In a brain it runs from the copied code under `.brain/`; in the starter it runs from the repository for development and tests.
+- One command-line entry point, `brain`, with subcommands `setup`, `validate`, `persist`, `recover`, `rebuild`, `discover`, `read`, `audit`, `ingest`, `grant`. It is invoked as `python3 bin/brain` from the starter repository root (development and tests) and as `python3 .brain/bin/brain` inside a brain; nothing is installed.
 - Every subcommand except `setup` requires `--root <brain>`; the root is never inferred from the working directory. Structured input is a JSON document on stdin or `--input <file>`. Output is exactly one JSON object on stdout carrying `outcome`.
-- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
+- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, and `invalid` from `validate`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
 
 ### C2. Brain layout and folder categories
 
@@ -173,8 +173,18 @@ The setup skill wraps this command and explains the private-repository recommend
 
 ### C4. Frontmatter subset and document versions
 
-- A managed document is a UTF-8 Markdown file starting with a `---` frontmatter block containing `kb: 1`.
-- Supported frontmatter subset: `key: value` lines where a value is a plain or quoted scalar, `[]`, a block list of scalars, or — for `origin` only — a block list of mappings with keys `ref` and `retrieved`. Anything else makes the file `invalid`. Code never re-serialises frontmatter; it appends lines.
+- A **managed document** is a UTF-8 Markdown file whose first line is `---`, followed by a frontmatter block closed by a `---` line, containing `kb: 1`.
+- A Markdown file with no frontmatter block, or with a block that parses within the subset but has no `kb` key, is **unmanaged**. It is not an error. Audit brings it under management (C12).
+- A file whose first line is `---` but whose block does not parse within the subset is **malformed** and reported `invalid`, whether or not a `kb` line is readable.
+- **Supported frontmatter subset:**
+  - Encoding and lines: UTF-8 without a byte-order mark. Lines end in LF or CRLF. Blank lines inside the block are allowed. Comment lines, duplicate keys and tab indentation make the file malformed.
+  - Each top-level line is `key: value` or `key:`. A key is lowercase letters, digits and `_`.
+  - Scalars: a **plain scalar** is everything after `: ` to the end of the line, with trailing spaces stripped; `#` and `: ` inside it are literal. A **quoted scalar** is enclosed in double quotes, with `\"` and `\\` as its only escapes. `key:` with nothing after it, and `key: ""`, are both the empty string.
+  - Lists: `key: []` is the only inline form and means an empty list. A **block list** is `key:` followed by items indented two spaces as `  - <scalar>`.
+  - `origin` alone may hold a block list of mappings. Each item is `  - ref: <scalar>` followed by `    retrieved: <scalar>` on the next line, in that order.
+  - Anything else — nested mappings, inline lists with items, mappings under other keys — is malformed.
+- Code never re-serialises frontmatter; it appends lines.
+- Dates are `YYYY-MM-DD`. `kb` must be the plain scalar `1`.
 - A document's **version** is the SHA-256 of its full file bytes.
 - A document **id** is minted once as a lowercase 26-character ULID, never reused, never derived from the path, and survives renames.
 
@@ -197,13 +207,44 @@ Optional: `fresh_until`, `first_seen`, `needs_review`, `supersedes`, `superseded
 | `evidence`, `derived_from`, `conflicts_with`, `supersedes` | lists of brain ids or external URLs |
 
 Rules:
-- Uncertainty values (`created: unknown`, `reviewed: never`, `kind: unknown`, `type: unclassified`, empty `summary`, a `retrieved: unknown`) are valid for any origin. `needs_review` must list exactly the fields holding them.
+- **Uncertainty values** are valid for any origin: `created: unknown`, `reviewed: never`, `kind: unknown`, `type: unclassified`, empty `summary`, `origin: unknown`, any `retrieved: unknown` (named as field `origin`), and any value a type definition declares under `uncertainty_values`.
+- `needs_review` must list exactly the fields holding uncertainty values, in any order. It is absent or `[]` when there are none.
+- An absent `fresh_until` means freshness is unknown, but it is not an uncertainty value for `needs_review`.
 - A `kind: unknown` document never counts as a source.
-- `origin: unknown` is accepted only on documents written by audit correction or carrying an explicit human statement recorded through a reviewed persist; `persist` refuses it otherwise.
+- `evidence`, `derived_from`, `conflicts_with` and `supersedes` entries are each an id (C4 shape) or an `http`/`https` URL.
+- **Who may write `origin: unknown`.** Validation accepts the value; the writing operations enforce who may write it. Audit correction may write it. `persist` refuses it unless the request is a reviewed write (C14).
 
-Base types: `note` (general authored note), `document` (processed item in `documents/`), `wiki-page` (synthesis in `wiki/`), `unclassified`. The `document` type additionally requires `source_identity`, `original` (relative path of the kept original) and `original_sha256`.
+Base types: `note` (general authored note; any durable data zone or module folder), `document` (processed item; `documents/` only), `wiki-page` (synthesis; `wiki/` only), `unclassified` (any durable data zone or module folder). The `document` type additionally requires `source_identity`, `original` (relative path of the kept original) and `original_sha256`.
 
-Type definition files are JSON: `{"type", "zones", "required", "allowed_values", "display_fields", "search_fields"}`. Base and module definitions are shipped system files; custom definitions live in `.brain/types/custom/`. Identity keys and relation types are post-beta.
+Type definitions:
+- **File shape.** Each definition is a JSON file named `<type>.json` with keys `type`, `zones` (list of zone folder names, or `["*"]` for any durable data zone or module folder), `required` (additional field names), `allowed_values` (object mapping field to list of allowed strings), `uncertainty_values` (object mapping field to one value, optional), `display_fields` and `search_fields` (lists).
+- **Locations.** Base definitions ship with the code, in the starter's `types/base/` and in a brain's `.brain/types/base/`, and are always read from beside the running code. Module definitions are in `.brain/modules/<module>/types/`. Custom definitions are in `<root>/.brain/types/custom/`.
+- **Enforcement.** Zones are enforced. A document whose `type` has no definition is invalid (`unknown_type`). A custom definition that reuses a base or module type name, has a malformed file, or has a file name that does not match its `type` makes validation's outcome `invalid`, with a `definitions` error.
+- Identity keys and relation types are post-beta.
+
+### C5a. Validate report
+
+`brain validate --root <brain>` scans every `.md` file under `documents/`, `wiki/` and installed module folders. It skips `inbox/`, `raw/`, hidden folders and non-Markdown files. Output:
+
+```json
+{
+  "outcome": "valid | invalid",
+  "counts": {"valid": 0, "invalid": 0, "unmanaged": 0},
+  "definitions": [{"path": "…", "code": "…", "message": "…"}],
+  "documents": [
+    {"path": "documents/x/x.md", "status": "valid | invalid | unmanaged",
+     "id": "… or null", "type": "… or null", "version": "sha256",
+     "errors": [{"field": "summary | null", "code": "missing | not_allowed | too_long | bad_format | needs_review_mismatch | unknown_type | wrong_zone | malformed", "message": "…"}]}
+  ]
+}
+```
+
+- `documents` lists every scanned file, sorted by path (POSIX, relative to the root).
+- An error's `field` is null only for `malformed`.
+- A document reports every error it has, not just the first.
+- `outcome` is `invalid` when any document is invalid or any definition error exists. An empty brain is `valid`.
+- Exit code: `0` for `valid`, `3` for `invalid`, `2` for a refused request (for example a missing or nonexistent `--root`).
+- Validation never writes to the brain.
 
 ### C6. Single-file persist
 
@@ -325,7 +366,7 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
 
 ### C15. Projects module
 
-- Folder `projects/<project-slug>/`. Types: `project` (required `project_status`: `active`, `paused`, `closed`; display fields `project_status`, `summary`) and `decision` (required `decision_status`: `proposed`, `accepted`, `superseded`; `decided` date or `unknown`; display fields `decision_status`, `decided`).
+- Folder `projects/<project-slug>/`. Types: `project` (required `project_status`: `active`, `paused`, `closed`; display fields `project_status`, `summary`) and `decision` (required `decision_status`: `proposed`, `accepted`, `superseded`; `decided` date or `unknown`, with `unknown` declared under `uncertainty_values`; display fields `decision_status`, `decided`).
 - Module documents use the same base fields, persistence, discovery and audit as base documents; nothing in the code names these types.
 
 ### C16. Claude entry path

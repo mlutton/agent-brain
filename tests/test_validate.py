@@ -1,5 +1,6 @@
 """Tests for `brain validate` (ST-01), against docs/specification/beta.md."""
 
+import collections
 import hashlib
 import json
 import os
@@ -1437,14 +1438,21 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         )
 
     def test_definition_errors(self):
-        self.write(".brain/types/custom/note.json", json.dumps({"type": "note", "zones": ["*"]}))  # missing keys -> shadows or invalid
+        # This file both lacks required keys and reuses the base type name.
+        # C5a states no multiplicity or precedence between invalid_definition
+        # and shadows_type; the expected collection pins the current
+        # behaviour, where the file's shape is checked first and a failed
+        # custom definition file reports exactly one definitions entry.
+        self.write(".brain/types/custom/note.json", json.dumps({"type": "note", "zones": ["*"]}))
         self.write("documents/base_note.md", note_doc())
 
         proc, report = self.validate(expect_paths={"documents/base_note.md"})
         self.assertEqual(proc.returncode, 3)
         self.assertEqual(report["outcome"], "invalid")
-        codes = {d["code"] for d in report["definitions"]}
-        self.assertTrue({"invalid_definition", "shadows_type"} & codes)
+        self.assertEqual(
+            collections.Counter((d["path"], d["code"]) for d in report["definitions"]),
+            collections.Counter([(".brain/types/custom/note.json", "invalid_definition")]),
+        )
         base_note_doc = support.doc_by_path(report, "documents/base_note.md")
         self.assertEqual(base_note_doc["status"], "valid")
 
@@ -1465,8 +1473,10 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         )
         self.write("documents/base_note.md", note_doc())
         _proc, report = self.validate(expect_paths={"documents/base_note.md"})
-        codes = {d["code"] for d in report["definitions"]}
-        self.assertIn("shadows_type", codes)
+        self.assertEqual(
+            collections.Counter((d["path"], d["code"]) for d in report["definitions"]),
+            collections.Counter([(".brain/types/custom/note.json", "shadows_type")]),
+        )
         self.assertEqual(support.doc_by_path(report, "documents/base_note.md")["status"], "valid")
 
     def test_name_mismatch_and_dual_unknown(self):
@@ -1507,8 +1517,10 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         _proc, report = self.validate(
             expect_paths={"documents/recipe_doc.md", "documents/dish_doc.md"}
         )
-        codes = {d["code"] for d in report["definitions"]}
-        self.assertIn("name_mismatch", codes)
+        self.assertEqual(
+            collections.Counter((d["path"], d["code"]) for d in report["definitions"]),
+            collections.Counter([(".brain/types/custom/recipe.json", "name_mismatch")]),
+        )
         for type_name in ("recipe", "dish"):
             doc = support.doc_by_path(report, f"documents/{type_name}_doc.md")
             support.assert_errors(self, doc, [("type", "unknown_type")])
@@ -1517,8 +1529,10 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         self.write(".brain/types/custom/broken.json", "{not valid json")
         self.write("documents/base_note.md", note_doc())
         _proc, report = self.validate(expect_paths={"documents/base_note.md"})
-        codes = {d["code"] for d in report["definitions"]}
-        self.assertIn("malformed_definition", codes)
+        self.assertEqual(
+            collections.Counter((d["path"], d["code"]) for d in report["definitions"]),
+            collections.Counter([(".brain/types/custom/broken.json", "malformed_definition")]),
+        )
 
 
 class TestBaseTypesReadBesideCode(TempBrainTestCase):

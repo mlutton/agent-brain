@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 831ae9c82b4ed02a5b6efc8cfbe3607d49dd052ebd050abf29c799155dda1d28
+Version: ab2ce435b845fe92b04cffd11445683441f124b79570ac06edb653db01362935
 Publication: published — accepted by merge of #2
 Status: **Accepted specification; not implemented.** Nothing described here exists yet. Delivery stories are opened as issues referencing this version.
 
@@ -51,7 +51,7 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 10. As a user, I want `needs_review` to list exactly the fields that hold uncertainty values, so that open questions about a document are visible in one place.
 11. As a user, I want `origin` to be one or more references with retrieval dates, or `authored`, or `unknown`, where only audit correction or an explicit human statement may set `unknown`, so that where content came from is always recorded honestly.
 12. As a user, I want type definitions to be data files read from the brain root, so that custom document types validate without code changes.
-13. As an operator, I want malformed frontmatter (not valid YAML, not a mapping, duplicate property names) reported as `invalid`, and valid YAML that the brain cannot safely edit reported as unsupported, both never modified, so that damaged or unusual notes are surfaced, not rewritten.
+13. As an operator, I want malformed frontmatter (not valid YAML, not a mapping, duplicate property names) reported as `invalid`, and valid YAML that the brain cannot safely edit reported as unsupported for editing (not an error), both never modified, so that damaged or unusual notes are surfaced, not rewritten.
 
 ### Persistence
 
@@ -141,14 +141,27 @@ Each decision is numbered (C1…C17, with C5a and C13a) so stories can reference
 
 ### C1. Runtime and packaging
 
-- Supporting code is Python 3.11+ using the standard library plus **one vendored library, PyYAML** (pure-Python build, MIT licence, exact version pinned), used only to parse frontmatter. It also uses the `git` command (2.30+) for git-backed brains. No package installation, daemon, network service, MCP server or Obsidian dependency.
-- **Dependency policy (proposed in this revision).** Obsidian stores properties as YAML, so the frontmatter reader must follow YAML rather than an invented subset. The vendored parser implements YAML 1.1. The written form (C4) quotes all text so that it reads the same under YAML 1.1 and 1.2. Dates are the one documented difference, and the reader accepts either reading. How Obsidian's own parser treats these files has not been exercised; it is checked manually during acceptance (S-G4(g)). PyYAML's source and licence ship in the starter's `vendor/` folder, and setup copies them into the brain, so users still install nothing.
+- Supporting code is Python 3.11+ using the standard library plus **one vendored library, PyYAML 6.0.3** (pure-Python build, MIT licence; record below), used only to parse frontmatter. It also uses the `git` command (2.30+) for git-backed brains. No package installation, daemon, network service, MCP server or Obsidian dependency.
+- **Dependency policy.** Obsidian stores properties as YAML, so the frontmatter reader must follow YAML rather than an invented subset. The vendored parser implements YAML 1.1. The written form (C4) quotes all text so that it reads the same under YAML 1.1 and 1.2. Dates are the one documented difference, and the reader accepts either reading. How Obsidian's own parser treats these files has not been exercised; it is checked manually during acceptance (S-G4(g)). PyYAML's source and licence ship in the starter's `vendor/` folder, and setup copies them into the brain, so users still install nothing.
   - Tradeoff: upstream fixes are adopted by deliberately bumping the pinned copy, and the optional C accelerator is not used.
   - Alternative considered: require the user to install PyYAML. Rejected because it adds a setup step and version drift.
   - The dependency is never used to write frontmatter (C4).
+- **Vendored dependency record.**
+
+  | Item | Value |
+  | --- | --- |
+  | Package | PyYAML 6.0.3 (MIT) |
+  | Source | PyPI sdist `pyyaml-6.0.3.tar.gz`, `https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz` |
+  | Source SHA-256 | `d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f` |
+  | Vendored files | the 17 files of the sdist's `lib/yaml/`, unmodified, at `vendor/yaml/`; the sdist's `LICENSE`, unmodified, at `vendor/PyYAML-LICENSE` |
+  | Record in the repository | `vendor/VENDORED.md`: package, version, source URL, source SHA-256, and the SHA-256 of every vendored file |
+
+  - **Loading.** The code puts its own `vendor/` directory first on the import path. Before any use, it confirms that the loaded module's file lies inside that directory and that `yaml.__version__` is `6.0.3`. Otherwise it stops with exit `1` and `{"outcome": "error", "reason": "vendored_dependency"}`. An installed PyYAML elsewhere is never used.
+  - **Loaders.** Only PyYAML's pure-Python safe loader is used, subclassed for duplicate-key detection. The C loaders, full or unsafe loaders, and dumpers are never used.
+  - Changing the version or files is a change to this record.
 - One command-line entry point, `brain`, with subcommands `setup`, `validate`, `persist`, `recover`, `rebuild`, `discover`, `read`, `audit`, `ingest`, `grant`. It is invoked as `python3 bin/brain` from the starter repository root (development and tests) and as `python3 .brain/bin/brain` inside a brain; nothing is installed.
 - Every subcommand except `setup` requires `--root <brain>`; the root is never inferred from the working directory. Structured input is a JSON document on stdin or `--input <file>`. Output is exactly one JSON object on stdout carrying `outcome`.
-- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, and `invalid` from `validate`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
+- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, and `invalid` from `validate`); `1` an unhandled error or a `vendored_dependency` failure. The JSON `outcome` is authoritative; exit codes are a convenience.
 
 ### C2. Brain layout and folder categories
 
@@ -197,22 +210,22 @@ The setup skill wraps this command and explains the private-repository recommend
 - A document's **version** is the SHA-256 of its full file bytes.
 - A document **id** is minted once as a lowercase 26-character ULID (Crockford base32 alphabet, without `i`, `l`, `o`, `u`). It is never reused, never derived from the path, and survives renames.
 
-**Frontmatter is YAML, as in Obsidian properties.** A Markdown file has frontmatter when its first line, after an optional UTF-8 byte-order mark, is `---` and a later line is `---`. The block between is parsed with a YAML safe loader. Code additionally detects duplicate property names, which the loader alone would silently resolve to the last value. A file whose role is a retained original or attachment (C13a) is classified by role first and never by the table below. Every other Markdown file is exactly one of:
+**Frontmatter is YAML, as in Obsidian properties.** A Markdown file has frontmatter when its first line, after an optional UTF-8 byte-order mark, is `---` and a later line is `---`. Line endings may be LF or CRLF. The block between is parsed with the vendored safe loader (C1). Code additionally detects duplicate property names, which the loader alone would silently resolve to the last value. A block that is empty, or holds only blank lines and comments, is an empty mapping. A file whose role is a retained original or attachment (C13a) is classified by role first and never by the table below. Every other Markdown file is exactly one of:
 
 | Class | Condition | Treatment |
 | --- | --- | --- |
 | `unmanaged` | no frontmatter, or a valid YAML mapping with no `kb` property | a user note; audit may bring it under management (C12) |
-| `managed` | valid YAML mapping with `kb: 1` | validated against C5 |
+| `managed` | valid YAML mapping whose `kb` parses to the integer 1 | validated against C5 |
 | `unsupported_version` | `kb` holds any other integer (booleans are not integers) | reported; never validated as `kb: 1`, indexed as a candidate, corrected or written |
-| `malformed` | unclosed block, invalid YAML, a top-level value that is not a mapping, duplicate property names, or `kb` holding a non-integer | reported `invalid`; never written |
+| `malformed` | a file that is not valid UTF-8; an unclosed block; invalid YAML; a value the loader cannot construct (for example the date `2026-02-30`); a top-level value that is not a mapping; duplicate property names; or `kb` holding anything other than an integer (a boolean, string, float or null) | reported `invalid`; never written |
 
-Valid YAML is **unsupported for editing**, but not malformed, when the block uses anchors, aliases, explicit tags, multiple documents, or flow style for the whole mapping (for example JSON-style frontmatter, which Obsidian also accepts). Such a note keeps its class above. Operations that would have to change the block refuse with `unsupported_frontmatter` and leave the file byte-identical.
+Valid YAML is **unsupported for editing**, but not malformed, when the block uses anchors, aliases, explicit tags, multiple documents, or flow style for the whole mapping (for example JSON-style frontmatter, which Obsidian also accepts). Such a note keeps its class above; validation reports this through the document's `frontmatter` field and is not an error (C5a). Operations that would have to change the block refuse with `unsupported_frontmatter` and leave the file byte-identical.
 
 **Reading values.**
 - A text property must parse to a string; an empty value (`summary:`, which editors write) is accepted as the empty string.
 - An unquoted value that the parser reads as something else is `invalid` with code `ambiguous_scalar` and a hint to quote it. It is never coerced. Under the vendored YAML 1.1 parser, `yes` becomes a boolean, `[[Link]]` becomes a nested list and `12` becomes a number.
-- A date property accepts a YAML date or a `YYYY-MM-DD` string.
-- An empty value is YAML null.
+- A date property accepts a YAML date, or a `YYYY-MM-DD` string that is a real calendar date. A date-time value (for example `2026-09-14T10:00:00Z`) or any other string is `bad_format`.
+- An empty value, `~` and `null` are YAML null. A text property reads null as the empty string.
 - `#` preceded by a space begins a YAML comment. An unquoted `: ` inside a value is a YAML error. Values containing either must be quoted.
 
 **Canonical written form.** Code writes text always quoted, and leaves only the `kb` integer, empty values, `[]` and dates unquoted, using the property formats Obsidian documents. Unquoted `YYYY-MM-DD` dates are the one value a YAML 1.1 parser reads as a date and a 1.2 core-schema parser reads as a string; both readings are accepted (see *Reading values*):
@@ -271,28 +284,64 @@ Type definitions:
 
 ### C5a. Validate report
 
-`brain validate --root <brain>` scans every `.md` file under `documents/`, `wiki/` and installed module folders. It skips `inbox/`, `raw/`, hidden folders and non-Markdown files. Output:
+**Scan.** `brain validate --root <brain>` scans every file whose name ends in lowercase `.md` under `documents/`, `wiki/` and installed module folders.
+- A module is installed when `.brain/modules/<module>/module.json` exists and names its folder (`{"module": "projects", "folder": "projects"}`). Without that file, no module folder is scanned.
+- It skips `inbox/`, `raw/`, hidden folders and hidden files (names starting with `.`) and other files.
+- Symbolic links are not followed. Each is listed under `skipped` with reason `symlink`, so nothing is skipped silently.
+
+**Output.**
 
 ```json
 {
   "outcome": "valid | invalid",
   "counts": {"valid": 0, "invalid": 0, "unmanaged": 0, "unsupported_version": 0, "retained": 0},
-  "definitions": [{"path": "…", "code": "…", "message": "…"}],
+  "definitions": [{"path": "…", "code": "malformed_definition | invalid_definition | name_mismatch | shadows_type", "message": "…"}],
+  "skipped": [{"path": "…", "reason": "symlink"}],
   "documents": [
     {"path": "documents/x/x.md", "status": "valid | invalid | unmanaged | unsupported_version | retained",
-     "id": "… or null", "type": "… or null", "version": "sha256",
-     "errors": [{"field": "summary | null", "code": "missing | not_allowed | too_long | bad_format | ambiguous_scalar | needs_review_mismatch | unknown_type | wrong_zone | malformed | unsupported_frontmatter | retained_changed", "message": "…"}]}
+     "frontmatter": "none | supported | unsupported_for_editing | malformed",
+     "frontmatter_features": ["anchor | alias | tag | multiple_documents | flow_mapping"],
+     "id": "… or null", "type": "… or null", "version": "sha256 of the file bytes",
+     "errors": [{"field": "summary | null", "code": "missing | not_allowed | too_long | bad_format | ambiguous_scalar | needs_review_mismatch | unknown_type | wrong_zone | malformed | retained_changed | retained_missing", "message": "…"}]}
   ]
 }
 ```
 
-- `documents` lists every scanned file, sorted by path (POSIX, relative to the root).
-- An error's `field` is null only for `malformed` and `unsupported_frontmatter`.
-- Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. A retained file whose bytes no longer match its recorded hash carries `retained_changed`; a retained path whose file is gone is still listed, with `retained_missing`. Either makes the outcome `invalid`. A retained file keeps status `retained` whatever its current bytes.
+**Listing and order.**
+- `documents` lists every scanned file exactly once, plus retained paths whose file is missing. It is sorted by the relative POSIX path string in code-point order.
+- `counts` add up to the number of entries in `documents`.
+
+**Statuses and outcome.**
+
+| Status | Errors | Effect on `outcome` |
+| --- | --- | --- |
+| `valid` | none | none |
+| `invalid` | at least one | makes it `invalid` |
+| `unmanaged` | none | none |
+| `unsupported_version` | none; C5 is not applied | none — the document is in a newer or different format, not wrong in this one. It is visible through `counts`, and discovery treats it as incomplete coverage (C9). |
+| `retained` | `retained_changed` or `retained_missing` when integrity fails | makes it `invalid` only when it carries one of those errors |
+
+**Frontmatter field.**
+- `frontmatter` records what was found: `none` (no block), `supported`, `unsupported_for_editing` (with `frontmatter_features` naming why), or `malformed`.
+- `unsupported_for_editing` is never an error and never changes a document's status or the outcome. It tells later operations that the block cannot be edited in place.
+
+**Errors.**
+- `field` is null only for `malformed`. A malformed file has exactly one error, `malformed`.
 - A document reports every error it has, not just the first.
-- `outcome` is `invalid` when any document is invalid or any definition error exists. An empty brain is `valid`.
-- Exit code: `0` for `valid`, `3` for `invalid`, `2` for a refused request (for example a missing or nonexistent `--root`).
-- Validation never writes to the brain.
+- A required property that is absent, null or empty where C5 does not allow empty is `missing`. An empty `title` is `missing`.
+- `wrong_zone` names field `type`.
+- When `type` is absent or unknown, only that error is reported for type-dependent rules (zones, type-specific requirements).
+- Duplicate entries in `needs_review`, an `origin` list that is empty, and an `original_sha256` that is not 64 lowercase hexadecimal characters are each `bad_format`.
+- `source_identity` must be non-empty text.
+
+**Definitions.** A custom definition that cannot be parsed as JSON is `malformed_definition`. One with missing or wrongly typed keys is `invalid_definition`. One whose file name differs from its `type` is `name_mismatch`. One reusing a base or module type name is `shadows_type`. A failed custom definition is ignored entirely: it defines no type and overrides nothing. A document is `unknown_type` exactly when no valid base, module or custom definition defines its `type`. So a failed `note.json` leaves the base `note` type in force, and a `recipe.json` declaring `dish` defines neither `recipe` nor `dish`.
+
+**Retained files.** Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. Role identity needs publication records from git history. Validate reads them only when the root is a git repository, runs git read-only, and treats a brain without git as having no retained files. A retained file whose bytes no longer match its recorded hash carries `retained_changed`; a retained path whose file is gone is still listed, with `retained_missing`.
+
+**Result.**
+- `outcome` is `invalid` when any document is `invalid`, any retained entry carries an error, or any definition error exists. An empty brain is `valid`.
+- Exit code: `0` for `valid`, `3` for `invalid`. A refused request — a missing, nonexistent or non-directory `--root`, or an unknown subcommand — exits `2` and still prints one JSON object with `outcome: "refused"` and a `reason`.
+- Validation never writes to the brain, including caches or bytecode.
 
 ### C6. Single-file persist
 
@@ -473,7 +522,7 @@ A file whose bytes equal a `retained_missing` path's recorded hash at another, u
 
 ### C15. Projects module
 
-- Folder `projects/<project-slug>/`. Types: `project` (required `project_status`: `active`, `paused`, `closed`; display fields `project_status`, `summary`) and `decision` (required `decision_status`: `proposed`, `accepted`, `superseded`; `decided` a date, or empty declared under `uncertainty_values`; display fields `decision_status`, `decided`).
+- Folder `projects/<project-slug>/`; installed with `.brain/modules/projects/module.json` (`{"module": "projects", "folder": "projects"}`) and its type definitions in `.brain/modules/projects/types/`. Types: `project` (required `project_status`: `active`, `paused`, `closed`; display fields `project_status`, `summary`) and `decision` (required `decision_status`: `proposed`, `accepted`, `superseded`; `decided` a date, or empty declared under `uncertainty_values`; display fields `decision_status`, `decided`).
 - Module documents use the same base fields, persistence, discovery and audit as base documents; nothing in the code names these types.
 
 ### C16. Claude entry path

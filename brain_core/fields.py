@@ -132,11 +132,7 @@ def validate_mapping(mapping, type_registry, zone):
             if field in mapping and not _is_missing(value, field) and value not in allowed:
                 errors.append((field, "not_allowed"))
 
-    if type_def is not None:
-        # When the type does not resolve, the type error already reported above
-        # is the only error raised for it: needs_review is not checked against
-        # fields that only a type definition could declare.
-        _check_needs_review(mapping, type_def, errors)
+    _check_needs_review(mapping, type_def, errors)
 
     return errors
 
@@ -276,6 +272,14 @@ def _uncertain_fields(mapping, type_def):
     return uncertain
 
 
+# The needs_review shape rules (not a list, non-string entries, duplicates)
+# always apply. When the type does not resolve, only entries naming a base
+# field are checked against the base uncertainty rules (C5a); an entry
+# naming any other field is a type-dependent rule and is not evaluated --
+# neither required nor reported as extraneous.
+_BASE_NEEDS_REVIEW_FIELDS = {"created", "reviewed", "kind", "type", "summary", "origin"}
+
+
 def _check_needs_review(mapping, type_def, errors):
     uncertain = _uncertain_fields(mapping, type_def)
     needs_review = mapping.get("needs_review")
@@ -289,5 +293,9 @@ def _check_needs_review(mapping, type_def, errors):
     if len(needs_review) != len(set(needs_review)):
         errors.append(("needs_review", "bad_format"))
         return
-    if set(needs_review) != uncertain:
+    if type_def is None:
+        relevant = {item for item in needs_review if item in _BASE_NEEDS_REVIEW_FIELDS}
+    else:
+        relevant = set(needs_review)
+    if relevant != uncertain:
         errors.append(("needs_review", "needs_review_mismatch"))

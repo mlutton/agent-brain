@@ -132,7 +132,11 @@ def validate_mapping(mapping, type_registry, zone):
             if field in mapping and not _is_missing(value, field) and value not in allowed:
                 errors.append((field, "not_allowed"))
 
-    _check_needs_review(mapping, type_def, errors)
+    if type_def is not None:
+        # When the type does not resolve, the type error already reported above
+        # is the only error raised for it: needs_review is not checked against
+        # fields that only a type definition could declare.
+        _check_needs_review(mapping, type_def, errors)
 
     return errors
 
@@ -231,7 +235,7 @@ def _check_reference_list_field(mapping, field, errors, required):
 def _uncertain_fields(mapping, type_def):
     """Fields holding a declared uncertainty value (C5). A field that is simply
     absent is "missing", not uncertain -- uncertainty is a value an editor wrote
-    (an empty property), not the omission of a required property (VF-06)."""
+    (an empty property), not the omission of a required property."""
     uncertain = set()
     created = mapping.get("created")
     if "created" in mapping and (created is None or (isinstance(created, str) and created == "")):
@@ -258,9 +262,14 @@ def _uncertain_fields(mapping, type_def):
                     break
     if type_def is not None:
         for field, marker in type_def.uncertainty_values.items():
+            # A type-declared field that is simply absent is "missing", not
+            # uncertain -- same rule as the base fields above: uncertainty is
+            # a value an editor wrote, never the omission of a property.
+            if field not in mapping:
+                continue
             value = mapping.get(field)
             if marker is None or marker == "":
-                if field not in mapping or value is None or value == "":
+                if value is None or value == "":
                     uncertain.add(field)
             elif value == marker:
                 uncertain.add(field)

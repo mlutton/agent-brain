@@ -20,8 +20,7 @@ def scan_zones(root, module_folders):
     for zone in zones:
         zone_path = os.path.join(root, zone)
         if os.path.islink(zone_path):
-            if os.path.isdir(zone_path):
-                skipped.append({"path": _rel_posix(root, zone_path), "reason": "symlink"})
+            skipped.append({"path": _rel_posix(root, zone_path), "reason": "symlink"})
             continue
         if not os.path.isdir(zone_path):
             continue

@@ -75,7 +75,10 @@ def load_base_types(base_dir):
         registry.types[data["type"]] = type_def
         for field in _UNIVERSAL_ALLOWED_VALUE_FIELDS:
             if field in type_def.allowed_values:
-                registry.base_allowed_values[field] = type_def.allowed_values[field]
+                union = registry.base_allowed_values.setdefault(field, [])
+                for value in type_def.allowed_values[field]:
+                    if value not in union:
+                        union.append(value)
     return registry
 
 
@@ -146,6 +149,8 @@ def detect_installed_modules(root):
             with open(module_json, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
             continue
         folder = data.get("folder")
         module = data.get("module")

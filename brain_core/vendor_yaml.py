@@ -45,8 +45,11 @@ def make_duplicate_safe_loader(yaml_module):
                 raise yaml_module.constructor.ConstructorError(
                     None, None, "expected a mapping node", node.start_mark
                 )
+            merge_tag = "tag:yaml.org,2002:merge"
+            own_key_ids = {id(key_node) for key_node, _ in node.value if key_node.tag != merge_tag}
             self.flatten_mapping(node)
             mapping = {}
+            seen_own_keys = set()
             for key_node, value_node in node.value:
                 key = self.construct_object(key_node, deep=deep)
                 try:
@@ -58,13 +61,19 @@ def make_duplicate_safe_loader(yaml_module):
                         f"found unhashable key ({exc})",
                         key_node.start_mark,
                     )
-                if key in mapping:
-                    raise yaml_module.constructor.ConstructorError(
-                        "while constructing a mapping",
-                        node.start_mark,
-                        f"found duplicate key: {key!r}",
-                        key_node.start_mark,
-                    )
+                # A key merged in via << is not a duplicate of the mapping's own
+                # explicit key that overrides it, nor of another merge source's
+                # matching key; only two of the mapping's own explicit keys can
+                # collide (standard YAML 1.1 merge-key semantics).
+                if id(key_node) in own_key_ids:
+                    if key in seen_own_keys:
+                        raise yaml_module.constructor.ConstructorError(
+                            "while constructing a mapping",
+                            node.start_mark,
+                            f"found duplicate key: {key!r}",
+                            key_node.start_mark,
+                        )
+                    seen_own_keys.add(key)
                 value = self.construct_object(value_node, deep=deep)
                 mapping[key] = value
             return mapping

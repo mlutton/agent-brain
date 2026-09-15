@@ -2259,5 +2259,404 @@ class TestMergeAndUncertaintyRegressions(TempBrainTestCase):
         )
 
 
+class TestMergeFlatteningReuse(TempBrainTestCase):
+    """A mapping that holds a merge key and is reached more than once --
+    constructed and also merged, merged from two places, merged through an
+    aliased sequence, or nested inside another merge source -- loads with the
+    values stock PyYAML SafeLoader gives it. Duplicate explicit keys stay
+    malformed in every mapping, however often it is reached.
+
+    Each accepted fixture's comment records the value `yaml.safe_load` gives
+    for the block. Each rejected fixture's comment records that stock loads it
+    last-wins, so rejecting it is this loader's own duplicate-key rule (C4)."""
+
+    _OTHER_VALID_FIELDS: ClassVar[list] = [
+        'id: "01arz3ndektsv4rrffq69g5fav"',
+        'type: "note"',
+        'summary: "S"',
+        'created: "2026-01-01"',
+        'reviewed: "2026-01-01"',
+        'origin: "authored"',
+        'evidence: []',
+        'kind: "source"',
+        'authored_by: "human"',
+        'retention: "durable"',
+    ]
+
+    def _doc(self, extra_lines):
+        """A complete managed document: kb: 1, extra_lines (which supply title
+        and status, directly or via merge), and every other required field
+        holding an ordinary valid value."""
+        lines = ["---", "kb: 1", *extra_lines, *self._OTHER_VALID_FIELDS, "---"]
+        return "\n".join(lines) + "\nbody\n"
+
+    def _assert_cases(self, cases):
+        """Writes every (path, extra_lines, expected_errors) case, validates
+        once against exactly that path set, then checks each document's
+        complete error multiset."""
+        for path, extra_lines, _expected in cases:
+            self.write(path, self._doc(extra_lines))
+        _proc, report = self.validate(expect_paths={path for path, _lines, _expected in cases})
+        for path, _lines, expected in cases:
+            support.assert_errors(self, support.doc_by_path(report, path), expected, path)
+
+    # Accepted: a merge-bearing source reached more than once.
+
+    def test_reused_source_with_override_merged_again(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"
+                (
+                    "documents/reuse_flow.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "bogus"}',
+                        'mid: &m {<<: *b, status: "draft"}',
+                        "<<: *m",
+                    ],
+                    [],
+                ),
+                # stock: status == "draft"
+                (
+                    "documents/reuse_block.md",
+                    [
+                        'title: "T"',
+                        "base: &b",
+                        '  status: "bogus"',
+                        "mid: &m",
+                        "  <<: *b",
+                        '  status: "draft"',
+                        "<<: *m",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_reused_source_with_invalid_override_merged_again(self):
+        self._assert_cases(
+            [
+                # stock: status == "bogus" (the source's explicit key wins)
+                (
+                    "documents/reuse_reverse.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "draft"}',
+                        'mid: &m {<<: *b, status: "bogus"}',
+                        "<<: *m",
+                    ],
+                    [("status", "not_allowed")],
+                ),
+            ]
+        )
+
+    def test_source_with_merge_merged_into_one_and_into_two_mappings(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"; x == y == {"status": "draft"}
+                (
+                    "documents/merged_into_two.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "bogus"}',
+                        'mid: &m {<<: *b, status: "draft"}',
+                        "x: &x {<<: *m}",
+                        "y: {<<: *m}",
+                        "<<: *x",
+                    ],
+                    [],
+                ),
+                # stock: status == "draft"; x == {"status": "draft"}
+                (
+                    "documents/merged_into_one.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "bogus"}',
+                        'mid: &m {<<: *b, status: "draft"}',
+                        "x: &x {<<: *m}",
+                        "<<: *x",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_reused_multi_source_merge_with_shared_key_first_source_wins(self):
+        self._assert_cases(
+            [
+                # stock: status == "bogus"
+                (
+                    "documents/multi_source_first_bogus.md",
+                    [
+                        'title: "T"',
+                        'b1: &b1 {status: "bogus"}',
+                        'b2: &b2 {status: "draft"}',
+                        "mid: &m {<<: [*b1, *b2]}",
+                        "<<: *m",
+                    ],
+                    [("status", "not_allowed")],
+                ),
+                # stock: status == "draft"
+                (
+                    "documents/multi_source_first_draft.md",
+                    [
+                        'title: "T"',
+                        'b1: &b1 {status: "bogus"}',
+                        'b2: &b2 {status: "draft"}',
+                        "mid: &m {<<: [*b2, *b1]}",
+                        "<<: *m",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_reuse_through_aliased_sequence_of_mappings(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"; x == [{"status": "draft"}]
+                (
+                    "documents/aliased_sequence_direct.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "bogus"}',
+                        'x: &x [{<<: *b, status: "draft"}]',
+                        "<<: *x",
+                    ],
+                    [],
+                ),
+                # stock: status == "draft"; y == {"status": "draft"}
+                (
+                    "documents/aliased_sequence_via_mapping.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "bogus"}',
+                        'x: &x [{<<: *b, status: "draft"}]',
+                        "y: &y {<<: *x}",
+                        "<<: *y",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_same_merge_bearing_source_listed_twice(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"
+                (
+                    "documents/merge_list_repeats_source.md",
+                    [
+                        'title: "T"',
+                        'base: &b {status: "bogus"}',
+                        'mid: &m {<<: *b, status: "draft"}',
+                        "<<: [*m, *m]",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_inline_source_nested_in_inline_source_merged_again(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"; x == {"status": "draft"}
+                (
+                    "documents/nested_inline_reused.md",
+                    [
+                        'title: "T"',
+                        'x: {<<: &m {<<: {status: "bogus"}, status: "draft"}}',
+                        "<<: *m",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_aliased_keys_in_and_over_a_reused_source(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"
+                (
+                    "documents/aliased_keys_in_reused_source.md",
+                    [
+                        'title: "T"',
+                        "sk: &sk status",
+                        'base: &b {*sk : "bogus"}',
+                        'mid: &m {<<: *b, *sk : "draft"}',
+                        "<<: *m",
+                    ],
+                    [],
+                ),
+                # stock: status == "draft"; x == {"status": "bogus"}
+                (
+                    "documents/aliased_key_overrides_reused_source.md",
+                    [
+                        'title: "T"',
+                        "sk: &sk status",
+                        'base: &b {status: "draft"}',
+                        'mid: &m {<<: *b, status: "bogus"}',
+                        "x: {<<: *m}",
+                        '*sk : "draft"',
+                        "<<: *m",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_self_recursive_merge(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"
+                (
+                    "documents/self_recursive_merge.md",
+                    [
+                        'title: "T"',
+                        'x: &a {<<: [*a, {status: "bogus"}], status: "draft"}',
+                        "<<: *a",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_value_key_in_document_and_in_reused_source(self):
+        self._assert_cases(
+            [
+                # stock: {"=": 1, "status": "draft", ...}
+                (
+                    "documents/value_key_in_document.md",
+                    ['title: "T"', 'status: "draft"', "=: 1"],
+                    [],
+                ),
+                # stock: {"=": 1, "status": "draft", ...}; x == {"=": 1, "status": "draft"}
+                (
+                    "documents/value_key_in_reused_source.md",
+                    [
+                        'title: "T"',
+                        'b: &b {=: 1, status: "draft"}',
+                        "x: {<<: *b}",
+                        "<<: *b",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+    def test_repeated_merge_keys_later_one_wins(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft"
+                (
+                    "documents/repeated_merge_later_draft.md",
+                    [
+                        'title: "T"',
+                        'b1: &b1 {status: "bogus"}',
+                        'b2: &b2 {status: "draft"}',
+                        "<<: *b1",
+                        "<<: *b2",
+                    ],
+                    [],
+                ),
+                # stock: status == "bogus"
+                (
+                    "documents/repeated_merge_later_bogus.md",
+                    [
+                        'title: "T"',
+                        'b1: &b1 {status: "draft"}',
+                        'b2: &b2 {status: "bogus"}',
+                        "<<: *b1",
+                        "<<: *b2",
+                    ],
+                    [("status", "not_allowed")],
+                ),
+            ]
+        )
+
+    # Rejected: duplicate explicit keys, wherever the mapping is reached.
+    # Stock loads every fixture below last-wins.
+
+    def test_duplicate_keys_rejected_in_every_mapping(self):
+        self._assert_cases(
+            [
+                # stock: status == "draft" (last wins)
+                (
+                    "documents/dup_top_level_beside_merge.md",
+                    [
+                        'title: "T"',
+                        "b: &b {c: 1}",
+                        'status: "bogus"',
+                        'status: "draft"',
+                        "<<: *b",
+                    ],
+                    [(None, "malformed")],
+                ),
+                # stock: status == "draft" (last wins)
+                (
+                    "documents/dup_inline_source.md",
+                    ['title: "T"', '<<: {status: "bogus", status: "draft"}'],
+                    [(None, "malformed")],
+                ),
+                # stock: status == "draft" (last wins)
+                (
+                    "documents/dup_anchored_source_reused.md",
+                    [
+                        'title: "T"',
+                        'd: &d {status: "bogus", status: "draft"}',
+                        "x: {<<: *d}",
+                        "<<: *d",
+                    ],
+                    [(None, "malformed")],
+                ),
+                # stock: status == "draft" (last wins)
+                (
+                    "documents/dup_nested_inline_source.md",
+                    ['title: "T"', '<<: {<<: {status: "bogus", status: "draft"}}'],
+                    [(None, "malformed")],
+                ),
+                # stock: status == "draft" (last wins)
+                (
+                    "documents/dup_reused_source_with_merge.md",
+                    [
+                        'title: "T"',
+                        "b: &b {c: 1}",
+                        'm: &m {<<: *b, status: "bogus", status: "draft"}',
+                        "x: {<<: *m}",
+                        "<<: *m",
+                    ],
+                    [(None, "malformed")],
+                ),
+                # A quoted "<<" is an ordinary explicit key.
+                # stock: "<<" == {"c": 2} (last wins)
+                (
+                    "documents/dup_quoted_merge_key.md",
+                    ['title: "T"', 'status: "draft"', '"<<": {c: 1}', '"<<": {c: 2}'],
+                    [(None, "malformed")],
+                ),
+            ]
+        )
+
+    def test_duplicate_keys_rejected_in_either_visit_order(self):
+        self._assert_cases(
+            [
+                # Merged by the top-level mapping first, constructed as d later.
+                # stock: c == 2 (last wins)
+                (
+                    "documents/dup_merged_then_constructed.md",
+                    ['title: "T"', 'status: "draft"', "d: &d {c: 1, c: 2}", "<<: *d"],
+                    [(None, "malformed")],
+                ),
+                # Constructed as d first, merged into x later.
+                # stock: d == x == {"c": 2} (last wins)
+                (
+                    "documents/dup_constructed_then_merged.md",
+                    ['title: "T"', 'status: "draft"', "d: &d {c: 1, c: 2}", "x: {<<: *d}"],
+                    [(None, "malformed")],
+                ),
+            ]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

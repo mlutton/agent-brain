@@ -18,7 +18,10 @@ def load(base_dir):
     """
     vendor_dir = os.path.join(base_dir, "vendor")
     sys.path.insert(0, vendor_dir)
-    import yaml
+    try:
+        import yaml
+    except ImportError as exc:
+        raise VendoredDependencyError(f"could not import yaml from {vendor_dir}: {exc}") from exc
 
     vendor_real = os.path.realpath(vendor_dir)
     module_file = getattr(yaml, "__file__", None)
@@ -42,6 +45,7 @@ def make_duplicate_safe_loader(yaml_module):
                 raise yaml_module.constructor.ConstructorError(
                     None, None, "expected a mapping node", node.start_mark
                 )
+            self.flatten_mapping(node)
             mapping = {}
             for key_node, value_node in node.value:
                 key = self.construct_object(key_node, deep=deep)

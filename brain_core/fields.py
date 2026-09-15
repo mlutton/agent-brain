@@ -34,21 +34,21 @@ TEXT_FIELDS = {
     "original_sha256",
 }
 
-STATUS_VALUES = {"draft", "incomplete", "complete", "superseded"}
-KIND_VALUES = {"source", "synthesis", "query-output", "decision", "project-context", "unknown"}
-AUTHORED_BY_VALUES = {"human", "agent", "mixed"}
-RETENTION_VALUES = {"ephemeral", "durable"}
-
 ID_RE = re.compile(r"^[0-9abcdefghjkmnpqrstvwxyz]{26}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
 REFERENCE_LIST_FIELDS = ["evidence", "derived_from", "conflicts_with", "supersedes"]
 
+_UNIVERSAL_ALLOWED_VALUE_FIELDS = {"status", "kind", "authored_by", "retention"}
 
-def _is_missing(value, field):
+_NO_MARKER = object()
+
+
+def _is_missing(value, field, extra_empty_allowed=False):
+    empty_allowed = field in EMPTY_ALLOWED or extra_empty_allowed
     if value is None:
-        return field not in EMPTY_ALLOWED
-    return bool(isinstance(value, str) and value == "" and field not in EMPTY_ALLOWED)
+        return not empty_allowed
+    return bool(isinstance(value, str) and value == "" and not empty_allowed)
 
 
 def _is_valid_date_value(value):
@@ -102,10 +102,10 @@ def validate_mapping(mapping, type_registry, zone):
     _check_text_field(mapping, "id", errors, extra_format=_check_id_format)
     _check_text_field(mapping, "title", errors)
     _check_text_field(mapping, "summary", errors, extra_format=_check_summary_length)
-    _check_enum_field(mapping, "status", STATUS_VALUES, errors)
-    _check_enum_field(mapping, "kind", KIND_VALUES, errors)
-    _check_enum_field(mapping, "authored_by", AUTHORED_BY_VALUES, errors)
-    _check_enum_field(mapping, "retention", RETENTION_VALUES, errors)
+    for field in ("status", "kind", "authored_by", "retention"):
+        allowed_values = type_registry.base_allowed_values.get(field)
+        if allowed_values is not None:
+            _check_enum_field(mapping, field, allowed_values, errors)
     _check_date_field(mapping, "created", errors)
     _check_date_field(mapping, "reviewed", errors)
     _check_origin_field(mapping, errors)
@@ -116,7 +116,9 @@ def validate_mapping(mapping, type_registry, zone):
     if type_def is not None:
         for extra_field in type_def.required:
             value = mapping.get(extra_field)
-            if extra_field not in mapping or _is_missing(value, extra_field):
+            marker = type_def.uncertainty_values.get(extra_field, _NO_MARKER)
+            extra_empty_allowed = marker is None or marker == ""
+            if extra_field not in mapping or _is_missing(value, extra_field, extra_empty_allowed=extra_empty_allowed):
                 errors.append((extra_field, "missing"))
             elif extra_field == "original_sha256":
                 if not isinstance(value, str) or not SHA256_RE.match(value):
@@ -124,6 +126,8 @@ def validate_mapping(mapping, type_registry, zone):
             elif extra_field in TEXT_FIELDS and not isinstance(value, str):
                 errors.append((extra_field, "ambiguous_scalar"))
         for field, allowed in type_def.allowed_values.items():
+            if field in _UNIVERSAL_ALLOWED_VALUE_FIELDS:
+                continue
             value = mapping.get(field)
             if field in mapping and not _is_missing(value, field) and value not in allowed:
                 errors.append((field, "not_allowed"))
@@ -225,19 +229,22 @@ def _check_reference_list_field(mapping, field, errors, required):
 
 
 def _uncertain_fields(mapping, type_def):
+    """Fields holding a declared uncertainty value (C5). A field that is simply
+    absent is "missing", not uncertain -- uncertainty is a value an editor wrote
+    (an empty property), not the omission of a required property (VF-06)."""
     uncertain = set()
     created = mapping.get("created")
-    if created is None or (isinstance(created, str) and created == ""):
+    if "created" in mapping and (created is None or (isinstance(created, str) and created == "")):
         uncertain.add("created")
     reviewed = mapping.get("reviewed")
-    if reviewed is None or (isinstance(reviewed, str) and reviewed == ""):
+    if "reviewed" in mapping and (reviewed is None or (isinstance(reviewed, str) and reviewed == "")):
         uncertain.add("reviewed")
     if mapping.get("kind") == "unknown":
         uncertain.add("kind")
     if mapping.get("type") == "unclassified":
         uncertain.add("type")
     summary = mapping.get("summary")
-    if summary is None or (isinstance(summary, str) and summary == ""):
+    if "summary" in mapping and (summary is None or (isinstance(summary, str) and summary == "")):
         uncertain.add("summary")
     origin = mapping.get("origin")
     if origin == "unknown":
@@ -251,12 +258,12 @@ def _uncertain_fields(mapping, type_def):
                     break
     if type_def is not None:
         for field, marker in type_def.uncertainty_values.items():
-            if marker is None:
-                if field not in mapping:
+            value = mapping.get(field)
+            if marker is None or marker == "":
+                if field not in mapping or value is None or value == "":
                     uncertain.add(field)
-            else:
-                if mapping.get(field) == marker:
-                    uncertain.add(field)
+            elif value == marker:
+                uncertain.add(field)
     return uncertain
 
 

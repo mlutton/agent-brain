@@ -2,7 +2,12 @@
   "type": "document",
   "zones": ["documents"],
   "required": ["source_identity", "original", "original_sha256"],
-  "allowed_values": {},
+  "allowed_values": {
+    "status": ["draft", "incomplete", "complete", "superseded"],
+    "kind": ["source", "synthesis", "query-output", "decision", "project-context", "unknown"],
+    "authored_by": ["human", "agent", "mixed"],
+    "retention": ["ephemeral", "durable"]
+  },
   "uncertainty_values": {},
   "display_fields": ["status", "kind", "source_identity"],
   "search_fields": ["tags"]

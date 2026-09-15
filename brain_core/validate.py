@@ -37,7 +37,10 @@ def _classify_file(raw_bytes, yaml_module, duplicate_loader, type_registry, zone
     if fm is frontmatter.UNCLOSED:
         return _malformed(version, "frontmatter block is not closed")
 
-    features, _doc_count = frontmatter.scan_features(fm.block_text, yaml_module)
+    try:
+        features, _doc_count = frontmatter.scan_features(fm.block_text, yaml_module)
+    except RecursionError:
+        return _malformed(version, "frontmatter is too deeply nested")
     if features is None:
         return _malformed(version, "frontmatter is not valid YAML")
 
@@ -45,8 +48,8 @@ def _classify_file(raw_bytes, yaml_module, duplicate_loader, type_registry, zone
         documents = list(yaml_module.load_all(fm.block_text, Loader=duplicate_loader))
     except yaml_module.YAMLError:
         return _malformed(version, "frontmatter is not valid YAML")
-    except ValueError:
-        return _malformed(version, "frontmatter holds a value that cannot be constructed")
+    except (ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError) as exc:
+        return _malformed(version, f"frontmatter holds a value that cannot be constructed: {exc}")
 
     mapping = documents[0] if documents else None
     if mapping is None:

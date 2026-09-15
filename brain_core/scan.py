@@ -19,25 +19,29 @@ def scan_zones(root, module_folders):
     skipped = []
     for zone in zones:
         zone_path = os.path.join(root, zone)
-        if not os.path.isdir(zone_path) or os.path.islink(zone_path):
+        if os.path.islink(zone_path):
+            if os.path.isdir(zone_path):
+                skipped.append({"path": _rel_posix(root, zone_path), "reason": "symlink"})
+            continue
+        if not os.path.isdir(zone_path):
             continue
         for dirpath, dirnames, filenames in os.walk(zone_path, followlinks=False):
             kept_dirs = []
             for d in dirnames:
+                if d.startswith("."):
+                    continue
                 full = os.path.join(dirpath, d)
                 if os.path.islink(full):
                     skipped.append({"path": _rel_posix(root, full), "reason": "symlink"})
                     continue
-                if d.startswith("."):
-                    continue
                 kept_dirs.append(d)
             dirnames[:] = kept_dirs
             for f in filenames:
+                if f.startswith("."):
+                    continue
                 full = os.path.join(dirpath, f)
                 if os.path.islink(full):
                     skipped.append({"path": _rel_posix(root, full), "reason": "symlink"})
-                    continue
-                if f.startswith("."):
                     continue
                 if not f.endswith(".md"):
                     continue

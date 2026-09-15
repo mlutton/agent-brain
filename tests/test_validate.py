@@ -54,9 +54,20 @@ class TempBrainTestCase(unittest.TestCase):
     def write(self, rel_path, content, **kwargs):
         return support.write_file(self.tmpdir, rel_path, content, **kwargs)
 
-    def validate(self):
+    def validate(self, expect_paths=None):
+        """Runs `brain validate`, asserting the common rules every call site needs:
+        the brain's files and hashes are unchanged, and stdout is one JSON object.
+        Pass expect_paths to also assert document paths exactly."""
+        before_hashes = support.hash_tree(self.tmpdir)
+        before_paths = support.list_paths(self.tmpdir)
         proc = support.run_brain(["validate", "--root", self.tmpdir])
         report = support.parse_single_json(proc.stdout)
+        after_hashes = support.hash_tree(self.tmpdir)
+        after_paths = support.list_paths(self.tmpdir)
+        self.assertEqual(before_hashes, after_hashes)
+        self.assertEqual(before_paths, after_paths)
+        if expect_paths is not None:
+            self.assertEqual(support.document_paths(report), set(expect_paths))
         return proc, report
 
 
@@ -66,6 +77,9 @@ class TestReportShapeAndCounts(TempBrainTestCase):
         self.write("documents/bad.md", "no frontmatter here\n")  # unmanaged
         self.write("documents/broken.md", "---\nkb: 1\nid: 1\n---\nbody\n")  # invalid (malformed base fields missing etc)
         self.write("documents/future.md", note_doc(kb="2", needs_review=()))
+        # version is the SHA-256 of the raw file bytes, never a CRLF-normalised
+        # copy (VF-11/I12): this fixture keeps its CRLF line endings verbatim.
+        self.write("documents/crlf.md", note_doc().replace("\n", "\r\n"), newline="")
 
         before = support.hash_tree(self.tmpdir)
         _proc, report = self.validate()
@@ -79,6 +93,11 @@ class TestReportShapeAndCounts(TempBrainTestCase):
         self.assertEqual(report["counts"]["retained"], 0)
 
         for doc in report["documents"]:
+            self.assertEqual(
+                set(doc.keys()),
+                {"path", "status", "frontmatter", "frontmatter_features", "id", "type", "version", "errors"},
+                doc["path"],
+            )
             full = os.path.join(self.tmpdir, doc["path"])
             with open(full, "rb") as fh:
                 expected_hash = hashlib.sha256(fh.read()).hexdigest()
@@ -106,12 +125,12 @@ class TestScanScopeAndOrder(TempBrainTestCase):
         link_path = os.path.join(self.tmpdir, "documents", "a_link.md")
         os.symlink(target, link_path)
 
-        _proc, report = self.validate()
+        # A hidden name is skipped silently even when it is a symlink: the
+        # hidden rule takes precedence over the symlink rule (VF-16).
+        hidden_link_path = os.path.join(self.tmpdir, "documents", ".hidden_link.md")
+        os.symlink(target, hidden_link_path)
 
-        paths = [d["path"] for d in report["documents"]]
-        self.assertEqual(paths, sorted(paths))
-
-        expected_present = {
+        expected_paths = {
             "documents/a-b.md",
             "documents/a/b.md",
             "documents/nested/deep/doc.md",
@@ -119,7 +138,10 @@ class TestScanScopeAndOrder(TempBrainTestCase):
             "documents/link_target.md",
             "projects/demo/decision.md",
         }
-        self.assertTrue(expected_present.issubset(set(paths)))
+        _proc, report = self.validate(expect_paths=expected_paths)
+
+        paths = [d["path"] for d in report["documents"]]
+        self.assertEqual(paths, sorted(paths))
 
         expected_absent = {
             "inbox/skip.md",
@@ -136,12 +158,40 @@ class TestScanScopeAndOrder(TempBrainTestCase):
         idx_a_slash_b = paths.index("documents/a/b.md")
         self.assertLess(idx_ab_dash, idx_a_slash_b)
 
-        skipped_paths = {s["path"] for s in report["skipped"]}
-        self.assertIn("documents/a_link.md", skipped_paths)
-        for s in report["skipped"]:
-            if s["path"] == "documents/a_link.md":
-                self.assertEqual(s["reason"], "symlink")
+        self.assertEqual(report["skipped"], [{"path": "documents/a_link.md", "reason": "symlink"}])
         self.assertNotIn("documents/a_link.md", paths)
+        self.assertNotIn("documents/.hidden_link.md", paths)
+
+
+class TestScanEdgeCases(TempBrainTestCase):
+    def test_symlinked_zone_root_is_listed_in_skipped(self):
+        real_wiki = os.path.join(self.tmpdir, "real_wiki")
+        os.makedirs(real_wiki)
+        support.write_file(self.tmpdir, "real_wiki/page.md", "unmanaged\n")
+        os.symlink(real_wiki, os.path.join(self.tmpdir, "wiki"))
+        os.makedirs(os.path.join(self.tmpdir, "documents"))
+
+        _proc, report = self.validate(expect_paths=set())
+        self.assertEqual(report["skipped"], [{"path": "wiki", "reason": "symlink"}])
+
+    def test_module_json_folder_validation(self):
+        # documents: reuses the reserved name and must not duplicate the
+        # documents/ zone or scan it twice; escaping ("..") and reserved
+        # names (inbox) must not be scanned; a hidden folder name is ignored.
+        self.write("documents/base.md", "unmanaged\n")
+        self.write("inbox/leaked.md", "unmanaged\n")
+        self.write(".hidden_module/leaked.md", "unmanaged\n")
+
+        self.write(".brain/modules/dup_documents/module.json", json.dumps({"module": "dup_documents", "folder": "documents"}))
+        self.write(".brain/modules/escape/module.json", json.dumps({"module": "escape", "folder": ".."}))
+        self.write(".brain/modules/reserved_inbox/module.json", json.dumps({"module": "reserved_inbox", "folder": "inbox"}))
+        self.write(".brain/modules/hidden/module.json", json.dumps({"module": "hidden", "folder": ".hidden_module"}))
+
+        # An invalid module.json is simply not installed: it is not a
+        # validate error in its own right (VF-08 deviation).
+        _proc, report = self.validate(expect_paths={"documents/base.md"})
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(report["definitions"], [])
 
 
 class TestExitCodesAndRefusals(TempBrainTestCase):
@@ -190,6 +240,12 @@ class TestExitCodesAndRefusals(TempBrainTestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(report["outcome"], "refused")
 
+    def test_known_but_not_implemented_subcommand_is_refused(self):
+        proc = support.run_brain(["setup", "--root", self.tmpdir])
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(report, {"outcome": "refused", "reason": "not_implemented"})
+
 
 class TestUnmanagedClasses(TempBrainTestCase):
     def test_unmanaged_classes(self):
@@ -208,6 +264,8 @@ class TestUnmanagedClasses(TempBrainTestCase):
             doc = support.doc_by_path(report, path)
             self.assertEqual(doc["status"], "unmanaged", path)
             self.assertEqual(doc["errors"], [], path)
+            if path == "documents/no_block.md":
+                self.assertEqual(doc["frontmatter"], "none", path)
 
 
 class TestKbReading(TempBrainTestCase):
@@ -233,16 +291,22 @@ class TestKbReading(TempBrainTestCase):
         for path in ("documents/bool_kb.md", "documents/str_kb.md", "documents/float_kb.md", "documents/empty_kb.md"):
             doc = support.doc_by_path(report, path)
             self.assertEqual(doc["status"], "invalid", path)
-            self.assertEqual(support.errors_multiset(doc), {(None, "malformed")}, path)
+            support.assert_errors(self, doc, [(None, "malformed")], path)
 
         self.assertEqual(report["outcome"], "invalid")
+
+    def test_unsupported_version_alone_does_not_make_outcome_invalid(self):
+        self.write("documents/v2.md", note_doc(kb="2", needs_review=()))
+        _proc, report = self.validate(expect_paths={"documents/v2.md"})
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(support.doc_by_path(report, "documents/v2.md")["status"], "unsupported_version")
 
 
 class TestMalformedConditions(TempBrainTestCase):
     def assert_malformed(self, path):
         _proc, report = self.validate()
         doc = support.doc_by_path(report, path)
-        self.assertEqual(support.errors_multiset(doc), {(None, "malformed")}, path)
+        support.assert_errors(self, doc, [(None, "malformed")], path)
         self.assertEqual(doc["status"], "invalid", path)
 
     def test_unclosed_block(self):
@@ -284,12 +348,32 @@ class TestMalformedConditions(TempBrainTestCase):
         self.assertNotEqual(doc["frontmatter"], "malformed")
         self.assertIn(("id", "missing"), support.errors_multiset(doc))
 
+    def test_unconstructible_tags_and_deep_nesting_are_malformed(self):
+        self.write("documents/bad_timestamp.md", "---\nkb: 1\nx: !!timestamp nope\n---\nbody\n")
+        self.write("documents/bad_bool.md", "---\nkb: 1\nx: !!bool maybe\n---\nbody\n")
+        deep = "x: " + "[" * 3000 + "]" * 3000
+        self.write("documents/deep_nesting.md", f"---\nkb: 1\n{deep}\n---\nbody\n")
+
+        proc, report = self.validate()
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        for path in ("documents/bad_timestamp.md", "documents/bad_bool.md", "documents/deep_nesting.md"):
+            self.assert_malformed_from_report(report, path)
+
+    def assert_malformed_from_report(self, report, path):
+        doc = support.doc_by_path(report, path)
+        support.assert_errors(self, doc, [(None, "malformed")], path)
+        self.assertEqual(doc["status"], "invalid", path)
+
 
 class TestUnsupportedForEditing(TempBrainTestCase):
     def test_features_are_not_errors(self):
         cases = {
             "anchor_alias": ("a: &x \"v\"\nb: *x", {"anchor", "alias"}),
             "explicit_tag": ("tagged: !!str \"v\"", {"tag"}),
+            # A merge key requires an alias, so the block is valid YAML and
+            # unsupported_for_editing, never malformed (VF-13).
+            "merge_key": ("base: &b {c: 1}\n<<: *b", {"anchor", "alias"}),
         }
         for name, (extra, expected_features) in cases.items():
             path = f"documents/{name}_managed.md"
@@ -334,6 +418,23 @@ class TestUnsupportedForEditing(TempBrainTestCase):
         self.assertIn("flow_mapping", doc["frontmatter_features"])
         self.assertEqual(doc["errors"], [])
 
+    def test_multiple_documents_is_not_malformed(self):
+        # A "--- " line with a trailing space does not close the frontmatter
+        # block (only an exact "---" line does), but YAML still reads it as a
+        # second-document separator, so the block holds two YAML documents.
+        # This is reachable, not "effectively unreachable" (VF-17).
+        base = note_doc()
+        closing_idx = base.rindex("\n---\n")
+        text = base[:closing_idx] + '\n--- \nextra: "ignored second document"' + base[closing_idx:]
+        self.write("documents/multi_doc.md", text)
+
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/multi_doc.md")
+        self.assertEqual(doc["status"], "valid", doc["errors"])
+        self.assertEqual(doc["frontmatter"], "unsupported_for_editing")
+        self.assertIn("multiple_documents", doc["frontmatter_features"])
+        self.assertEqual(doc["errors"], [])
+
 
 class TestAmbiguousScalars(TempBrainTestCase):
     def test_ambiguous_scalars(self):
@@ -347,11 +448,11 @@ class TestAmbiguousScalars(TempBrainTestCase):
 
         _proc, report = self.validate()
 
-        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/yes_title.md")), {("title", "ambiguous_scalar")})
-        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/num_title.md")), {("title", "ambiguous_scalar")})
-        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/float_summary.md")), {("summary", "ambiguous_scalar")})
-        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/link_title.md")), {("title", "ambiguous_scalar")})
-        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/yes_status.md")), {("status", "ambiguous_scalar")})
+        support.assert_errors(self, support.doc_by_path(report, "documents/yes_title.md"), [("title", "ambiguous_scalar")])
+        support.assert_errors(self, support.doc_by_path(report, "documents/num_title.md"), [("title", "ambiguous_scalar")])
+        support.assert_errors(self, support.doc_by_path(report, "documents/float_summary.md"), [("summary", "ambiguous_scalar")])
+        support.assert_errors(self, support.doc_by_path(report, "documents/link_title.md"), [("title", "ambiguous_scalar")])
+        support.assert_errors(self, support.doc_by_path(report, "documents/yes_status.md"), [("status", "ambiguous_scalar")])
         self.assertEqual(support.doc_by_path(report, "documents/quoted_ok.md")["status"], "valid")
 
 
@@ -413,7 +514,7 @@ class TestObsidianFixtureSetValid(TempBrainTestCase):
             self.assertEqual(doc["status"], "valid", "{}: {!r}".format(name, doc["errors"]))
 
         truncated_quoted = support.doc_by_path(report, "documents/comment_truncated_quoted.md")
-        self.assertEqual(support.errors_multiset(truncated_quoted), {("summary", "too_long")})
+        support.assert_errors(self, truncated_quoted, [("summary", "too_long")])
 
         truncated_unquoted = support.doc_by_path(report, "documents/comment_truncated_unquoted.md")
         self.assertEqual(truncated_unquoted["errors"], [])
@@ -427,6 +528,13 @@ class TestDates(TempBrainTestCase):
         self.write("documents/bad_word.md", note_doc(created='"unknown"', needs_review=("reviewed", "summary", "kind", "origin")))
         self.write("documents/bad_datetime.md", note_doc(created='"2026-09-14T10:00:00Z"', needs_review=("reviewed", "summary", "kind", "origin")))
         self.write("documents/bad_datetime_unquoted.md", note_doc(created="2026-09-14T10:00:00Z", needs_review=("reviewed", "summary", "kind", "origin")))
+        # Fullwidth digits are not ASCII: Python's \d matches them under the
+        # default (non-ASCII) regex flags, so this must still be bad_format,
+        # not a coerced calendar date (VF-09).
+        self.write(
+            "documents/fullwidth_digits.md",
+            note_doc(created='"２０２６-09-14"', needs_review=("reviewed", "summary", "kind", "origin")),
+        )
 
         _proc, report = self.validate()
 
@@ -434,9 +542,15 @@ class TestDates(TempBrainTestCase):
             doc = support.doc_by_path(report, path)
             self.assertEqual(doc["errors"], [], path)
 
-        for path in ("documents/bad_short.md", "documents/bad_word.md", "documents/bad_datetime.md", "documents/bad_datetime_unquoted.md"):
+        for path in (
+            "documents/bad_short.md",
+            "documents/bad_word.md",
+            "documents/bad_datetime.md",
+            "documents/bad_datetime_unquoted.md",
+            "documents/fullwidth_digits.md",
+        ):
             doc = support.doc_by_path(report, path)
-            self.assertEqual(support.errors_multiset(doc), {("created", "bad_format")}, path)
+            support.assert_errors(self, doc, [("created", "bad_format")], path)
 
 
 class TestFieldContractRejections(TempBrainTestCase):
@@ -471,10 +585,18 @@ class TestFieldContractRejections(TempBrainTestCase):
             "authored_by": '"human"',
             "retention": '"durable"',
         }
+        # created/reviewed/summary declare an empty-value uncertainty marker (C5),
+        # but that marker means "the editor wrote the property with no value" --
+        # it never applies to a property that was never written at all. Deleting
+        # one of these three keys entirely is "missing", exactly like any other
+        # required field, not a disclosable uncertainty (VF-06). needs_review is
+        # built per fixture so a deleted field is never listed as disclosed.
+        default_uncertain = {"created", "reviewed", "summary", "kind", "origin"}
         for field in required:
             fields = dict(base_fields)
             del fields[field]
-            text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n"
+            needs_review = tuple(sorted(default_uncertain - {field}))
+            text = make_frontmatter(fields, needs_review=needs_review) + "body\n"
             self.write(f"documents/missing_{field}.md", text)
 
         _proc, report = self.validate()
@@ -484,7 +606,7 @@ class TestFieldContractRejections(TempBrainTestCase):
                 self.assertEqual(doc["status"], "unmanaged", field)
                 self.assertEqual(doc["errors"], [], field)
             else:
-                self.assertIn((field, "missing"), support.errors_multiset(doc), field)
+                support.assert_errors(self, doc, [(field, "missing")], field)
 
     def test_not_allowed_enums(self):
         self.write("documents/bad_status.md", note_doc(status='"weird"'))
@@ -493,10 +615,14 @@ class TestFieldContractRejections(TempBrainTestCase):
         self.write("documents/bad_retention.md", note_doc(retention='"weird"'))
 
         _proc, report = self.validate()
-        self.assertIn(("status", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_status.md")))
-        self.assertIn(("kind", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_kind.md")))
-        self.assertIn(("authored_by", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_authored_by.md")))
-        self.assertIn(("retention", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_retention.md")))
+        support.assert_errors(self, support.doc_by_path(report, "documents/bad_status.md"), [("status", "not_allowed")])
+        support.assert_errors(self, support.doc_by_path(report, "documents/bad_kind.md"), [("kind", "not_allowed")])
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/bad_authored_by.md"), [("authored_by", "not_allowed")]
+        )
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/bad_retention.md"), [("retention", "not_allowed")]
+        )
 
     def test_too_long_summary(self):
         self.write(
@@ -509,9 +635,8 @@ class TestFieldContractRejections(TempBrainTestCase):
         )
         _proc, report = self.validate()
         self.assertEqual(support.doc_by_path(report, "documents/summary_300.md")["errors"], [])
-        self.assertEqual(
-            support.errors_multiset(support.doc_by_path(report, "documents/summary_301.md")),
-            {("summary", "too_long")},
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/summary_301.md"), [("summary", "too_long")]
         )
 
     def test_document_type_required_fields(self):
@@ -533,12 +658,25 @@ class TestFieldContractRejections(TempBrainTestCase):
         text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "origin")) + "body\n"
         self.write("documents/doc_missing_source.md", text)
 
+        # source_identity must be non-empty text (C5a) -- an explicitly empty
+        # value is "missing" too, not silently accepted (I11).
+        empty_source_fields = dict(fields)
+        empty_source_fields.update(
+            {"source_identity": None, "original": '"original/a.md"', "original_sha256": '"%s"' % ("a" * 64)}
+        )
+        empty_source_text = make_frontmatter(empty_source_fields, needs_review=("created", "reviewed", "summary", "origin")) + "body\n"
+        self.write("documents/doc_empty_source.md", empty_source_text)
+
         _proc, report = self.validate()
         doc = support.doc_by_path(report, "documents/doc_missing_source.md")
-        errs = support.errors_multiset(doc)
-        self.assertIn(("source_identity", "missing"), errs)
-        self.assertIn(("original", "missing"), errs)
-        self.assertIn(("original_sha256", "missing"), errs)
+        support.assert_errors(
+            self,
+            doc,
+            [("source_identity", "missing"), ("original", "missing"), ("original_sha256", "missing")],
+        )
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/doc_empty_source.md"), [("source_identity", "missing")]
+        )
 
     def test_malformed_original_sha256(self):
         fields = {
@@ -563,13 +701,13 @@ class TestFieldContractRejections(TempBrainTestCase):
         self.write("documents/doc_bad_hash.md", text)
         _proc, report = self.validate()
         doc = support.doc_by_path(report, "documents/doc_bad_hash.md")
-        self.assertIn(("original_sha256", "bad_format"), support.errors_multiset(doc))
+        support.assert_errors(self, doc, [("original_sha256", "bad_format")])
 
     def test_unknown_type(self):
         self.write("documents/unknown_type.md", note_doc(type='"gadget"'))
         _proc, report = self.validate()
         doc = support.doc_by_path(report, "documents/unknown_type.md")
-        self.assertEqual(support.errors_multiset(doc), {("type", "unknown_type")})
+        support.assert_errors(self, doc, [("type", "unknown_type")])
 
     def test_wrong_zone(self):
         fields = {
@@ -594,7 +732,7 @@ class TestFieldContractRejections(TempBrainTestCase):
         self.write("wiki/misplaced_document.md", text)
         _proc, report = self.validate()
         doc = support.doc_by_path(report, "wiki/misplaced_document.md")
-        self.assertIn(("type", "wrong_zone"), support.errors_multiset(doc))
+        support.assert_errors(self, doc, [("type", "wrong_zone")])
 
     def test_evidence_bad_format(self):
         self.write("documents/bad_evidence.md", note_doc(evidence='["ftp://x", "[[Link]]", "0123456789012345678901234"]'))
@@ -607,8 +745,8 @@ class TestFieldContractRejections(TempBrainTestCase):
         self.write("documents/upper_id.md", note_doc(id='"01ARZ3NDEKTSV4RRFFQ69G5FAV"'))
         self.write("documents/u_id.md", note_doc(id='"01arz3ndektsv4rrffq69g5fau"'))
         _proc, report = self.validate()
-        self.assertIn(("id", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/upper_id.md")))
-        self.assertIn(("id", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/u_id.md")))
+        support.assert_errors(self, support.doc_by_path(report, "documents/upper_id.md"), [("id", "bad_format")])
+        support.assert_errors(self, support.doc_by_path(report, "documents/u_id.md"), [("id", "bad_format")])
 
     def test_needs_review_bad_format(self):
         text = note_doc(needs_review=("created", "created", "reviewed", "summary", "kind", "origin"))
@@ -616,18 +754,34 @@ class TestFieldContractRejections(TempBrainTestCase):
         self.write("documents/empty_origin_list.md", note_doc(origin="[]"))
 
         _proc, report = self.validate()
-        self.assertIn(("needs_review", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/dup_needs_review.md")))
-        self.assertIn(("origin", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/empty_origin_list.md")))
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/dup_needs_review.md"), [("needs_review", "bad_format")]
+        )
+        support.assert_errors(
+            self,
+            support.doc_by_path(report, "documents/empty_origin_list.md"),
+            [("origin", "bad_format"), ("needs_review", "needs_review_mismatch")],
+        )
+
+    def test_origin_entry_missing_ref_is_bad_format(self):
+        # An origin list entry without ref is bad_format, never silently
+        # accepted (I17).
+        self.write("documents/origin_no_ref.md", note_doc(origin='\n  - retrieved: "2026-01-01"'))
+        _proc, report = self.validate()
+        support.assert_errors(
+            self,
+            support.doc_by_path(report, "documents/origin_no_ref.md"),
+            [("origin", "bad_format"), ("needs_review", "needs_review_mismatch")],
+        )
 
     def test_three_faults_one_file(self):
         text = note_doc(status='"weird"', evidence='["ftp://bad"]', id='"TOO-SHORT"')
         self.write("documents/three_faults.md", text)
         _proc, report = self.validate()
         doc = support.doc_by_path(report, "documents/three_faults.md")
-        errs = support.errors_multiset(doc)
-        self.assertIn(("status", "not_allowed"), errs)
-        self.assertIn(("evidence", "bad_format"), errs)
-        self.assertIn(("id", "bad_format"), errs)
+        support.assert_errors(
+            self, doc, [("status", "not_allowed"), ("evidence", "bad_format"), ("id", "bad_format")]
+        )
 
 
 class TestUncertaintyAndNeedsReview(TempBrainTestCase):
@@ -663,6 +817,83 @@ class TestUncertaintyAndNeedsReview(TempBrainTestCase):
             doc = support.doc_by_path(report, path)
             self.assertEqual(doc["errors"], [], "{}: {!r}".format(path, doc["errors"]))
 
+    def test_unclassified_type_and_empty_retrieved_are_uncertain(self):
+        # type: unclassified is itself an uncertainty value (C5) -- it must be
+        # disclosed in needs_review like any other uncertain field (I4).
+        self.write(
+            "documents/unclassified_disclosed.md",
+            note_doc(type='"unclassified"', needs_review=("created", "reviewed", "summary", "kind", "origin", "type")),
+        )
+        self.write("documents/unclassified_undisclosed.md", note_doc(type='"unclassified"'))
+
+        # An origin entry with an empty retrieved date is uncertain even when
+        # ref is a resolvable id/URL (I5).
+        fields_empty_retrieved = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"note"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '\n  - ref: "https://example.com/a"\n    retrieved:',
+            "evidence": "[]",
+            "kind": '"unknown"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+        }
+        self.write(
+            "documents/empty_retrieved_disclosed.md",
+            make_frontmatter(fields_empty_retrieved, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+        self.write(
+            "documents/empty_retrieved_undisclosed.md",
+            make_frontmatter(fields_empty_retrieved, needs_review=("created", "reviewed", "summary", "kind")) + "body\n",
+        )
+
+        _proc, report = self.validate()
+        self.assertEqual(support.doc_by_path(report, "documents/unclassified_disclosed.md")["errors"], [])
+        support.assert_errors(
+            self,
+            support.doc_by_path(report, "documents/unclassified_undisclosed.md"),
+            [("needs_review", "needs_review_mismatch")],
+        )
+        self.assertEqual(support.doc_by_path(report, "documents/empty_retrieved_disclosed.md")["errors"], [])
+        support.assert_errors(
+            self,
+            support.doc_by_path(report, "documents/empty_retrieved_undisclosed.md"),
+            [("needs_review", "needs_review_mismatch")],
+        )
+
+    def test_wiki_page_type_in_wiki_zone(self):
+        # wiki-page's zones must stay ["wiki"], not the whole-brain wildcard
+        # ["*"] (I6): a wiki-page document outside wiki/ is wrong_zone.
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"wiki-page"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"synthesis"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+        }
+        text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "origin")) + "body\n"
+        self.write("wiki/page.md", text)
+        self.write("documents/misplaced_wiki_page.md", text)
+
+        _proc, report = self.validate()
+        self.assertEqual(support.doc_by_path(report, "wiki/page.md")["errors"], [])
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/misplaced_wiki_page.md"), [("type", "wrong_zone")]
+        )
+
     def test_needs_review_mismatch_cases(self):
         self.write("documents/missing_origin_marker.md", note_doc(needs_review=("created", "reviewed", "summary", "kind")))
         self.write(
@@ -683,7 +914,7 @@ class TestUncertaintyAndNeedsReview(TempBrainTestCase):
             "documents/list_absent.md",
         ):
             doc = support.doc_by_path(report, path)
-            self.assertEqual(support.errors_multiset(doc), {("needs_review", "needs_review_mismatch")}, path)
+            support.assert_errors(self, doc, [("needs_review", "needs_review_mismatch")], path)
 
 
 class TestCustomTypesBothWays(TempBrainTestCase):
@@ -698,6 +929,94 @@ class TestCustomTypesBothWays(TempBrainTestCase):
             "search_fields": ["cuisine"],
         }
     )
+
+    RECIPE_REQUIRED_DEF = json.dumps(
+        {
+            "type": "recipe",
+            "zones": ["*"],
+            "required": ["cuisine"],
+            "allowed_values": {"cuisine": ["italian", "french"]},
+            "uncertainty_values": {"cuisine": None},
+            "display_fields": ["cuisine"],
+            "search_fields": ["cuisine"],
+        }
+    )
+
+    RECIPE_NO_UNCERTAINTY_DEF = json.dumps(
+        {
+            "type": "recipe",
+            "zones": ["*"],
+            "required": [],
+            "allowed_values": {"cuisine": ["italian", "french"]},
+            "display_fields": ["cuisine"],
+            "search_fields": ["cuisine"],
+        }
+    )
+
+    def _recipe_fields(self, **overrides):
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"recipe"',
+            "title": '"Pasta"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"unknown"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+        }
+        fields.update(overrides)
+        return fields
+
+    def test_null_marker_present_empty_is_uncertain(self):
+        # cuisine: (present, explicit empty value) is the uncertainty marker
+        # itself, not the same as cuisine being altogether absent from the
+        # frontmatter -- both must be treated as uncertain (VF-04).
+        self.write(".brain/types/custom/recipe.json", self.RECIPE_DEF)
+        fields = self._recipe_fields(cuisine=None)
+        self.write(
+            "documents/cuisine_present_empty_disclosed.md",
+            make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin", "cuisine")) + "body\n",
+        )
+        self.write(
+            "documents/cuisine_present_empty_undisclosed.md",
+            make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+
+        _proc, report = self.validate()
+        self.assertEqual(support.doc_by_path(report, "documents/cuisine_present_empty_disclosed.md")["errors"], [])
+        support.assert_errors(
+            self,
+            support.doc_by_path(report, "documents/cuisine_present_empty_undisclosed.md"),
+            [("needs_review", "needs_review_mismatch")],
+        )
+
+    def test_required_field_with_null_marker_present_empty_is_not_missing(self):
+        self.write(".brain/types/custom/recipe.json", self.RECIPE_REQUIRED_DEF)
+        fields = self._recipe_fields(cuisine=None)
+        self.write(
+            "documents/required_cuisine_empty.md",
+            make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin", "cuisine")) + "body\n",
+        )
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/required_cuisine_empty.md")
+        self.assertEqual(doc["errors"], [])
+
+    def test_definition_without_uncertainty_values_is_valid(self):
+        self.write(".brain/types/custom/recipe.json", self.RECIPE_NO_UNCERTAINTY_DEF)
+        fields = self._recipe_fields(cuisine='"italian"')
+        self.write(
+            "documents/recipe_no_uncertainty_key.md",
+            make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+        _proc, report = self.validate()
+        self.assertEqual(report["definitions"], [])
+        doc = support.doc_by_path(report, "documents/recipe_no_uncertainty_key.md")
+        self.assertEqual(doc["status"], "valid", doc["errors"])
 
     def test_recipe_type_valid_missing_not_allowed(self):
         self.write(".brain/types/custom/recipe.json", self.RECIPE_DEF)
@@ -744,13 +1063,13 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         _proc, report = self.validate()
         self.assertEqual(support.doc_by_path(report, "documents/recipe_valid.md")["errors"], [])
         self.assertEqual(support.doc_by_path(report, "documents/recipe_missing_cuisine_disclosed.md")["errors"], [])
-        self.assertIn(
-            ("needs_review", "needs_review_mismatch"),
-            support.errors_multiset(support.doc_by_path(report, "documents/recipe_missing_cuisine_undisclosed.md")),
+        support.assert_errors(
+            self,
+            support.doc_by_path(report, "documents/recipe_missing_cuisine_undisclosed.md"),
+            [("needs_review", "needs_review_mismatch")],
         )
-        self.assertIn(
-            ("cuisine", "not_allowed"),
-            support.errors_multiset(support.doc_by_path(report, "documents/recipe_bad_cuisine.md")),
+        support.assert_errors(
+            self, support.doc_by_path(report, "documents/recipe_bad_cuisine.md"), [("cuisine", "not_allowed")]
         )
 
     def test_type_unknown_without_definition_file(self):
@@ -776,7 +1095,7 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         )
         _proc, report = self.validate()
         doc = support.doc_by_path(report, "documents/recipe_no_def.md")
-        self.assertEqual(support.errors_multiset(doc), {("type", "unknown_type")})
+        support.assert_errors(self, doc, [("type", "unknown_type")])
 
     def test_definition_errors(self):
         self.write(".brain/types/custom/note.json", json.dumps({"type": "note", "zones": ["*"]}))  # missing keys -> shadows or invalid
@@ -851,7 +1170,7 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         self.assertIn("name_mismatch", codes)
         for type_name in ("recipe", "dish"):
             doc = support.doc_by_path(report, f"documents/{type_name}_doc.md")
-            self.assertEqual(support.errors_multiset(doc), {("type", "unknown_type")})
+            support.assert_errors(self, doc, [("type", "unknown_type")])
 
     def test_malformed_definition(self):
         self.write(".brain/types/custom/broken.json", "{not valid json")
@@ -935,8 +1254,11 @@ class TestVendoredYamlRecord(TempBrainTestCase):
     }
 
     def test_vendored_yaml_record(self):
-        vendored_files = [f for f in os.listdir(os.path.join(support.REPO_ROOT, "vendor", "yaml")) if f.endswith(".py")]
-        self.assertEqual(len(vendored_files), 17)
+        all_files = os.listdir(os.path.join(support.REPO_ROOT, "vendor", "yaml"))
+        # All 17 vendored files are .py -- a stray extra file of any kind
+        # (not just a stray .py) must fail this (VF-11/I19).
+        self.assertEqual(len(all_files), 17)
+        self.assertTrue(all(f.endswith(".py") for f in all_files), all_files)
 
         vendored_md = os.path.join(support.REPO_ROOT, "vendor", "VENDORED.md")
         with open(vendored_md, "r", encoding="utf-8") as fh:
@@ -998,6 +1320,32 @@ class TestVendoredYamlIsTheOneLoaded(TempBrainTestCase):
         content = content.replace("__version__ = '6.0.3'", "__version__ = '6.0.3-altered'")
         with open(init_path, "w", encoding="utf-8") as fh:
             fh.write(content)
+
+        brain_root = tempfile.mkdtemp(prefix="brain-data-")
+        self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)
+        support.write_file(brain_root, "documents/note.md", note_doc())
+
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-B", "-S", "-E", os.path.join(copy_root, "bin", "brain"), "validate", "--root", brain_root],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(report, {"outcome": "error", "reason": "vendored_dependency"})
+
+    def test_missing_vendor_yaml_errors_instead_of_crashing(self):
+        copy_root = tempfile.mkdtemp(prefix="brain-missing-vendor-")
+        self.addCleanup(shutil.rmtree, copy_root, ignore_errors=True)
+        for name in ("bin", "brain_core", "types"):
+            src = os.path.join(support.REPO_ROOT, name)
+            dst = os.path.join(copy_root, name)
+            shutil.copytree(src, dst)
+        os.makedirs(os.path.join(copy_root, "vendor"))  # vendor/yaml itself is absent
 
         brain_root = tempfile.mkdtemp(prefix="brain-data-")
         self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)

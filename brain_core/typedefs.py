@@ -8,10 +8,11 @@ _REQUIRED_KEYS = {
     "zones": list,
     "required": list,
     "allowed_values": dict,
-    "uncertainty_values": dict,
     "display_fields": list,
     "search_fields": list,
 }
+
+_UNIVERSAL_ALLOWED_VALUE_FIELDS = {"status", "kind", "authored_by", "retention"}
 
 
 class TypeDef:
@@ -20,7 +21,7 @@ class TypeDef:
         self.zones = data["zones"]
         self.required = data["required"]
         self.allowed_values = data["allowed_values"]
-        self.uncertainty_values = data["uncertainty_values"]
+        self.uncertainty_values = data.get("uncertainty_values") or {}
         self.display_fields = data["display_fields"]
         self.search_fields = data["search_fields"]
 
@@ -32,6 +33,7 @@ class TypeRegistry:
     def __init__(self):
         self.types = {}
         self.definitions_errors = []
+        self.base_allowed_values = {}
 
     def get(self, name):
         return self.types.get(name)
@@ -51,6 +53,8 @@ def _validate_shape(data):
             return False
         if not isinstance(data[key], expected_type):
             return False
+    if "uncertainty_values" in data and not isinstance(data["uncertainty_values"], dict):
+        return False
     for key in ("zones", "required", "display_fields", "search_fields"):
         if not all(isinstance(item, str) for item in data[key]):
             return False
@@ -67,7 +71,11 @@ def load_base_types(base_dir):
         path = os.path.join(base_types_dir, name)
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        registry.types[data["type"]] = TypeDef(data)
+        type_def = TypeDef(data)
+        registry.types[data["type"]] = type_def
+        for field in _UNIVERSAL_ALLOWED_VALUE_FIELDS:
+            if field in type_def.allowed_values:
+                registry.base_allowed_values[field] = type_def.allowed_values[field]
     return registry
 
 
@@ -106,12 +114,30 @@ def load_custom_types(registry, root):
         registry.types[declared_type] = TypeDef(data)
 
 
+_RESERVED_ZONE_FOLDERS = {"documents", "wiki", "inbox", "raw"}
+
+
+def _valid_module_folder(folder):
+    if not isinstance(folder, str) or not folder:
+        return False
+    if folder in (".", "..") or folder.startswith("."):
+        return False
+    if os.sep in folder or "/" in folder:
+        return False
+    return folder not in _RESERVED_ZONE_FOLDERS
+
+
 def detect_installed_modules(root):
-    """Returns {module_name: folder_name} for modules with a module.json (C15)."""
+    """Returns {module_name: folder_name} for modules with a valid module.json (C15).
+
+    A module.json naming a reserved, hidden, parent-escaping or multi-component
+    folder is ignored: that module is treated as not installed.
+    """
     modules_dir = os.path.join(root, ".brain", "modules")
     installed = {}
     if not os.path.isdir(modules_dir):
         return installed
+    used_folders = set()
     for name in sorted(os.listdir(modules_dir)):
         module_json = os.path.join(modules_dir, name, "module.json")
         if not os.path.isfile(module_json):
@@ -123,6 +149,12 @@ def detect_installed_modules(root):
             continue
         folder = data.get("folder")
         module = data.get("module")
-        if isinstance(folder, str) and isinstance(module, str):
-            installed[module] = folder
+        if not isinstance(module, str) or not module:
+            continue
+        if not _valid_module_folder(folder):
+            continue
+        if folder in used_folders:
+            continue
+        used_folders.add(folder)
+        installed[module] = folder
     return installed

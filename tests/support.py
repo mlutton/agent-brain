@@ -1,6 +1,7 @@
 """Shared test helpers. Not a test module itself (unittest discover ignores it
 because it does not match the test*.py pattern)."""
 
+import collections
 import hashlib
 import json
 import os
@@ -82,7 +83,13 @@ def find_bytecode(root):
 
 
 def errors_multiset(doc):
-    return {(e["field"], e["code"]) for e in doc["errors"]}
+    """A true multiset: repeated (field, code) pairs are distinct, not collapsed."""
+    return collections.Counter((e["field"], e["code"]) for e in doc["errors"])
+
+
+def assert_errors(testcase, doc, expected, msg=None):
+    """Exact multiset equality between doc's errors and expected [(field, code), ...]."""
+    testcase.assertEqual(errors_multiset(doc), collections.Counter(expected), msg or doc.get("path"))
 
 
 def doc_by_path(report, path):

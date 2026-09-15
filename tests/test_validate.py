@@ -2975,13 +2975,37 @@ class TestOptionalDates(TempBrainTestCase):
                 path = f"documents/{field}-control-{number}.md"
                 paths.add(path)
                 self.write(path, note_doc(**{field: value}))
-            mismatch = f"documents/{field}-mismatch.md"
-            paths.add(mismatch)
-            self.write(mismatch, note_doc(**{field: None}, needs_review=("created", "reviewed", "summary", "kind", "origin", field)))
+            for number, value in enumerate((None, "~", "null", '\"\"')):
+                mismatch = f"documents/{field}-mismatch-{number}.md"
+                paths.add(mismatch)
+                self.write(mismatch, note_doc(**{field: value}, needs_review=("created", "reviewed", "summary", "kind", "origin", field)))
         _proc, report = self.validate(paths)
         for path in paths:
-            expected = [("needs_review", "needs_review_mismatch")] if path.endswith("mismatch.md") else []
+            expected = [("needs_review", "needs_review_mismatch")] if "-mismatch-" in path else []
             support.assert_errors(self, support.doc_by_path(report, path), expected, path)
+
+    def test_both_optional_dates_absent_is_valid(self):
+        self.write("documents/absent.md", note_doc())
+        proc, report = self.validate({"documents/absent.md"})
+        doc = support.doc_by_path(report, "documents/absent.md")
+        support.assert_errors(self, doc, [])
+        self.assertEqual(doc["status"], "valid")
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(proc.returncode, 0)
+
+    def test_unquoted_impossible_optional_date_stays_malformed(self):
+        paths = set()
+        for field in ("fresh_until", "first_seen"):
+            path = f"documents/{field}-impossible.md"
+            paths.add(path)
+            self.write(path, note_doc(**{field: "2026-02-30"}))
+        _proc, report = self.validate(paths)
+        for path in paths:
+            with self.subTest(path):
+                doc = support.doc_by_path(report, path)
+                self.assertEqual(doc["frontmatter"], "malformed")
+                self.assertEqual(doc["status"], "invalid")
+                support.assert_errors(self, doc, [(None, "malformed")], path)
 
 
 class TestCustomAllowedValuesShape(TempBrainTestCase):
@@ -2993,8 +3017,10 @@ class TestCustomAllowedValuesShape(TempBrainTestCase):
             with self.subTest(values=values):
                 self.write(".brain/types/custom/recipe.json", self._definition(values))
                 self.write("documents/recipe.md", note_doc(type='"recipe"', cuisine="123"))
-                _proc, report = self.validate({"documents/recipe.md"})
+                proc, report = self.validate({"documents/recipe.md"})
                 self.assertEqual(report["definitions"], [{"path": ".brain/types/custom/recipe.json", "code": "invalid_definition", "message": "missing or wrongly typed keys"}])
+                self.assertEqual(report["outcome"], "invalid")
+                self.assertEqual(proc.returncode, 3)
                 support.assert_errors(self, support.doc_by_path(report, "documents/recipe.md"), [("type", "unknown_type")])
                 os.unlink(os.path.join(self.tmpdir, ".brain/types/custom/recipe.json"))
 
@@ -3010,16 +3036,35 @@ class TestCustomAllowedValuesShape(TempBrainTestCase):
         _proc, report = self.validate({"documents/empty.md", "documents/thai.md", "documents/martian.md"})
         self.assertEqual(report["definitions"], [])
         support.assert_errors(self, support.doc_by_path(report, "documents/thai.md"), [])
+        self.assertEqual(support.doc_by_path(report, "documents/thai.md")["status"], "valid")
         support.assert_errors(self, support.doc_by_path(report, "documents/martian.md"), [("cuisine", "not_allowed")])
 
     def test_failed_note_definition_leaves_the_base_type_in_force(self):
-        self.write(".brain/types/custom/note.json", self._definition([1], name="note"))
+        # This definition both reuses the base type name and has a non-string
+        # member, so only its single entry is asserted, not which code it carries.
+        definition = json.loads(self._definition([1], name="note"))
+        definition["allowed_values"] = {"status": [1]}
+        self.write(".brain/types/custom/note.json", json.dumps(definition))
         self.write("documents/note.md", note_doc())
-        _proc, report = self.validate({"documents/note.md"})
-        self.assertEqual(len(report["definitions"]), 1)
-        self.assertEqual(report["definitions"][0]["code"], "invalid_definition")
-        support.assert_errors(self, support.doc_by_path(report, "documents/note.md"), [])
+        proc, report = self.validate({"documents/note.md"})
+        self.assertEqual([entry["path"] for entry in report["definitions"]], [".brain/types/custom/note.json"])
+        doc = support.doc_by_path(report, "documents/note.md")
+        support.assert_errors(self, doc, [])
+        self.assertEqual(doc["status"], "valid")
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
 
+    def test_single_non_string_member_is_exactly_invalid_definition(self):
+        self.write(".brain/types/custom/recipe.json", self._definition([1]))
+        self.write("documents/recipe.md", note_doc(type='"recipe"'))
+        proc, report = self.validate({"documents/recipe.md"})
+        self.assertEqual(
+            [(entry["path"], entry["code"]) for entry in report["definitions"]],
+            [(".brain/types/custom/recipe.json", "invalid_definition")],
+        )
+        support.assert_errors(self, support.doc_by_path(report, "documents/recipe.md"), [("type", "unknown_type")])
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
 
 
 if __name__ == "__main__":

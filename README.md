@@ -41,7 +41,7 @@ Planned work and its status are tracked in this repository's [issues](https://gi
 
 - GitHub issues and pull requests are the authority for work state; documents link to them rather than tracking status.
 - Changes to behaviour update the specification (and its version) in the same pull request.
-- Public content is freshly authored; examples are synthetic.
+- Public content is freshly authored; examples are synthetic. Third-party code is added only as a pinned, vendored library with its licence, named in the specification.
 
 ## License
 

@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: f5237ea5540b63a27feec27b23da968bbe75f7d31fb8b21b0c61b29b7304daab
+Version: 002a151be516f8c5d4aeae8e790e3283a37a55b19ec2fbf6f7fe53de81911e72
 Publication: published — draft pull request for review; proposed, not accepted
 Status: **Proposed.** The beta is being specified, not implemented. Nothing described here exists yet.
 
@@ -22,7 +22,7 @@ Users also want to keep their knowledge in ordinary Markdown that stays useful i
 
 ## Solution
 
-A public starter repository, `agent-brain`, from which a user creates their own separate, private **brain**: a folder of ordinary Markdown documents with a small frontmatter contract, plus agent skills and supporting code copied into hidden folders.
+A public starter repository, `agent-brain`, from which a user creates their own separate, private **brain**: a folder of ordinary Markdown documents whose properties (YAML frontmatter, as Obsidian reads it) carry a small `kb` (knowledge base) metadata contract, plus agent skills and supporting code copied into hidden folders.
 
 - **Skills are the entry point.** A Claude session opened at the brain root uses skills to find knowledge, read selected evidence, save results and ingest new material. Claude is the required entry path for the beta; Codex support is optional and claimed only once demonstrated.
 - **Code does the mechanics.** Skills call a command-line interface that takes an explicit brain root and returns JSON. The code validates documents, persists them safely, maintains an index, discovers candidates, reads bounded excerpts, audits out-of-band changes and composes ingestion runs. The model proposes; the code validates and applies.
@@ -45,13 +45,13 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 
 ### Documents and validation
 
-7. As a user, I want every managed document to carry the `kb` marker and the base fields, so that any document can be validated and discovered consistently.
+7. As a user, I want every managed document to carry the `kb` (knowledge base) format marker and the base fields, so that any document can be validated and discovered consistently.
 8. As an operator, I want validation to fail loudly, naming every invalid field of every invalid document, so that a problem is never silently skipped.
-9. As a user, I want uncertainty recorded field by field (`created: unknown`, `reviewed: never`, `kind: unknown`, `type: unclassified`, empty summary, with freshness unknown when `fresh_until` is absent) independently of origin, so that a document with a known origin can still say what is unknown.
+9. As a user, I want uncertainty recorded field by field (unknown creation date, no recorded review, `kind: unknown`, `type: unclassified`, empty summary, with freshness unknown when `fresh_until` is absent) independently of origin, so that a document with a known origin can still say what is unknown.
 10. As a user, I want `needs_review` to list exactly the fields that hold uncertainty values, so that open questions about a document are visible in one place.
 11. As a user, I want `origin` to be one or more references with retrieval dates, or `authored`, or `unknown`, where only audit correction or an explicit human statement may set `unknown`, so that where content came from is always recorded honestly.
 12. As a user, I want type definitions to be data files read from the brain root, so that custom document types validate without code changes.
-13. As an operator, I want a malformed file (unparseable frontmatter, outside the supported frontmatter subset) reported as `invalid` and never modified, so that damaged or unusual notes are surfaced, not rewritten.
+13. As an operator, I want malformed frontmatter (not valid YAML, not a mapping, duplicate property names) reported as `invalid`, and valid YAML that the brain cannot safely edit reported as unsupported, both never modified, so that damaged or unusual notes are surfaced, not rewritten.
 
 ### Persistence
 
@@ -97,8 +97,8 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 41. As a user, I want an audit command that lists data-zone changes made outside brain operations since the last audit position — commits without a valid trailer, and uncommitted changes — so that out-of-band edits are found by code, not by guesswork.
 42. As a user, I want audit to classify trailer commits as `record_backed`, `consistent_unrecorded`, `inconsistent_trailer` or `unparseable_trailer`, and commits without a trailer as `out_of_band`, so that I know how much each change can be trusted.
 43. As a user, I want audit to state that a trailer proves internal consistency, not authorship, so that a forged but consistent trailer is not reported as verified.
-44. As a user, I want audit after a fresh clone or loss of generated state to report consistent trailer commits as unverifiable, not verified, while still flagging inconsistent, unparseable and out-of-band commits, so that lost local records reduce confidence rather than invent it.
-45. As a user, I want correction to add the `kb` marker and deterministic fields to new unmanaged notes, re-index edited managed documents, follow renames and mark removals, only ever appending and never altering existing bytes, so that my notes join the brain without being rewritten.
+44. As a user, I want audit after a fresh clone or loss of the operation journal to report consistent trailer commits as unverifiable, not verified, while still flagging inconsistent, unparseable and out-of-band commits, so that lost local records reduce confidence rather than invent it.
+45. As a user, I want correction to add the `kb` marker and deterministic fields to new unmanaged notes, re-index edited managed documents, follow renames and mark removals, only ever appending and never altering existing bytes (including comments), so that my notes join the brain without being rewritten.
 46. As a user, I want correction to refuse a file whose existing field holds an invalid value (`correction_blocked`) and never touch a malformed file, so that correction cannot damage what it does not understand.
 47. As a user, I want audit and correction to make no model call, so that they are deterministic and repeatable.
 
@@ -127,16 +127,28 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 62. As an evaluator, I want a harness that builds a synthetic brain at a pinned commit, copies it per run, strips skills, code and index for a baseline arm, isolates each run's configuration and captures each run's transcript and usage, so that brain-assisted and baseline sessions can be compared honestly.
 63. As an evaluator, I want an acceptance run and evaluation report covering every scenario in Verification Decisions on Claude, reporting per phase and cumulatively with no target and unknowns kept unknown, so that the beta is accepted on evidence.
 
+### Format, retained sources and reconciliation
+
+64. As a user, I want a document marked with an unsupported format version (for example `kb: 2`) reported as `unsupported_version` and left untouched, so that a newer or foreign format is never treated as an unmanaged note and rewritten.
+65. As a user, I want every document the brain writes to be ordinary YAML frontmatter that Obsidian shows with the intended property types, and my comments, ordering and untouched properties preserved when an operation updates a field, so that editing in Obsidian and working through agents do not fight each other.
+66. As a user, I want retained originals and attachments recognised as source evidence, never validated, indexed, discovered or corrected as notes, with their bytes and recorded hashes intact, so that the evidence behind a document cannot be silently altered.
+67. As a user, I want files from an interrupted ingestion to stay unpublished through rebuild, discovery, read and audit, even after local operation records are lost, so that recreating an index or making an audit commit never publishes half a run.
+68. As a user, I want an explicit way to adopt my own new notes, retry an interrupted ingestion, or abandon its leftovers when the brain cannot tell them apart, so that uncertainty is resolved by a recorded decision rather than a guess.
+
 ## Implementation Decisions
 
-Each decision is numbered (C1…C17, with C5a) so stories can reference it. Field names, outcome names and command names below are part of the contract.
+Each decision is numbered (C1…C17, with C5a and C13a) so stories can reference it. Field names, outcome names and command names below are part of the contract.
 
 ### C1. Runtime and packaging
 
-- Supporting code is Python 3.11+ using only the standard library, plus the `git` command (2.30+) for git-backed brains. No package installation, daemon, network service, MCP server or Obsidian dependency.
+- Supporting code is Python 3.11+ using the standard library plus **one vendored library, PyYAML** (pure-Python build, MIT licence, exact version pinned), used only to parse frontmatter. It also uses the `git` command (2.30+) for git-backed brains. No package installation, daemon, network service, MCP server or Obsidian dependency.
+- **Dependency policy (proposed in this revision).** A frontmatter reader must agree with how YAML — and therefore Obsidian — interprets properties. A hand-written subset parser cannot guarantee that. PyYAML's source and licence ship in the starter's `vendor/` folder, and setup copies them into the brain, so users still install nothing.
+  - Tradeoff: upstream fixes are adopted by deliberately bumping the pinned copy, and the optional C accelerator is not used.
+  - Alternative considered: require the user to install PyYAML. Rejected because it adds a setup step and version drift.
+  - The dependency is never used to write frontmatter (C4).
 - One command-line entry point, `brain`, with subcommands `setup`, `validate`, `persist`, `recover`, `rebuild`, `discover`, `read`, `audit`, `ingest`, `grant`. It is invoked as `python3 bin/brain` from the starter repository root (development and tests) and as `python3 .brain/bin/brain` inside a brain; nothing is installed.
 - Every subcommand except `setup` requires `--root <brain>`; the root is never inferred from the working directory. Structured input is a JSON document on stdin or `--input <file>`. Output is exactly one JSON object on stdout carrying `outcome`.
-- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, and `invalid` from `validate`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
+- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, `needs_resolution`, and `invalid` from `validate`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
 
 ### C2. Brain layout and folder categories
 
@@ -148,7 +160,8 @@ Each decision is numbered (C1…C17, with C5a) so stories can reference it. Fiel
   .claude/skills/  .agents/skills/   copied skills (system)
   .brain/                      copied code, base and module types, setup record (system)
   .brain/types/custom/         user-added type definitions (user data)
-  .brain/state/                generated: index, intents, change records, backups, temps (ignored)
+  .brain/journal/              operation journal: journal epoch, intents, run manifests, change records (ignored; not rebuildable)
+  .brain/state/                rebuildable cache: index, backups, temps (ignored)
 ```
 
 | Category | Starter repository | Brain |
@@ -157,6 +170,11 @@ Each decision is numbered (C1…C17, with C5a) so stories can reference it. Fiel
 | User data | absent (synthetic examples only, never a real brain) | tracked in the brain's private git |
 | Generated state | never present | always git-ignored |
 
+Generated state has two parts:
+- **Rebuildable cache** (`.brain/state/`). `rebuild` may delete and recreate it.
+- **Operation journal** (`.brain/journal/`). It records operations in flight and cannot be derived from files. `rebuild` never creates, deletes or modifies it.
+- **Journal lost.** The journal is *present* when its `epoch.json` names the brain id recorded in the setup record. Losing it is the "fresh clone or lost journal" case in C8 and C12.
+
 `wiki/` is a persist target for synthesis documents. No beta operation compiles or regenerates `wiki/` content.
 
 ### C3. Setup
@@ -164,29 +182,57 @@ Each decision is numbered (C1…C17, with C5a) so stories can reference it. Fiel
 `brain setup --starter <checkout> --target <folder> [--git] [--module projects]`:
 
 1. Refuse unless the starter checkout is clean and its `HEAD` commit resolves; refuse a non-empty target or a target inside another repository's working tree.
-2. Create the layout; copy skills to both skill folders, code, base types and selected modules under `.brain/`.
-3. Write `.brain/setup.json`: `starter_url`, `commit`, `created`, `modules`, and `copied: [{path, sha256}]`.
-4. Write `.gitignore` containing the generated-state folder. With `--git`, initialise a repository and make the first commit with trailer `Brain-Op: setup`.
+2. Create the layout; copy skills to both skill folders, and code (including the vendored library), base types and selected modules under `.brain/`; create the journal with `epoch.json` naming a new brain id.
+3. Write `.brain/setup.json`: `brain_id`, `starter_url`, `commit`, `created`, `modules`, and `copied: [{path, sha256}]`.
+4. Write `.gitignore` containing the journal and cache folders. With `--git`, initialise a repository and make the first commit with trailer `Brain-Op: setup`.
 5. Smoke check: Python and git versions; create and refuse a hard link inside a data zone and inside state; validate the empty brain. Any failure → outcome `setup_failed` naming the check; with a failed hard-link check the brain must not be used for `create`.
 
 The setup skill wraps this command and explains the private-repository recommendation. Contribute-back and update skills are post-beta; the setup record makes them possible later.
 
-### C4. Frontmatter subset and document versions
+### C4. Frontmatter, format version and document versions
 
-- A **managed document** is a UTF-8 Markdown file whose first line is `---`, followed by a frontmatter block closed by a `---` line, containing `kb: 1`.
-- A Markdown file with no frontmatter block, or with a block that parses within the subset but has no `kb` key, is **unmanaged**. It is not an error. Audit brings it under management (C12).
-- A file whose first line is `---` but whose block does not parse within the subset is **malformed** and reported `invalid`, whether or not a `kb` line is readable.
-- **Supported frontmatter subset:**
-  - Encoding and lines: UTF-8 without a byte-order mark. Lines end in LF or CRLF. Blank lines inside the block are allowed. Comment lines, duplicate keys and tab indentation make the file malformed.
-  - Each top-level line is `key: value` or `key:`. A key is lowercase letters, digits and `_`.
-  - Scalars: a **plain scalar** is everything after `: ` to the end of the line, with trailing spaces stripped; `#` and `: ` inside it are literal. A **quoted scalar** is enclosed in double quotes, with `\"` and `\\` as its only escapes. `key:` with nothing after it, and `key: ""`, are both the empty string.
-  - Lists: `key: []` is the only inline form and means an empty list. A **block list** is `key:` followed by items indented two spaces as `  - <scalar>`.
-  - `origin` alone may hold a block list of mappings. Each item is `  - ref: <scalar>` followed by `    retrieved: <scalar>` on the next line, in that order.
-  - Anything else — nested mappings, inline lists with items, mappings under other keys — is malformed.
-- Code never re-serialises frontmatter; it appends lines.
-- Dates are `YYYY-MM-DD`. `kb` must be the plain scalar `1`.
+**`kb` and versions.**
+- `kb` stands for *knowledge base*.
+- `kb: 1` (the unquoted integer) is the **managed-document format version**: the schema this specification defines. It is not a formatter setting, a content revision, a freshness indicator or an approval status.
 - A document's **version** is the SHA-256 of its full file bytes.
-- A document **id** is minted once as a lowercase 26-character ULID, never reused, never derived from the path, and survives renames.
+- A document **id** is minted once as a lowercase 26-character ULID (Crockford base32 alphabet, without `i`, `l`, `o`, `u`). It is never reused, never derived from the path, and survives renames.
+
+**Frontmatter is YAML, as in Obsidian properties.** A Markdown file has frontmatter when its first line, after an optional UTF-8 byte-order mark, is `---` and a later line is `---`. The block between is parsed with a YAML safe loader. Code additionally detects duplicate property names, which the loader alone would silently resolve to the last value. Each Markdown file is exactly one of:
+
+| Class | Condition | Treatment |
+| --- | --- | --- |
+| `unmanaged` | no frontmatter, or a valid YAML mapping with no `kb` property | a user note; audit may bring it under management (C12) |
+| `managed` | valid YAML mapping with `kb: 1` | validated against C5 |
+| `unsupported_version` | `kb` holds any other integer | reported; never validated as `kb: 1`, indexed as a candidate, corrected or written |
+| `malformed` | unclosed block, invalid YAML, a top-level value that is not a mapping, duplicate property names, or `kb` holding a non-integer | reported `invalid`; never written |
+
+Valid YAML is **unsupported for editing**, but not malformed, when the block uses anchors, aliases, explicit tags, multiple documents, or flow style for the whole mapping (for example JSON-style frontmatter, which Obsidian also accepts). Such a note keeps its class above. Operations that would have to change the block refuse with `unsupported_frontmatter` and leave the file byte-identical.
+
+**Reading values.**
+- A text property must parse to a string.
+- An unquoted value that YAML reads as something else — `yes` becomes a boolean, `[[Link]]` becomes a nested list, `12` becomes a number — is `invalid` with code `ambiguous_scalar` and a hint to quote it. It is never coerced.
+- A date property accepts a YAML date or a `YYYY-MM-DD` string.
+- An empty value is YAML null.
+- `#` preceded by a space begins a YAML comment. An unquoted `: ` inside a value is a YAML error. Values containing either must be quoted.
+
+**Canonical written form.** Everything code writes parses to the same values under YAML 1.1 and 1.2, and uses Obsidian's property formats:
+- a block-style mapping with one property per line, LF line endings, no comments written by code;
+- `kb: 1` as an unquoted integer;
+- every text value in double quotes, escaping only `\"` and `\\`; single-line fields reject line breaks;
+- dates unquoted as `YYYY-MM-DD`; unknown or absent-by-design values written as an empty value (`created:`);
+- lists as block lists with two-space `  - "item"` entries, and an empty list as `[]`;
+- `origin` references as block-list mappings (`  - ref: "…"` then `    retrieved: 2026-09-14`). Obsidian shows nested properties only in source mode, a documented limitation accepted for this one field.
+
+**Editing existing frontmatter.** Two separate rules:
+- **Audit correction is additive** (C12). It appends missing properties in canonical form immediately before the closing `---`, and changes no existing byte, comment or ordering. Afterwards every original line must be byte-identical, and a re-parse must equal the previous mapping plus exactly the added properties; otherwise the file is restored and reported `correction_blocked`.
+- **Persist updates use targeted property replacement** (C6).
+  - For each property the request changes, only that property's lines are replaced: its key line and the indented continuation lines belonging to it. New properties are appended; removed properties have their lines deleted.
+  - Comments, ordering and every untouched property's bytes are preserved.
+  - A re-parse must equal the intended mapping. Otherwise, or when the block is unsupported for editing, the update is refused with `unsupported_frontmatter`.
+  - A reviewed write may instead supply the complete new frontmatter with `replace_frontmatter: true`. That always counts as an overwrite (C14).
+- Code never re-serialises a whole frontmatter block it did not create.
+
+**Editor rewrites.** Obsidian may re-save a block in its own style, for example rewriting JSON-style frontmatter as YAML, or changing quoting. Validity depends on parsed values, not on the exact text, so a semantically equal rewrite stays valid. It is still a byte change: a new document version and an out-of-band change for audit.
 
 ### C5. Field contract (`kb: 1`)
 
@@ -200,24 +246,24 @@ Optional: `fresh_until`, `first_seen`, `needs_review`, `supersedes`, `superseded
 | `kind` | `source`, `synthesis`, `query-output`, `decision`, `project-context`, `unknown` |
 | `authored_by` | `human`, `agent`, `mixed` |
 | `retention` | `ephemeral`, `durable` |
-| `created` | ISO date or `unknown` |
-| `reviewed` | ISO date or `never` |
+| `created` | date, or empty meaning unknown |
+| `reviewed` | date, or empty meaning no review recorded |
 | `summary` | at most 300 characters; empty means undescribed |
-| `origin` | list of `{ref, retrieved}` (`retrieved` an ISO date or `unknown`), or `authored`, or `unknown` |
+| `origin` | list of `{ref, retrieved}` (`retrieved` a date, or empty meaning unknown), or `authored`, or `unknown` |
 | `evidence`, `derived_from`, `conflicts_with`, `supersedes` | lists of brain ids or external URLs |
 
 Rules:
-- **Uncertainty values** are valid for any origin: `created: unknown`, `reviewed: never`, `kind: unknown`, `type: unclassified`, empty `summary`, `origin: unknown`, any `retrieved: unknown` (named as field `origin`), and any value a type definition declares under `uncertainty_values`.
+- **Uncertainty values** are valid for any origin: empty `created`, empty `reviewed`, `kind: unknown`, `type: unclassified`, empty `summary`, `origin: unknown`, any empty `retrieved` (named as field `origin`), and any value a type definition declares under `uncertainty_values` (which may be empty). Date properties use empty rather than a word such as `unknown` so that Obsidian, which assigns one type to a property name across the whole vault, keeps them valid dates.
 - `needs_review` must list exactly the fields holding uncertainty values, in any order. It is absent or `[]` when there are none.
 - An absent `fresh_until` means freshness is unknown, but it is not an uncertainty value for `needs_review`.
 - A `kind: unknown` document never counts as a source.
 - `evidence`, `derived_from`, `conflicts_with` and `supersedes` entries are each an id (C4 shape) or an `http`/`https` URL.
 - **Who may write `origin: unknown`.** Validation accepts the value; the writing operations enforce who may write it. Audit correction may write it. `persist` refuses it unless the request is a reviewed write (C14).
 
-Base types: `note` (general authored note; any durable data zone or module folder), `document` (processed item; `documents/` only), `wiki-page` (synthesis; `wiki/` only), `unclassified` (any durable data zone or module folder). The `document` type additionally requires `source_identity`, `original` (relative path of the kept original) and `original_sha256`.
+Base types: `note` (general authored note; any durable data zone or module folder), `document` (processed item; `documents/` only), `wiki-page` (synthesis; `wiki/` only), `unclassified` (any durable data zone or module folder). The `document` type additionally requires `source_identity`, `original` (path of the retained original, relative to the document's folder) and `original_sha256`, and allows `attachments` (list of relative paths).
 
 Type definitions:
-- **File shape.** Each definition is a JSON file named `<type>.json` with keys `type`, `zones` (list of zone folder names, or `["*"]` for any durable data zone or module folder), `required` (additional field names), `allowed_values` (object mapping field to list of allowed strings), `uncertainty_values` (object mapping field to one value, optional), `display_fields` and `search_fields` (lists).
+- **File shape.** Each definition is a JSON file named `<type>.json` with keys `type`, `zones` (list of zone folder names, or `["*"]` for any durable data zone or module folder), `required` (additional field names), `allowed_values` (object mapping field to list of allowed strings), `uncertainty_values` (object mapping field to one value, possibly null, optional), `display_fields` and `search_fields` (lists).
 - **Locations.** Base definitions ship with the code, in the starter's `types/base/` and in a brain's `.brain/types/base/`, and are always read from beside the running code. Module definitions are in `.brain/modules/<module>/types/`. Custom definitions are in `<root>/.brain/types/custom/`.
 - **Enforcement.** Zones are enforced. A document whose `type` has no definition is invalid (`unknown_type`). A custom definition that reuses a base or module type name, has a malformed file, or has a file name that does not match its `type` makes validation's outcome `invalid`, with a `definitions` error.
 - Identity keys and relation types are post-beta.
@@ -229,18 +275,19 @@ Type definitions:
 ```json
 {
   "outcome": "valid | invalid",
-  "counts": {"valid": 0, "invalid": 0, "unmanaged": 0},
+  "counts": {"valid": 0, "invalid": 0, "unmanaged": 0, "unsupported_version": 0, "retained": 0},
   "definitions": [{"path": "…", "code": "…", "message": "…"}],
   "documents": [
-    {"path": "documents/x/x.md", "status": "valid | invalid | unmanaged",
+    {"path": "documents/x/x.md", "status": "valid | invalid | unmanaged | unsupported_version | retained",
      "id": "… or null", "type": "… or null", "version": "sha256",
-     "errors": [{"field": "summary | null", "code": "missing | not_allowed | too_long | bad_format | needs_review_mismatch | unknown_type | wrong_zone | malformed", "message": "…"}]}
+     "errors": [{"field": "summary | null", "code": "missing | not_allowed | too_long | bad_format | ambiguous_scalar | needs_review_mismatch | unknown_type | wrong_zone | malformed | unsupported_frontmatter | retained_changed", "message": "…"}]}
   ]
 }
 ```
 
 - `documents` lists every scanned file, sorted by path (POSIX, relative to the root).
-- An error's `field` is null only for `malformed`.
+- An error's `field` is null only for `malformed` and `unsupported_frontmatter`.
+- Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. A retained file whose bytes no longer match its recorded hash carries `retained_changed`, which makes the outcome `invalid`.
 - A document reports every error it has, not just the first.
 - `outcome` is `invalid` when any document is invalid or any definition error exists. An empty brain is `valid`.
 - Exit code: `0` for `valid`, `3` for `invalid`, `2` for a refused request (for example a missing or nonexistent `--root`).
@@ -248,21 +295,21 @@ Type definitions:
 
 ### C6. Single-file persist
 
-Request: `{operation: create|update|attach, path, frontmatter?, body?, content_base64?, for_document?, expected_version?, run_id?}`. Sequence:
+Request: `{operation: create|update|attach, path, frontmatter?, body?, content_base64?, for_document?, expected_version?, run_id?, replace_frontmatter?}`. `create` writes the canonical form. `update` applies targeted property replacement (C4). Writes to `retained` files, `unsupported_version` documents and unsupported-for-editing blocks are refused. Sequence:
 
 1. Validate the request and the resulting document against C5 and its type.
-2. Record an intent under `.brain/state/intents/`: `run_id`, `op_key`, `path`, `expected_prior` (`absent` or a hash), `intended_sha256`, temp path, backup path.
+2. Record an intent in the journal (`.brain/journal/intents/`): `run_id`, `op_key`, `path`, `expected_prior` (`absent` or a hash), `intended_sha256`, temp path, backup path.
 3. Write a temp file in the target's directory, `fsync`, and verify its hash.
 4. Re-check the target against `expected_prior`.
-5. Apply. `create` and `attach`: hard-link the temp file to the target; the link fails if the target exists, and there is no fallback. `update`: copy the current target to a backup in state, then atomically replace.
+5. Apply. `create` and `attach`: hard-link the temp file to the target; the link fails if the target exists, and there is no fallback. `update`: copy the current target to a backup in state, then atomically replace. Any operation refuses with `journal_missing` while the journal is not present (C8).
 6. Hash the target after applying.
-7. Bookkeeping: write the change record, update the index, commit (git brains).
+7. Bookkeeping: write the change record to the journal, update the index, commit (git brains).
 
 `op_key` = SHA-256 of `run_id`, `path` and `intended_sha256`. At most one change record and one commit exist per `op_key`.
 
 | Outcome | Meaning |
 | --- | --- |
-| `refused` | Target untouched; observed hash reported; reason named (`exists`, `version_mismatch`, `invalid`, `open_intent`, `review_required`). |
+| `refused` | Target untouched; observed hash reported; reason named (`exists`, `version_mismatch`, `invalid`, `open_intent`, `review_required`, `unsupported_frontmatter`, `unsupported_version`, `retained`, `journal_missing`). |
 | `failed_before_apply` | This operation did not apply; any temp file reported; includes `unsupported_filesystem`. |
 | `written` | Target hash equals intended hash and all bookkeeping finished. |
 | `written_incomplete` | Target hash equals intended hash; pending steps named (`change_record`, `index`, `commit`). |
@@ -279,25 +326,39 @@ Fault injection for tests: when `BRAIN_TEST_FAULTS=1`, the environment variable 
 Every brain commit message ends with a single final paragraph of trailers (git ignores trailer lines placed in any earlier paragraph):
 
 ```
-Brain-Op: create | update | attach | ingest | delete-raw | audit | grant | setup
+Brain-Op: create | update | attach | ingest | delete-raw | audit | adopt | journal-reset | resolve | grant | setup
 Brain-Run: <run_id>
 Brain-Key: <op_key>                      (one per applied write)
-Brain-Path: <path> sha256=<hash> prior=<absent|hash|deleted>   (one per path)
+Brain-Path: <path> sha256=<hash> prior=<absent|hash|deleted> [role=document|original|attachment]   (one per path; role on ingest)
 Brain-Grant: <id> maintenance=agent by=<agent|human>            (create and grant only)
-Brain-Review: approved by=human                                  (reviewed writes only)
+Brain-Review: approved|adopted|abandoned by=human                (reviewed writes and explicit resolutions)
+Brain-Unverified: <path> sha256=<hash>                            (journal-reset only)
 ```
 
 A trailer is **consistent** when the commit changes exactly the declared data-zone paths and each declared hash matches the committed content. Brain commits stage and commit only their declared paths, never other working-tree changes.
 
 ### C8. Index and publication visibility
 
-- The index lives in generated state and records, per managed document: id, path, version, size, modification time, type, module, display and search fields, summary, labels inputs, evidence and derivation lists. `rebuild` recreates it from files and reports invalid, unpublished and unverified files.
-- **Publication rule, shared by discover, read and rebuild.** A data-zone file is:
-  - `unpublished` when an open intent or open ingestion run names it — excluded from candidates; `read` returns outcome `unpublished` without content; counted as `interrupted` coverage.
-  - `unverified` when generated state is missing (fresh clone or loss) and, in a git brain, the file's current bytes are not committed — excluded from candidates and listed separately; `read` returns outcome `unverified` and gives content only when `include_unverified` is requested; audit correction publishes it by committing it.
-  - `changed_out_of_band` when state is present, no intent names it, and it differs from its index entry (discover compares size and modification time; read and rebuild compare bytes) — returned as a candidate with that label, with metadata taken from the current file where it parses.
-  - `published` otherwise.
-- In a brain without git, loss of generated state makes publication unverifiable for every file: `rebuild` marks all files `unverified` until the user runs `rebuild --accept-current-files`, which records that acknowledgement in state. Non-git brains are outside beta acceptance.
+- **Index.** The index lives in the rebuildable cache. For each managed document it records: id, path, version, size, modification time, type, module, display and search fields, summary, label inputs, evidence and derivation lists, role and publication status. `rebuild` recreates it from files, git history and the journal.
+- **Publication never depends on the index.** Recreating or deleting the index cannot publish or unpublish anything.
+- **Publication rule** (git brains). discover, read, rebuild, validate's `retained` status and audit all apply the same rule. The first matching rule wins.
+
+  1. **`unpublished`.** An open intent or open run manifest in the journal names the file. This holds even when someone has committed the file out of band; audit then reports `run_file_committed_out_of_band`. The file is excluded from candidates, `read` returns `unpublished` without content, and it counts as `interrupted` coverage.
+  2. **Retained original or attachment** (C13a). The file is never a candidate and never a note.
+  3. **Processed `document`.** Published only when its current path and bytes descend from a consistent `Brain-Op: ingest` commit that declared it `role=document`, or from an explicit `Brain-Op: adopt` commit, with later changes only through brain writes or audit-labelled edits. Otherwise it is **`unverified`** (`no_ingest_record`), even if a generic out-of-band or audit commit contains it.
+  4. **Other Markdown files** (notes, wiki pages, module documents, unmanaged notes):
+     - Committed: `published`. Out-of-band commits are ordinary human edits, labelled by audit.
+     - Uncommitted, journal present: `changed_out_of_band`. Returned as a candidate with that label, with metadata from the current file where it parses.
+     - Uncommitted, journal missing: `unverified` (`journal_missing`).
+  5. **`suspected_ingestion` hint.** Added to an `unverified` file when a surviving durable signal ties it to ingestion: an uncommitted `document` references it; its bytes equal a current `raw/` item (raw items are deleted only after a run commit); it sits in an item folder with such a file; or a `Brain-Unverified` trailer lists it.
+- **`unverified` files** are excluded from candidates and listed separately. `read` returns `unverified` and gives content only when `include_unverified` is requested. They become published only through an explicit resolution (C12, C13): adoption, a retried ingestion, or abandonment.
+- **Journal missing.** While the journal is not present, operations that write refuse with `journal_missing`. The user resolves this with `brain recover --start-journal`, an explicit human step that:
+  - creates a new journal epoch;
+  - makes a `Brain-Op: journal-reset` commit;
+  - lists every currently unverified file as `Brain-Unverified: <path> sha256=<hash>`, so its status survives a later rebuild or cache loss.
+
+  After the reset, those files stay `unverified` until resolved. New uncommitted edits made after the reset are ordinary `changed_out_of_band` changes.
+- **Brains without git.** Loss of the journal makes publication unverifiable for every file. `rebuild` marks all files `unverified` until the user runs `rebuild --accept-current-files`, which records that acknowledgement in a new journal. Non-git brains are outside beta acceptance.
 
 ### C9. Discover
 
@@ -308,15 +369,15 @@ Request: `{query, module?, type?, zone?, limit (default 10), as_of, max_bytes}`.
 3. Labels per candidate: `freshness` (`fresh` when `as_of` ≤ `fresh_until`, `stale` when after, `unknown` when absent), `status`, `superseded_by`, `newer_version_available`, `summary_may_be_outdated`, `changed_out_of_band`, `needs_review`, `conflicts_with`, and the `support` summary (C11).
 4. `summary_may_be_outdated` is derived from history: the body changed through an out-of-band or unattributed change after the last brain write that set the summary. It is never written into the note.
 
-Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage: {indexed, undescribed, invalid, interrupted, unverified, changed_out_of_band}, index: present|missing|stale, truncated, omitted_count}`.
+Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage: {indexed, undescribed, invalid, unsupported_version, interrupted, unverified, changed_out_of_band}, index: present|missing|stale, journal: present|missing, truncated, omitted_count}`. Retained originals and attachments never appear in `candidates` or `body_matches`.
 
-- `partial` when any coverage count other than `indexed` and `undescribed` is non-zero, or the index is missing or stale.
+- `partial` when any coverage count other than `indexed` and `undescribed` is non-zero, or the index is missing or stale, or the journal is missing.
 - `no_match` only when there are no candidates and no body matches and coverage is complete.
 - Truncation to `limit` or `max_bytes` sets `truncated` and `omitted_count` and does not by itself make the result partial.
 
 ### C10. Read
 
-Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unpublished|unverified, id, path, version, frontmatter, excerpt, truncated, origin, evidence: [{target, exists}], support, labels}`. External URLs are returned, never fetched.
+Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id, path, version, role: note|document|original|attachment, owner?, frontmatter, excerpt, truncated, origin, evidence: [{target, exists}], support, labels}`. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
 
 ### C11. Source identity, versions and support
 
@@ -327,15 +388,17 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
 ### C12. Out-of-band audit and correction (git brains)
 
 - **Audit position**: the latest consistent `Brain-Op: audit` commit; without one, the brain's first commit.
-- **Report** (`brain audit`): each commit since the position touching data zones gets an evidence level (`record_backed`, `consistent_unrecorded`, `inconsistent_trailer`, `unparseable_trailer`, `out_of_band`). With state present, a `consistent_unrecorded` commit is also flagged `unrecorded_trailer_commit`. Without state, consistent trailer commits are `unverifiable`. Uncommitted changes with no intent are `unattributed_uncommitted`. Each affected file is classified `managed_changed`, `unmanaged_new`, `managed_missing` (rename followed when git detects it, otherwise `removed`), `invalid` or `correction_blocked`.
+- **Report** (`brain audit`): each commit since the position touching data zones gets an evidence level (`record_backed`, `consistent_unrecorded`, `inconsistent_trailer`, `unparseable_trailer`, `out_of_band`). With the journal present, a `consistent_unrecorded` commit is also flagged `unrecorded_trailer_commit`. Without the journal, consistent trailer commits are `unverifiable`. Uncommitted changes with no intent are `unattributed_uncommitted`. Each affected file is classified `managed_changed`, `unmanaged_new`, `managed_missing` (rename followed when git detects it, otherwise `removed`), `invalid`, `unsupported_version`, `correction_blocked`, `retained_changed`, `retained_missing`, `run_file` (named by an open run) or `unverified` (with any `suspected_ingestion` hint).
 - **Correction** (`brain audit --apply`), code only:
   - `managed_changed`: re-hash and re-index; no file write.
-  - `unmanaged_new`: append a frontmatter block (or missing keys to an existing block) with `kb: 1`, new `id`, `title` (first heading, else file name), `type: unclassified`, `kind: unknown`, `status: draft`, `origin: unknown`, `authored_by: human`, `summary` empty, `created` (an existing valid value, else `unknown`), optional `first_seen` (date of the file's first commit), `reviewed: never`, `evidence: []`, `retention: durable`, and `needs_review`.
+  - `unmanaged_new` (only with the journal present, or when explicitly adopted): add a frontmatter block, or append missing properties to an existing supported block, following C4's additive rule. The properties are `kb: 1`, a new `id`, `title` (first heading, else file name), `type: "unclassified"`, `kind: "unknown"`, `status: "draft"`, `origin: "unknown"`, `authored_by: "human"`, empty `summary`, `created` (an existing valid value, else empty), optional `first_seen` (date of the file's first commit), empty `reviewed`, `evidence: []`, `retention: "durable"`, and `needs_review`. A block that is unsupported for editing is reported `correction_blocked` and left unchanged.
   - Verify afterwards that every original line is byte-identical; otherwise restore and report `correction_blocked`.
   - An existing key holding an invalid base-field value → `correction_blocked`, file unchanged. Malformed files → `invalid`, unchanged.
   - `managed_missing`: update the index (follow rename or mark removed); never write files.
   - Commit corrected and unattributed files with `Brain-Op: audit`, which becomes the new position.
-- Audit never rewrites `authored_by` or any existing value, and makes no model call.
+  - **Never corrected or committed by an audit commit:** `unpublished` and `run_file` files; retained originals and attachments; `unsupported_version` documents; processed `document`s without an ingest record; and any `unverified` file. `retained_changed` and `retained_missing` are reported for review. Restoring or accepting new bytes for a retained file is an overwrite (C14).
+- **Explicit adoption** (`brain audit --apply --adopt <path>…`): a human-confirmed resolution for `unverified` files the user identifies as their own notes, including files with a `suspected_ingestion` hint, which the report shows before confirmation. It applies the additive correction where needed, commits with `Brain-Op: adopt` and `Brain-Review: adopted by=human`, and publishes the files. An adopted `document` is published as a document and not as an ingestion.
+- Audit never rewrites `authored_by` or any existing value, never writes because an event or hint was received, and makes no model call.
 
 ### C13. Ingestion runs
 
@@ -344,29 +407,45 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
   1. Re-hash the raw item; a mismatch → `refused` with `raw_changed` before any write.
   2. Look up published `document`s with the same source identity. Same `original_sha256` → `duplicate`: write nothing, return the existing id, its recorded retrieval dates and the new retrieval date, then run the raw-deletion step. Different hash → continue as a new version: the new document gets its own id and `previous_version`, and the proposal must include a `supersession_assessment` (`replaces`, `partially_updates`, `conflicts_with` or `unrelated`, with reasons).
   3. Review check (C14). Unresolved fields or an overwrite → `review_required`, nothing written.
-  4. Record one run intent listing every file: kept original (`documents/<slug>/original.<ext>`), attachments, processed document (`documents/<slug>/<slug>.md`).
+  4. Write a run manifest to the journal listing every file with its role and intended hash: retained original (`documents/<slug>/original/<original file name>`), attachments (`documents/<slug>/attachments/…`), processed document (`documents/<slug>/<slug>.md`, whose `original` and `attachments` properties reference the others).
   5. Write the original and attachments, then the processed document, each through C6 steps 1–6 with its own intent. Change records are `pending`; index updates are staged; no per-file commit. The kept original's hash must equal `raw_sha256`.
-  6. Once every file is at its intended hash, make one commit (`Brain-Op: ingest`, one `Brain-Path` per file), mark change records committed, apply staged index updates. Any `target_unexpected` stops the run before commit; nothing is published.
+  6. Once every file is at its intended hash, make one commit (`Brain-Op: ingest`, one `Brain-Path` per file with its `role`), close the run manifest, mark change records committed, apply staged index updates. Any `target_unexpected` stops the run before commit; nothing is published.
   7. Raw deletion: record a deletion intent with `raw_sha256`; re-read the raw item; if its hash differs, do not delete (`raw_changed`); otherwise delete and commit with `Brain-Op: delete-raw` and `prior=<hash>`.
 - **Run outcomes**: `ingested`, `ingested_raw_retained`, `not_published`, `target_unexpected`, `duplicate`, `new_version` (supersession pending review), `review_required`, `refused`.
-- **Retry** with the same `run_id`: skip files already at their intended hash, commit once, repeat the raw-deletion check. When generated state was lost, a create whose target already exists, is `unverified` and holds exactly the intended bytes is treated as applied; any other existing target is refused.
+- **Retry** with the same `run_id`: skip files already at their intended hash, commit once, repeat the raw-deletion check. After the journal was lost and restarted, a create whose target already exists, is `unverified` and holds exactly the intended bytes is treated as applied; any other existing target is refused. The ingest commit resolves those paths' `Brain-Unverified` entries.
+- **Abandon** (`brain ingest abandon --run <run_id>` or `--paths <path>…`): a human-confirmed resolution. It removes uncommitted leftovers whose bytes equal the run manifest's intended hashes or the hashes recorded in `Brain-Unverified`. Files with any other bytes are left in place and reported. With the journal restarted, it commits `Brain-Op: resolve` with `Brain-Review: abandoned by=human`. Abandoning never deletes committed content or the `raw/` item.
+
+### C13a. Retained originals and attachments
+
+- **Role evidence.** A file's role as a retained original or attachment is established by durable evidence, checked in this order:
+  1. A published `document` references it through `original` or `attachments`.
+  2. A consistent `Brain-Op: ingest` commit declared it with `role=original` or `role=attachment`.
+  3. An open run manifest in the journal names it.
+
+  Evidence 1 and 2 are in git and survive loss of the cache and the journal. A folder name alone never establishes a role, and an ordinary user note is never reclassified because of where it sits.
+- **A retained file with role evidence:**
+  - is listed as `retained` by validate;
+  - is never parsed as frontmatter, validated, indexed as a candidate, matched on body text or corrected;
+  - is readable as evidence (C10);
+  - has its bytes compared with `original_sha256` or the trailer hash. A mismatch is `retained_changed`, a missing file is `retained_missing`, and both are reported and never repaired automatically.
+- **A Markdown original without role evidence** — for example left by an interrupted run after journal loss — is `unverified` with a `suspected_ingestion` hint when C8's signals apply. It is resolved by retry, adoption or abandonment, never by audit's automatic correction.
 
 ### C14. Review, authorship and maintenance grants
 
 - `authored_by` records who contributed content. Audit never changes it. A reviewed update applied to a document with out-of-band content changes since its last agent write sets `authored_by: mixed`.
 - A **maintenance grant** is recorded in history, never in frontmatter: an agent `create` of an agent-authored document carries `Brain-Grant: <id> maintenance=agent by=agent`; `brain grant --id <id>` makes a separate `Brain-Op: grant` commit with `by=human` after the skill obtains the user's explicit instruction.
-- A grant is valid only while every content change to the document since the grant is a `record_backed` or `consistent_unrecorded` brain write and the working copy is unchanged. After state loss, unverifiable commits make the grant invalid until a new grant.
+- A grant is valid only while every content change to the document since the grant is a `record_backed` or `consistent_unrecorded` brain write and the working copy is unchanged. After loss of the operation journal, unverifiable commits make the grant invalid until a new grant.
 - **Precedence** — the first matching rule applies:
   1. An open intent on the path: only `recover` may write.
-  2. Audit correction: may append missing fields without review, commits separately.
+  2. Audit correction: may append missing fields without review, commits separately; never applies to retained, unpublished, unverified or unsupported-version files.
   3. Automatic agent update, only when all hold: valid grant; current version agent-attributed; expected version matches; no unresolved values; the change does not delete, rename or move a document or replace an original or attachment.
   4. Anything else changing existing content requires review. A reviewed write carries `Brain-Review: approved by=human`; approving it does not create a grant.
-- **Overwrite**: any change to or removal of existing content not covered by rule 3. Replacing an original or attachment, and deleting, renaming or moving a document, always count. Creating a new path never counts.
+- **Overwrite**: any change to or removal of existing content not covered by rule 3. Replacing an original or attachment, accepting changed bytes of a retained file, `replace_frontmatter`, and deleting, renaming or moving a document, always count. Creating a new path never counts. Explicit adoption and abandonment are recorded human resolutions, not maintenance grants.
 - `supersedes` and `superseded_by` are written only by a reviewed update approving a supersession assessment. The prior version stays citable; discovery flags citations of it with `newer_version_available`.
 
 ### C15. Projects module
 
-- Folder `projects/<project-slug>/`. Types: `project` (required `project_status`: `active`, `paused`, `closed`; display fields `project_status`, `summary`) and `decision` (required `decision_status`: `proposed`, `accepted`, `superseded`; `decided` date or `unknown`, with `unknown` declared under `uncertainty_values`; display fields `decision_status`, `decided`).
+- Folder `projects/<project-slug>/`. Types: `project` (required `project_status`: `active`, `paused`, `closed`; display fields `project_status`, `summary`) and `decision` (required `decision_status`: `proposed`, `accepted`, `superseded`; `decided` a date, or empty declared under `uncertainty_values`; display fields `decision_status`, `decided`).
 - Module documents use the same base fields, persistence, discovery and audit as base documents; nothing in the code names these types.
 
 ### C16. Claude entry path
@@ -398,7 +477,7 @@ No other seam is introduced. A good test states a behaviour, runs the command, a
 
 ### Scenario catalogue
 
-Scenarios run against a brain created by `setup` from a pinned commit and populated with a synthetic collection: two synthetic projects (one of them the development example), about a dozen documents with relevance labels written before runs, one `incomplete`, one past `fresh_until`, one superseded pair, one conflicting pair, one synthesis citing only synthesis, one undescribed plain note, one malformed file and one document with an image attachment, with `as_of` fixed.
+Scenarios run against a brain created by `setup` from a pinned commit and populated with a synthetic collection: two synthetic projects (one of them the development example), about a dozen documents with relevance labels written before runs, one `incomplete`, one past `fresh_until`, one superseded pair, one conflicting pair, one synthesis citing only synthesis, one undescribed plain note, one malformed file, one `kb: 2` document, one note with comments and quoted properties, one ingested Markdown original and one document with an image attachment, with `as_of` fixed. **None of these scenarios has been executed**: the repository has no implementation yet, and each scenario becomes evidence only when its story's tests run.
 
 | Id | Scenario | Key injections |
 | --- | --- | --- |
@@ -414,11 +493,14 @@ Scenarios run against a brain created by `setup` from a pinned commit and popula
 | S-E3 | Kill at three points, each classified correctly by `recover` | `kill` at `after_intent`, `before_apply`, `after_apply` |
 | S-F | Traceability: id and version cited; origin and evidence returned; broken internal reference `exists: false`; external URLs verbatim | break an internal id |
 | S-F2 | Provenance graph: identity, version, declared derivation, same-content flag, broken reference, cycle, unknown node; changing a mirror's content never yields "independent" | alter mirror content |
-| S-G | Out-of-band change and correction: body edit committed without trailer; new unmanaged note; rename; an editor-style write-temp-then-rename save; discover `partial` with labels; audit classifies and corrects; later discover finds all at current paths; no model call | forged consistent trailer without a record; inconsistent trailer; unrecorded trailer commit with state present |
-| S-G2 | Fresh clone or lost state: consistent trailer commits `unverifiable`, never verified; unverified files hidden from candidates until audit publishes them | delete generated state |
-| S-G3 | Metadata correction and preservation: appended fields only; original lines byte-identical; `correction_blocked` on invalid existing value; malformed untouched; ingested document with known origin and `created: unknown` validates | invalid existing value |
+| S-G | Out-of-band change and correction: body edit committed without trailer; new unmanaged note; rename; an editor-style write-temp-then-rename save; discover `partial` with labels; audit classifies and corrects; later discover finds all at current paths; no model call | forged consistent trailer without a record; inconsistent trailer; unrecorded trailer commit with the journal present |
+| S-G2 | Fresh clone or lost journal: consistent trailer commits `unverifiable`, never verified; writes refused `journal_missing` until `--start-journal`; unverified files hidden from candidates and published only by explicit adoption; a human note adopted and then discoverable | delete the journal; delete the cache |
+| S-G3 | Metadata correction and preservation: appended properties only; original lines, comments and order byte-identical; `correction_blocked` on invalid existing value and on JSON-style or anchored frontmatter; malformed untouched; ingested document with known origin and empty `created` validates | invalid existing value |
+| S-G4 | Obsidian-compatible frontmatter: <br>(a) fixtures — a title containing `: ` (quoted), a value containing ` #` (quoted) and `#` without a space, quoted strings, a comment line, block and empty lists, dates, empty values, an unquoted `yes` and an unquoted `[[Link]]` (`ambiguous_scalar`); <br>(b) every document created by persist re-parses to its intended values under YAML 1.1 and 1.2; <br>(c) a targeted update of one property preserves comments, order and all other property bytes; <br>(d) an editor-style rewrite (JSON-style block re-saved as YAML, quoting changed) stays valid and is reported out of band; <br>(e) `kb: 2` is `unsupported_version`, not corrected, not written, not a candidate; <br>(f) duplicate property names are `malformed` | unquote a colon-space title; strip a comment during update; treat `kb: 2` as unmanaged; drop duplicate-key detection |
 | S-H | Ingestion and projects module: raw article ingested with original kept and origin recorded; raw removed after commit; a new custom type added by file validates and is discoverable with display fields; unresolved field stops for review | missing required type field |
-| S-H2 | Ingestion recovery: kill before publish (nothing discoverable, rebuild agrees, read `unpublished`); kill after run commit before raw deletion; raw modified after proposal → `raw_changed`, not deleted; duplicate with a new retrieval date writes nothing; new version with supersession proposed, not applied; state lost mid-run then retry adopts identical files | `kill` at `before_commit`, `after_run_commit`; modify raw; delete state |
+| S-H3 | Retained originals: ingest one Markdown source without frontmatter and one with its own frontmatter (including a `kb` property); run `validate`, `rebuild`, `discover`, `audit` and `audit --apply`; only the processed documents are candidates; originals are `retained`, never corrected, and still match `original_sha256`; modifying an original yields `retained_changed` and no repair; deleting the index and journal leaves roles recognised from committed evidence | add frontmatter to an original; delete the cache and journal; rename an ordinary note into an `original/` folder (stays a note) |
+| S-H4 | Interrupted ingestion through reconciliation, in both variants (journal kept; journal deleted). Steps: <br>1. Interrupt ingestion before its run commit. <br>2. Remove generated state. <br>3. `rebuild`. <br>4. `discover` and `read`: no run file is a candidate; read returns `unpublished` (journal kept) or `unverified` with `suspected_ingestion` (journal deleted). <br>5. `audit --apply`: no run file is corrected or committed; a normal human note created alongside is adopted automatically (journal kept) or via explicit `--adopt` (journal deleted). <br>6. `rebuild` again and retry ingestion: one document, one ingest commit, raw deleted once; `abandon` instead removes only byte-identical leftovers | `kill` at `before_commit`; delete cache; delete journal; commit run files out of band with plain git |
+| S-H2 | Ingestion recovery: kill before publish (nothing discoverable, rebuild agrees, read `unpublished`); kill after run commit before raw deletion; raw modified after proposal → `raw_changed`, not deleted; duplicate with a new retrieval date writes nothing; new version with supersession proposed, not applied; journal lost mid-run, restarted, then retry adopts identical files | `kill` at `before_commit`, `after_run_commit`; modify raw; delete the journal |
 | S-I | Review and maintenance: automatic update under a valid grant; stop after an out-of-band edit; one approved update does not restore automatic updates; explicit grant restores them; audit additions without review; open intent blocks writes; attachment replacement stops | out-of-band edit; open intent |
 | S-DEV | Development example: decision and evidence retrieved by a fresh process with evidence resolving; fresh Claude session answer cites the decision id and version | remove the decision's evidence target |
 
@@ -433,7 +515,7 @@ Out of the beta:
 - Contribute-back and update skills; inbox routing into modules; generated index notes; automatic backfill; non-git audit fallback (non-git brains work but carry the C8 limitation and are outside acceptance).
 - Compiling or regenerating `wiki/` content; content drafting and writing workflows.
 - Tracking modules (companies, people, application records, commitments), identity keys and relation types.
-- Obsidian plugin, web UI, MCP adapter, embeddings or graph database, image understanding or search.
+- Obsidian plugin or any storage-event adapter (see Further Notes, *Storage change events*), filesystem watcher, web UI, MCP adapter, embeddings or graph database, image understanding or search.
 - Concurrent multi-writer guarantees; synchronisation conflict files.
 - Migration or backfill of any existing note collection.
 - Codex entry path as an acceptance requirement (it may be added and claimed once demonstrated).
@@ -449,12 +531,37 @@ Out of the beta:
 - **After beta acceptance.** A maintainer can set up a personal, private brain from an accepted starter commit and use its projects module for development knowledge about this project, linking to repository contracts and issues rather than copying them. That brain is a separate instance: never nested in this repository, never committed here.
 - The starter does not contain or depend on any particular delivery or orchestration tooling used to build it.
 
+### Storage change events (design note; post-beta)
+
+Obsidian's plugin API emits vault `create`, `modify`, `delete` and `rename` (with the old path) events. Its documentation also says `create` fires for every existing file when the vault loads, unless the handler is registered after the workspace layout is ready. A later adapter could use these events, or the same four signals from a generic filesystem watcher, to make reconciliation more responsive. The beta does not depend on them.
+
+Responsibilities, when such an adapter exists:
+- **An event is a hint that storage changed at a path.** It does not say who changed it, whether a brain operation or an authorised ingestion caused it, or whether the content differs.
+- **The adapter only records changed paths and asks existing operations to reconcile them.** A path-scoped audit report is the intended call, and it would be added with the adapter. The adapter never writes notes, grants maintenance, adopts files or publishes anything.
+- **Code classifies.** Reconciliation compares current bytes with the journal's intents and run manifests, commit history and trailers, and the index. That is the same classification audit already performs.
+- **Duplicates, reordering and echoes are harmless by construction.** Reconciliation is a comparison, not an event replay. A repeated or reordered event, a rename-on-save sequence, the load-time `create` burst, and events caused by the brain's own writes (whose bytes match recorded intended hashes or commits) all converge on the same report and cause no writes, so there is no feedback loop.
+- **Missed events are covered by the headless path.** While the editor or adapter is inactive, correctness comes from discovery's quick check and a startup or on-demand audit. Events improve responsiveness; they are never the only source of correctness.
+- **No daemon, service or event framework** is designed now.
+
+**Documented now:** these responsibilities, and the guarantee that beta audit and reconciliation are editor-independent. **Deferred:** the adapter, a path-scoped report option, and any filesystem watcher.
+
+**Post-beta follow-up — storage-event reconciliation adapter.** Behaviour: a user running the adapter sees out-of-band changes reported soon after they happen, with results identical to an on-demand audit. Verification expectations:
+- Recorded event sequences are replayed against the command interface: duplicated, reordered, rename-on-save (create, modify, rename and delete of a temporary file), the load-time `create` burst, and echoes of brain writes. Each must produce the same report as a full audit, with no writes, commits, grants or publications.
+- Changes made while the adapter was inactive are found by startup reconciliation.
+- An event for a file in an interrupted run or a retained original never changes its status.
+- Removing the adapter changes responsiveness only, never outcomes.
+
+**Scope option, not adopted.** Making the adapter part of the beta would add an editor runtime to acceptance and a second path to verify, for responsiveness that discovery's quick check and on-demand audit already give at beta size. It remains a post-beta option unless the maintainer chooses otherwise.
+
 ### Promotion of rationale
 
 Rationale needed to interpret a contract is written here or in an ADR. Earlier exploratory material is not required to understand this specification.
 
 ### Terms
 
+- **kb**: *knowledge base*. The `kb` property marks a managed document, and its value is the managed-document format version (`1` in this specification). It is not a content revision, freshness indicator or approval status.
+- **Operation journal**: the brain's local, ignored, non-rebuildable record of operations in flight (intents, run manifests, change records).
+- **Retained original**: the exact source bytes an ingestion kept alongside its processed document; evidence, never a note.
 - **Brain**: a user's own knowledge folder, created by setup from the starter; private by default.
 - **Starter**: this repository — default layout, base skills, supporting code, base and module types, synthetic examples. It never contains a user's knowledge.
 - **Zone**: one of the brain's top-level data folders (`inbox/`, `raw/`, `documents/`, `wiki/`) or a module folder.

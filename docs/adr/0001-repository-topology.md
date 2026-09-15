@@ -23,9 +23,9 @@ Options considered:
 
 Option 4.
 
-- The **starter repository** holds only freshly authored system source: layout definition, skills, supporting code, base and module document types, tests, synthetic examples, this specification and ADRs, and contributor guidance. It never contains a real brain or anyone's knowledge.
+- The **starter repository** holds only freshly authored system source: layout definition, skills, supporting code, base and module document types, tests, synthetic examples, this specification and ADRs, and contributor guidance. The one exception to freshly authored content is a pinned, vendored third-party library under `vendor/`, kept with its own licence, which the specification names explicitly. It never contains a real brain or anyone's knowledge.
 - A **brain** is created by the setup skill from a specific starter commit into a separate folder. Setup copies skills into `.claude/skills` and `.agents/skills`, and code, type definitions and the layout into `.brain/` and the data folders. It writes a setup record: the starter URL, the commit, and every copied file with its hash.
-- Setup recommends, and the maintainer's own use requires, a **private git repository for the brain** that tracks user data and the copied system files, and ignores only generated state (index, intents, change records, backups, temps).
+- Setup recommends, and the maintainer's own use requires, a **private git repository for the brain** that tracks user data and the copied system files, and ignores only generated state (the rebuildable cache and the local operation journal).
 - A brain is **never nested** inside the starter or any other repository, and the starter is never nested inside a brain. Setup refuses a target inside another repository's working tree.
 - Code always receives the brain root explicitly; nothing locates a brain by walking up from the current directory.
 - **Improvements flow back** by ordinary pull requests to the starter. Skills to compare a brain's copied system files with the setup record and propose changes upstream, or to update a brain from a newer starter commit, are planned after the beta.

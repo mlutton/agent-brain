@@ -132,8 +132,12 @@ def run_validate(root, base_dir, yaml_module, duplicate_loader):
 
     for rel_path, zone in entries:
         full_path = os.path.join(root, rel_path)
-        with open(full_path, "rb") as fh:
-            raw_bytes = fh.read()
+        try:
+            with open(full_path, "rb") as fh:
+                raw_bytes = fh.read()
+        except OSError:
+            skipped.append({"path": rel_path, "reason": "unreadable"})
+            continue
         result = _classify_file(raw_bytes, yaml_module, duplicate_loader, type_registry, zone)
         counts[result["status"]] = counts.get(result["status"], 0) + 1
         documents.append(
@@ -150,10 +154,11 @@ def run_validate(root, base_dir, yaml_module, duplicate_loader):
         )
 
     documents.sort(key=lambda d: d["path"])
+    skipped.sort(key=lambda entry: entry["path"])
 
     definitions = type_registry.definitions_sorted()
 
-    outcome = "invalid" if (counts["invalid"] > 0 or definitions) else "valid"
+    outcome = "invalid" if (counts["invalid"] > 0 or definitions or any(entry["reason"] == "unreadable" for entry in skipped)) else "valid"
 
     return {
         "outcome": outcome,

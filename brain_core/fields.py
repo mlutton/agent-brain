@@ -108,6 +108,8 @@ def validate_mapping(mapping, type_registry, zone):
             _check_enum_field(mapping, field, allowed_values, errors)
     _check_date_field(mapping, "created", errors)
     _check_date_field(mapping, "reviewed", errors)
+    _check_date_field(mapping, "fresh_until", errors)
+    _check_date_field(mapping, "first_seen", errors)
     _check_origin_field(mapping, errors)
 
     for field in REFERENCE_LIST_FIELDS:

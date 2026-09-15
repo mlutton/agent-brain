@@ -17,6 +17,34 @@ def scan_zones(root, module_folders):
     zones = ["documents", "wiki"] + sorted(set(module_folders.values()))
     entries = []
     skipped = []
+    def add_unreadable(path):
+        skipped.append({"path": _rel_posix(root, path), "reason": "unreadable"})
+
+    def walk(folder, zone):
+        try:
+            with os.scandir(folder) as iterator:
+                children = sorted(iterator, key=lambda entry: entry.name)
+        except OSError:
+            add_unreadable(folder)
+            return
+
+        for entry in children:
+            if entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_symlink():
+                    skipped.append({"path": _rel_posix(root, entry.path), "reason": "symlink"})
+                    continue
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                if entry.name.endswith(".md"):
+                    add_unreadable(entry.path)
+                continue
+            if is_directory:
+                walk(entry.path, zone)
+            elif entry.name.endswith(".md"):
+                entries.append((_rel_posix(root, entry.path), zone))
+
     for zone in zones:
         zone_path = os.path.join(root, zone)
         if os.path.islink(zone_path):
@@ -24,27 +52,7 @@ def scan_zones(root, module_folders):
             continue
         if not os.path.isdir(zone_path):
             continue
-        for dirpath, dirnames, filenames in os.walk(zone_path, followlinks=False):
-            kept_dirs = []
-            for d in dirnames:
-                if d.startswith("."):
-                    continue
-                full = os.path.join(dirpath, d)
-                if os.path.islink(full):
-                    skipped.append({"path": _rel_posix(root, full), "reason": "symlink"})
-                    continue
-                kept_dirs.append(d)
-            dirnames[:] = kept_dirs
-            for f in filenames:
-                if f.startswith("."):
-                    continue
-                full = os.path.join(dirpath, f)
-                if os.path.islink(full):
-                    skipped.append({"path": _rel_posix(root, full), "reason": "symlink"})
-                    continue
-                if not f.endswith(".md"):
-                    continue
-                entries.append((_rel_posix(root, full), zone))
+        walk(zone_path, zone)
     entries.sort(key=lambda e: e[0])
     skipped.sort(key=lambda e: e["path"])
     return entries, skipped

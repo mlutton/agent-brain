@@ -55,18 +55,33 @@ class TempBrainTestCase(unittest.TestCase):
     def write(self, rel_path, content, **kwargs):
         return support.write_file(self.tmpdir, rel_path, content, **kwargs)
 
-    def validate(self, expect_paths):
+    def validate(self, expect_paths, restrict=None, restore=None):
         """Runs `brain validate`, asserting the rules every call site needs: the
         brain's files, directories and hashes are unchanged, stdout is one JSON
         object, and the report's document paths are exactly expect_paths."""
         before_hashes = support.hash_tree(self.tmpdir)
         before_paths = support.list_paths(self.tmpdir)
+        restricted = []
+        if restrict is not None:
+            self.addCleanup(restore)
+            restricted = restrict()
+            for path, _mode in restricted:
+                if os.path.isdir(path):
+                    with self.assertRaises(PermissionError):
+                        os.listdir(path)
+                else:
+                    with self.assertRaises(PermissionError):
+                        open(path, "rb").close()
         proc = support.run_brain(["validate", "--root", self.tmpdir])
         report = support.parse_single_json(proc.stdout)
+        restricted_modes = [(path, os.stat(path).st_mode) for path, _mode in restricted]
+        if restore is not None:
+            restore()
         after_hashes = support.hash_tree(self.tmpdir)
         after_paths = support.list_paths(self.tmpdir)
         self.assertEqual(before_hashes, after_hashes)
         self.assertEqual(before_paths, after_paths)
+        self.assertEqual(restricted_modes, [(path, mode) for path, mode in restricted])
         self.assertEqual(support.document_paths(report), set(expect_paths))
         return proc, report
 
@@ -2670,6 +2685,143 @@ class TestMergeFlatteningReuse(TempBrainTestCase):
                 ),
             ]
         )
+
+
+class TestUnreadablePaths(TempBrainTestCase):
+    def _locked(self, paths):
+        original = [(path, os.stat(path).st_mode) for path in paths]
+
+        def restrict():
+            for path, _mode in original:
+                os.chmod(path, 0)
+            return [(path, os.stat(path).st_mode) for path, _mode in original]
+
+        def restore():
+            for path, mode in original:
+                os.chmod(path, mode)
+
+        return restrict, restore
+
+    def _assert_counts(self, report):
+        self.assertEqual(sum(report["counts"].values()), len(report["documents"]))
+
+    def test_locked_nested_folder_is_skipped(self):
+        self.write("documents/visible.md", note_doc())
+        locked = self.write("documents/locked/bad.md", "---\nkb: 1\n---\n")
+        folder = os.path.dirname(locked)
+        restrict, restore = self._locked([folder])
+        proc, report = self.validate({"documents/visible.md"}, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(report["skipped"], [{"path": "documents/locked", "reason": "unreadable"}])
+        self._assert_counts(report)
+
+    def test_locked_markdown_file_is_skipped(self):
+        self.write("documents/ok.md", note_doc())
+        locked = self.write("documents/locked.md", note_doc())
+        restrict, restore = self._locked([locked])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(report["skipped"], [{"path": "documents/locked.md", "reason": "unreadable"}])
+        self._assert_counts(report)
+
+    def test_locked_zone_and_module_roots_are_skipped(self):
+        self.write("documents/ok.md", note_doc())
+        wiki = os.path.join(self.tmpdir, "wiki")
+        os.makedirs(wiki)
+        self.write("wiki/bad.md", note_doc())
+        self.write(".brain/modules/projects/module.json", json.dumps({"module": "projects", "folder": "projects"}))
+        projects = os.path.join(self.tmpdir, "projects")
+        os.makedirs(projects)
+        restrict, restore = self._locked([wiki, projects])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(
+            report["skipped"],
+            [{"path": "projects", "reason": "unreadable"}, {"path": "wiki", "reason": "unreadable"}],
+        )
+        self._assert_counts(report)
+
+    def test_silent_rules_and_symlinks_precede_readability(self):
+        self.write("documents/ok.md", note_doc())
+        hidden = self.write("documents/.hidden.md", note_doc())
+        inbox = self.write("inbox/locked.md", note_doc())
+        raw = self.write("raw/locked/item.md", note_doc())
+        text = self.write("documents/n.txt", "text\n")
+        locked = self.write("documents/aa/bad.md", note_doc())
+        target = self.write("elsewhere/locked/target.md", note_doc())
+        os.symlink(os.path.dirname(target), os.path.join(self.tmpdir, "documents", "zz.md"))
+        restrict, restore = self._locked([hidden, inbox, os.path.dirname(raw), text, os.path.dirname(locked), os.path.dirname(target)])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(
+            report["skipped"],
+            [{"path": "documents/aa", "reason": "unreadable"}, {"path": "documents/zz.md", "reason": "symlink"}],
+        )
+        self._assert_counts(report)
+
+
+class TestOptionalDates(TempBrainTestCase):
+    def test_invalid_optional_dates(self):
+        values = ['"not-a-date"', '"2026-09-14T10:00:00Z"', "2026-09-14T10:00:00Z", "0", "20260914", "false", "yes", "[]", "[2026-01-01]", '" "', '"2026-02-30"']
+        paths = set()
+        for field in ("fresh_until", "first_seen"):
+            for number, value in enumerate(values):
+                path = f"documents/{field}-{number}.md"
+                paths.add(path)
+                self.write(path, note_doc(**{field: value}))
+        self.write("documents/both.md", note_doc(fresh_until='"bad"', first_seen="false"))
+        paths.add("documents/both.md")
+        _proc, report = self.validate(paths)
+        for path in paths:
+            expected = [("fresh_until", "bad_format"), ("first_seen", "bad_format")] if path.endswith("both.md") else [(("fresh_until" if "/fresh_until-" in path else "first_seen"), "bad_format")]
+            support.assert_errors(self, support.doc_by_path(report, path), expected, path)
+
+    def test_optional_date_null_empty_and_valid_controls(self):
+        paths = set()
+        for field in ("fresh_until", "first_seen"):
+            for number, value in enumerate((None, "~", "null", '\"\"', "2026-01-01", '\"2026-01-01\"')):
+                path = f"documents/{field}-control-{number}.md"
+                paths.add(path)
+                self.write(path, note_doc(**{field: value}))
+            mismatch = f"documents/{field}-mismatch.md"
+            paths.add(mismatch)
+            self.write(mismatch, note_doc(**{field: None}, needs_review=("created", "reviewed", "summary", "kind", "origin", field)))
+        _proc, report = self.validate(paths)
+        for path in paths:
+            expected = [("needs_review", "needs_review_mismatch")] if path.endswith("mismatch.md") else []
+            support.assert_errors(self, support.doc_by_path(report, path), expected, path)
+
+
+class TestCustomAllowedValuesShape(TempBrainTestCase):
+    def _definition(self, values, name="recipe"):
+        return json.dumps({"type": name, "zones": ["*"], "required": [], "allowed_values": {"cuisine": values}, "display_fields": [], "search_fields": []})
+
+    def test_non_string_members_invalidate_definition_and_type(self):
+        for number, values in enumerate(([123], ["thai", 1], [None], [["thai"]], [True], [{"a": "b"}])):
+            with self.subTest(values=values):
+                self.write(".brain/types/custom/recipe.json", self._definition(values))
+                self.write("documents/recipe.md", note_doc(type='"recipe"', cuisine="123"))
+                _proc, report = self.validate({"documents/recipe.md"})
+                self.assertEqual(report["definitions"], [{"path": ".brain/types/custom/recipe.json", "code": "invalid_definition", "message": "missing or wrongly typed keys"}])
+                support.assert_errors(self, support.doc_by_path(report, "documents/recipe.md"), [("type", "unknown_type")])
+                os.unlink(os.path.join(self.tmpdir, ".brain/types/custom/recipe.json"))
+
+    def test_empty_and_string_allowed_values_keep_existing_behavior(self):
+        self.write(".brain/types/custom/recipe.json", self._definition([]))
+        self.write("documents/empty.md", note_doc(type='"recipe"'))
+        _proc, report = self.validate({"documents/empty.md"})
+        self.assertEqual(report["definitions"], [])
+        support.assert_errors(self, support.doc_by_path(report, "documents/empty.md"), [])
+        self.write(".brain/types/custom/recipe.json", self._definition(["thai"]))
+        self.write("documents/thai.md", note_doc(type='"recipe"', cuisine='"thai"'))
+        self.write("documents/martian.md", note_doc(type='"recipe"', cuisine='"martian"'))
+        _proc, report = self.validate({"documents/empty.md", "documents/thai.md", "documents/martian.md"})
+        self.assertEqual(report["definitions"], [])
+        support.assert_errors(self, support.doc_by_path(report, "documents/thai.md"), [])
+        support.assert_errors(self, support.doc_by_path(report, "documents/martian.md"), [("cuisine", "not_allowed")])
+
 
 
 if __name__ == "__main__":

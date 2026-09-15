@@ -58,7 +58,10 @@ def _validate_shape(data):
     for key in ("zones", "required", "display_fields", "search_fields"):
         if not all(isinstance(item, str) for item in data[key]):
             return False
-    return all(isinstance(v, list) for v in data["allowed_values"].values())
+    return all(
+        isinstance(values, list) and all(isinstance(value, str) for value in values)
+        for values in data["allowed_values"].values()
+    )
 
 
 def load_base_types(base_dir):

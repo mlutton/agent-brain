@@ -2709,33 +2709,82 @@ class TestUnreadablePaths(TempBrainTestCase):
 
         def restore():
             for path, mode in original:
-                os.chmod(path, mode)
+                if os.path.lexists(path):
+                    os.chmod(path, mode)
 
         return restrict, restore
 
-    def _assert_counts(self, report):
+    def _new_brain(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="brain-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _path(self, rel_path):
+        return os.path.join(self.tmpdir, rel_path)
+
+    def _assert_counts(self, report, expected):
+        counts = {"valid": 0, "invalid": 0, "unmanaged": 0, "unsupported_version": 0, "retained": 0}
+        counts.update(expected)
+        self.assertEqual(report["counts"], counts)
         self.assertEqual(sum(report["counts"].values()), len(report["documents"]))
 
+    def _nested_folder_brain(self):
+        self.write("documents/open/visible.md", note_doc())
+        self.write("documents/locked/bad.md", "---\nkb: 1\n---\n")
+        return {"documents/open/visible.md"}, [self._path("documents/locked")]
+
+    def _markdown_file_brain(self):
+        self.write("documents/ok.md", note_doc())
+        self.write("documents/locked.md", note_doc())
+        return {"documents/ok.md"}, [self._path("documents/locked.md")]
+
+    def _wiki_root_brain(self):
+        self.write("documents/ok.md", note_doc())
+        self.write("wiki/page.md", note_doc())
+        return {"documents/ok.md"}, [self._path("wiki")]
+
+    def _module_root_brain(self):
+        self.write("documents/ok.md", note_doc())
+        self.write(".brain/modules/projects/module.json", json.dumps({"module": "projects", "folder": "projects"}))
+        self.write("projects/alpha/alpha.md", note_doc())
+        return {"documents/ok.md"}, [self._path("projects")]
+
     def test_locked_nested_folder_is_skipped(self):
-        self.write("documents/visible.md", note_doc())
-        locked = self.write("documents/locked/bad.md", "---\nkb: 1\n---\n")
-        folder = os.path.dirname(locked)
-        restrict, restore = self._locked([folder])
-        proc, report = self.validate({"documents/visible.md"}, restrict, restore)
+        expect, locked = self._nested_folder_brain()
+        restrict, restore = self._locked(locked)
+        proc, report = self.validate(expect, restrict, restore)
         self.assertEqual(proc.returncode, 3)
         self.assertEqual(report["outcome"], "invalid")
         self.assertEqual(report["skipped"], [{"path": "documents/locked", "reason": "unreadable"}])
-        self._assert_counts(report)
+        self.assertEqual(support.doc_by_path(report, "documents/open/visible.md")["status"], "valid")
+        self._assert_counts(report, {"valid": 1})
 
     def test_locked_markdown_file_is_skipped(self):
-        self.write("documents/ok.md", note_doc())
-        locked = self.write("documents/locked.md", note_doc())
-        restrict, restore = self._locked([locked])
-        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        expect, locked = self._markdown_file_brain()
+        restrict, restore = self._locked(locked)
+        proc, report = self.validate(expect, restrict, restore)
         self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
         self.assertNotIn("Traceback", proc.stderr)
         self.assertEqual(report["skipped"], [{"path": "documents/locked.md", "reason": "unreadable"}])
-        self._assert_counts(report)
+        self._assert_counts(report, {"valid": 1})
+
+    def test_locked_wiki_root_is_skipped(self):
+        expect, locked = self._wiki_root_brain()
+        restrict, restore = self._locked(locked)
+        proc, report = self.validate(expect, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(report["skipped"], [{"path": "wiki", "reason": "unreadable"}])
+        self._assert_counts(report, {"valid": 1})
+
+    def test_locked_module_folder_root_is_skipped(self):
+        expect, locked = self._module_root_brain()
+        restrict, restore = self._locked(locked)
+        proc, report = self.validate(expect, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(report["skipped"], [{"path": "projects", "reason": "unreadable"}])
+        self._assert_counts(report, {"valid": 1})
 
     def test_locked_zone_and_module_roots_are_skipped(self):
         self.write("documents/ok.md", note_doc())
@@ -2748,11 +2797,12 @@ class TestUnreadablePaths(TempBrainTestCase):
         restrict, restore = self._locked([wiki, projects])
         proc, report = self.validate({"documents/ok.md"}, restrict, restore)
         self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
         self.assertEqual(
             report["skipped"],
             [{"path": "projects", "reason": "unreadable"}, {"path": "wiki", "reason": "unreadable"}],
         )
-        self._assert_counts(report)
+        self._assert_counts(report, {"valid": 1})
 
     def test_silent_rules_and_symlinks_precede_readability(self):
         self.write("documents/ok.md", note_doc())
@@ -2770,19 +2820,80 @@ class TestUnreadablePaths(TempBrainTestCase):
             report["skipped"],
             [{"path": "documents/aa", "reason": "unreadable"}, {"path": "documents/zz.md", "reason": "symlink"}],
         )
-        self._assert_counts(report)
+        self._assert_counts(report, {"valid": 1})
+
+    def test_unreadable_markdown_file_sorts_before_a_symlink(self):
+        self.write("documents/ok.md", note_doc())
+        locked = self.write("documents/a.md", note_doc())
+        os.symlink(self._path("documents/ok.md"), self._path("documents/b.md"))
+        restrict, restore = self._locked([locked])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(
+            report["skipped"],
+            [{"path": "documents/a.md", "reason": "unreadable"}, {"path": "documents/b.md", "reason": "symlink"}],
+        )
+        self._assert_counts(report, {"valid": 1})
+
+    def test_silent_locked_paths_leave_a_valid_brain_valid(self):
+        cases = {
+            "hidden locked folder": ("documents/.hid/x.md", "documents/.hid"),
+            "locked folder under inbox": ("inbox/locked/x.md", "inbox/locked"),
+            "unreadable non-Markdown file": ("documents/n.txt", "documents/n.txt"),
+            "unreadable hidden file": ("documents/.h.md", "documents/.h.md"),
+            "locked raw folder": ("raw/x.md", "raw"),
+        }
+        for label, (file_path, locked_path) in cases.items():
+            with self.subTest(label):
+                self._new_brain()
+                self.write("documents/ok.md", note_doc())
+                self.write(file_path, note_doc())
+                restrict, restore = self._locked([self._path(locked_path)])
+                proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+                self.assertEqual(report["skipped"], [])
+                self.assertEqual(report["outcome"], "valid")
+                self.assertEqual(proc.returncode, 0)
+                self._assert_counts(report, {"valid": 1})
 
     def test_permission_fixture_controls_are_valid_when_accessible(self):
         self.write("documents/visible.md", note_doc())
         self.write("documents/locked/bad.md", note_doc())
         self.write("documents/locked.md", note_doc())
         self.write("wiki/page.md", note_doc())
-        _proc, report = self.validate(
+        proc, report = self.validate(
             {"documents/visible.md", "documents/locked/bad.md", "documents/locked.md", "wiki/page.md"}
         )
+        self.assertEqual(proc.returncode, 0)
         self.assertEqual(report["outcome"], "valid")
         self.assertEqual(report["skipped"], [])
-        self._assert_counts(report)
+        self._assert_counts(report, {"valid": 4})
+
+    def test_same_brains_with_permissions_intact(self):
+        builders = {
+            "readable markdown file": (self._markdown_file_brain, {"documents/locked.md"}),
+            "readable wiki root": (self._wiki_root_brain, {"wiki/page.md"}),
+            "readable module folder root": (self._module_root_brain, {"projects/alpha/alpha.md"}),
+        }
+        for label, (build, restored) in builders.items():
+            with self.subTest(label):
+                self._new_brain()
+                expect, _locked = build()
+                proc, report = self.validate(expect | restored)
+                self.assertEqual(report["skipped"], [])
+                self.assertEqual(report["outcome"], "valid")
+                self.assertEqual(proc.returncode, 0)
+                self._assert_counts(report, {"valid": 2})
+        with self.subTest("readable nested folder"):
+            # The folder's document is invalid by design, so the outcome follows it.
+            self._new_brain()
+            expect, _locked = self._nested_folder_brain()
+            proc, report = self.validate(expect | {"documents/locked/bad.md"})
+            self.assertEqual(report["skipped"], [])
+            self.assertEqual(support.doc_by_path(report, "documents/locked/bad.md")["status"], "invalid")
+            self.assertEqual(report["outcome"], "invalid")
+            self.assertEqual(proc.returncode, 3)
+            self._assert_counts(report, {"valid": 1, "invalid": 1})
 
     def test_listable_unsearchable_folder_reports_entries_by_rule(self):
         self.write("documents/ok.md", note_doc())
@@ -2812,6 +2923,13 @@ class TestUnreadablePaths(TempBrainTestCase):
                 os.listdir(os.path.dirname(sub))
         except PermissionError:
             self.skipTest("0o644 does not provide the required listable-but-unsearchable condition")
+        try:
+            with os.scandir(folder) as iterator:
+                for entry in iterator:
+                    entry.is_symlink()
+                    entry.is_dir(follow_symlinks=False)
+        except PermissionError:
+            self.skipTest("the folder listing does not report entry types without searching the folder")
         self.assertEqual(set(names), {"x.md", "sub", "link.md", "n.txt", ".h.md"})
         restore()
 
@@ -2831,7 +2949,7 @@ class TestUnreadablePaths(TempBrainTestCase):
                 {"path": "documents/ro/x.md", "reason": "unreadable"},
             ],
         )
-        self._assert_counts(report)
+        self._assert_counts(report, {"valid": 1})
 
 
 class TestOptionalDates(TempBrainTestCase):

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""agent-brain command-line entry point (see docs/specification/beta.md, C1)."""
+
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_BASE_DIR = os.path.dirname(_SCRIPT_DIR)
+
+KNOWN_SUBCOMMANDS = {
+    "setup",
+    "validate",
+    "persist",
+    "recover",
+    "rebuild",
+    "discover",
+    "read",
+    "audit",
+    "ingest",
+    "grant",
+}
+
+
+def _refuse(reason):
+    print(json.dumps({"outcome": "refused", "reason": reason}))
+    return 2
+
+
+def _parse_options(argv):
+    options = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--"):
+            key = arg
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                options[key] = argv[i + 1]
+                i += 2
+            else:
+                options[key] = True
+                i += 1
+        else:
+            i += 1
+    return options
+
+
+def main(argv):
+    if not argv:
+        return _refuse("missing_subcommand")
+
+    subcommand = argv[0]
+    if subcommand not in KNOWN_SUBCOMMANDS:
+        return _refuse("unknown_subcommand")
+
+    options = _parse_options(argv[1:])
+
+    if subcommand != "validate":
+        return _refuse("not_implemented")
+
+    root = options.get("--root")
+    if not isinstance(root, str):
+        return _refuse("missing_root")
+    if not os.path.isdir(root):
+        return _refuse("invalid_root")
+
+    sys.path.insert(0, _BASE_DIR)
+
+    from brain_core import vendor_yaml
+
+    try:
+        yaml_module = vendor_yaml.load(_BASE_DIR)
+    except vendor_yaml.VendoredDependencyError:
+        print(json.dumps({"outcome": "error", "reason": "vendored_dependency"}))
+        return 1
+
+    duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+
+    from brain_core import validate
+
+    report = validate.run_validate(root, _BASE_DIR, yaml_module, duplicate_loader)
+    print(json.dumps(report))
+    return 0 if report["outcome"] == "valid" else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

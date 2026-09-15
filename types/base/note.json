@@ -1,0 +1,9 @@
+{
+  "type": "note",
+  "zones": ["*"],
+  "required": [],
+  "allowed_values": {},
+  "uncertainty_values": {},
+  "display_fields": ["status", "kind"],
+  "search_fields": ["tags"]
+}

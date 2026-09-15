@@ -1,0 +1,9 @@
+{
+  "type": "document",
+  "zones": ["documents"],
+  "required": ["source_identity", "original", "original_sha256"],
+  "allowed_values": {},
+  "uncertainty_values": {},
+  "display_fields": ["status", "kind", "source_identity"],
+  "search_fields": ["tags"]
+}

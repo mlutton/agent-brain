@@ -1,0 +1,1047 @@
+"""Tests for `brain validate` (ST-01), against docs/specification/beta.md."""
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import unittest
+from typing import ClassVar
+
+from tests import support
+
+
+def make_frontmatter(fields, needs_review=()):
+    lines = ["---"]
+    for key, value in fields.items():
+        if value is None:
+            lines.append(f"{key}:")
+        else:
+            lines.append(f"{key}: {value}")
+    if needs_review:
+        lines.append("needs_review:")
+        for item in needs_review:
+            lines.append(f'  - "{item}"')
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def note_doc(body="Body text.\n", needs_review=("created", "reviewed", "summary", "kind", "origin"), **overrides):
+    fields = {
+        "kb": "1",
+        "id": '"01arz3ndektsv4rrffq69g5fav"',
+        "type": '"note"',
+        "title": '"Sample Note"',
+        "summary": '""',
+        "status": '"draft"',
+        "created": None,
+        "reviewed": None,
+        "origin": '"unknown"',
+        "evidence": "[]",
+        "kind": '"unknown"',
+        "authored_by": '"human"',
+        "retention": '"durable"',
+    }
+    fields.update(overrides)
+    return make_frontmatter(fields, needs_review) + body
+
+
+class TempBrainTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="brain-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def write(self, rel_path, content, **kwargs):
+        return support.write_file(self.tmpdir, rel_path, content, **kwargs)
+
+    def validate(self):
+        proc = support.run_brain(["validate", "--root", self.tmpdir])
+        report = support.parse_single_json(proc.stdout)
+        return proc, report
+
+
+class TestReportShapeAndCounts(TempBrainTestCase):
+    def test_report_shape_and_counts(self):
+        self.write("documents/valid.md", note_doc())
+        self.write("documents/bad.md", "no frontmatter here\n")  # unmanaged
+        self.write("documents/broken.md", "---\nkb: 1\nid: 1\n---\nbody\n")  # invalid (malformed base fields missing etc)
+        self.write("documents/future.md", note_doc(kb="2", needs_review=()))
+
+        before = support.hash_tree(self.tmpdir)
+        _proc, report = self.validate()
+        after = support.hash_tree(self.tmpdir)
+        self.assertEqual(before, after)
+
+        self.assertEqual(set(report.keys()), {"outcome", "counts", "definitions", "skipped", "documents"})
+        self.assertIn(report["outcome"], ("valid", "invalid"))
+        count_sum = sum(report["counts"].values())
+        self.assertEqual(count_sum, len(report["documents"]))
+        self.assertEqual(report["counts"]["retained"], 0)
+
+        for doc in report["documents"]:
+            full = os.path.join(self.tmpdir, doc["path"])
+            with open(full, "rb") as fh:
+                expected_hash = hashlib.sha256(fh.read()).hexdigest()
+            self.assertEqual(doc["version"], expected_hash)
+
+
+class TestScanScopeAndOrder(TempBrainTestCase):
+    def test_scan_scope_and_order(self):
+        self.write("documents/a-b.md", "unmanaged\n")
+        self.write("documents/a/b.md", "unmanaged\n")
+        self.write("documents/nested/deep/doc.md", "unmanaged\n")
+        self.write("wiki/page.md", "unmanaged\n")
+        self.write("inbox/skip.md", "unmanaged\n")
+        self.write("raw/skip.md", "unmanaged\n")
+        self.write(".hidden/skip.md", "unmanaged\n")
+        self.write("documents/.hidden.md", "unmanaged\n")
+        self.write("documents/UPPER.MD", "unmanaged\n")
+        self.write("documents/note.txt", "not markdown\n")
+        self.write("root.md", "unmanaged\n")
+
+        self.write(".brain/modules/projects/module.json", json.dumps({"module": "projects", "folder": "projects"}))
+        self.write("projects/demo/decision.md", "unmanaged\n")
+
+        target = self.write("documents/link_target.md", "unmanaged\n")
+        link_path = os.path.join(self.tmpdir, "documents", "a_link.md")
+        os.symlink(target, link_path)
+
+        _proc, report = self.validate()
+
+        paths = [d["path"] for d in report["documents"]]
+        self.assertEqual(paths, sorted(paths))
+
+        expected_present = {
+            "documents/a-b.md",
+            "documents/a/b.md",
+            "documents/nested/deep/doc.md",
+            "wiki/page.md",
+            "documents/link_target.md",
+            "projects/demo/decision.md",
+        }
+        self.assertTrue(expected_present.issubset(set(paths)))
+
+        expected_absent = {
+            "inbox/skip.md",
+            "raw/skip.md",
+            ".hidden/skip.md",
+            "documents/.hidden.md",
+            "documents/UPPER.MD",
+            "documents/note.txt",
+            "root.md",
+        }
+        self.assertFalse(expected_absent & set(paths))
+
+        idx_ab_dash = paths.index("documents/a-b.md")
+        idx_a_slash_b = paths.index("documents/a/b.md")
+        self.assertLess(idx_ab_dash, idx_a_slash_b)
+
+        skipped_paths = {s["path"] for s in report["skipped"]}
+        self.assertIn("documents/a_link.md", skipped_paths)
+        for s in report["skipped"]:
+            if s["path"] == "documents/a_link.md":
+                self.assertEqual(s["reason"], "symlink")
+        self.assertNotIn("documents/a_link.md", paths)
+
+
+class TestExitCodesAndRefusals(TempBrainTestCase):
+    def test_valid_brain_exit_zero(self):
+        self.write("documents/ok.md", note_doc())
+        proc, report = self.validate()
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(report["outcome"], "valid")
+
+    def test_empty_brain_exit_zero(self):
+        os.makedirs(os.path.join(self.tmpdir, "documents"))
+        proc, report = self.validate()
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(report["counts"]["valid"], 0)
+        self.assertEqual(report["documents"], [])
+
+    def test_invalid_brain_exit_three(self):
+        self.write("documents/bad.md", "---\nkb: 1\n---\nbody\n")
+        proc, report = self.validate()
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+
+    def test_missing_root(self):
+        proc = support.run_brain(["validate"])
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(report["outcome"], "refused")
+
+    def test_nonexistent_root(self):
+        proc = support.run_brain(["validate", "--root", os.path.join(self.tmpdir, "does-not-exist")])
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(report["outcome"], "refused")
+
+    def test_file_root(self):
+        file_path = self.write("not-a-dir.txt", "hello")
+        proc = support.run_brain(["validate", "--root", file_path])
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(report["outcome"], "refused")
+
+    def test_unknown_subcommand(self):
+        proc = support.run_brain(["frobnicate", "--root", self.tmpdir])
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(report["outcome"], "refused")
+
+
+class TestUnmanagedClasses(TempBrainTestCase):
+    def test_unmanaged_classes(self):
+        self.write("documents/no_block.md", "Just prose, no frontmatter.\n")
+        self.write("documents/no_kb.md", "---\ntitle: \"x\"\n---\nbody\n")
+        self.write("documents/empty_block.md", "---\n---\nbody\n")
+        self.write("documents/comment_only.md", "---\n# just a comment\n---\nbody\n")
+
+        _proc, report = self.validate()
+        for path in (
+            "documents/no_block.md",
+            "documents/no_kb.md",
+            "documents/empty_block.md",
+            "documents/comment_only.md",
+        ):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(doc["status"], "unmanaged", path)
+            self.assertEqual(doc["errors"], [], path)
+
+
+class TestKbReading(TempBrainTestCase):
+    def test_kb_reading(self):
+        self.write("documents/managed.md", note_doc())
+        self.write("documents/v2.md", note_doc(kb="2", needs_review=()))
+        self.write("documents/v0.md", note_doc(kb="0", needs_review=()))
+        self.write("documents/vneg.md", note_doc(kb="-3", needs_review=()))
+        self.write("documents/bool_kb.md", note_doc(kb="true", needs_review=()))
+        self.write("documents/str_kb.md", note_doc(kb='"1"', needs_review=()))
+        self.write("documents/float_kb.md", note_doc(kb="1.0", needs_review=()))
+        self.write("documents/empty_kb.md", note_doc(kb=None, needs_review=()))
+
+        _proc, report = self.validate()
+
+        self.assertEqual(support.doc_by_path(report, "documents/managed.md")["status"], "valid")
+
+        for path in ("documents/v2.md", "documents/v0.md", "documents/vneg.md"):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(doc["status"], "unsupported_version", path)
+            self.assertEqual(doc["errors"], [], path)
+
+        for path in ("documents/bool_kb.md", "documents/str_kb.md", "documents/float_kb.md", "documents/empty_kb.md"):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(doc["status"], "invalid", path)
+            self.assertEqual(support.errors_multiset(doc), {(None, "malformed")}, path)
+
+        self.assertEqual(report["outcome"], "invalid")
+
+
+class TestMalformedConditions(TempBrainTestCase):
+    def assert_malformed(self, path):
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, path)
+        self.assertEqual(support.errors_multiset(doc), {(None, "malformed")}, path)
+        self.assertEqual(doc["status"], "invalid", path)
+
+    def test_unclosed_block(self):
+        self.write("documents/unclosed.md", "---\nkb: 1\ntitle: \"x\"\nbody without closing\n")
+        self.assert_malformed("documents/unclosed.md")
+
+    def test_ambiguous_colon(self):
+        self.write("documents/colon.md", "---\nkb: 1\ntitle: a: b\n---\nbody\n")
+        self.assert_malformed("documents/colon.md")
+
+    def test_top_level_list(self):
+        self.write("documents/list.md", "---\n- kb\n- 1\n---\nbody\n")
+        self.assert_malformed("documents/list.md")
+
+    def test_duplicate_keys(self):
+        self.write(
+            "documents/dup.md",
+            '---\nkb: 1\ntitle: "same"\ntitle: "same"\n---\nbody\n',
+        )
+        self.assert_malformed("documents/dup.md")
+
+    def test_invalid_utf8(self):
+        self.write("documents/badutf8.md", b"---\nkb: 1\n---\n\xff\xfe\n", binary=True)
+        self.assert_malformed("documents/badutf8.md")
+
+    def test_bad_calendar_date(self):
+        self.write("documents/baddate.md", "---\nkb: 1\ncreated: 2026-02-30\n---\nbody\n")
+        self.assert_malformed("documents/baddate.md")
+
+    def test_python_tuple_tag(self):
+        self.write("documents/tuple.md", "---\nkb: 1\nx: !!python/tuple [1, 2]\n---\nbody\n")
+        self.assert_malformed("documents/tuple.md")
+
+    def test_bom_and_crlf_recognised(self):
+        content = "﻿---\r\nkb: 1\r\n---\r\nbody\r\n".encode()
+        self.write("documents/bomcrlf.md", content, binary=True)
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/bomcrlf.md")
+        self.assertNotEqual(doc["frontmatter"], "malformed")
+        self.assertIn(("id", "missing"), support.errors_multiset(doc))
+
+
+class TestUnsupportedForEditing(TempBrainTestCase):
+    def test_features_are_not_errors(self):
+        cases = {
+            "anchor_alias": ("a: &x \"v\"\nb: *x", {"anchor", "alias"}),
+            "explicit_tag": ("tagged: !!str \"v\"", {"tag"}),
+        }
+        for name, (extra, expected_features) in cases.items():
+            path = f"documents/{name}_managed.md"
+            fields = {
+                "kb": "1",
+                "id": '"01arz3ndektsv4rrffq69g5fav"',
+                "type": '"note"',
+                "title": '"Sample"',
+                "summary": '""',
+                "status": '"draft"',
+                "created": None,
+                "reviewed": None,
+                "origin": '"unknown"',
+                "evidence": "[]",
+                "kind": '"unknown"',
+                "authored_by": '"human"',
+                "retention": '"durable"',
+            }
+            text = "---\n" + "\n".join(
+                f"{k}: {v}" if v is not None else f"{k}:" for k, v in fields.items()
+            )
+            text += "\nneeds_review:\n"
+            for item in ("created", "reviewed", "summary", "kind", "origin"):
+                text += f'  - "{item}"\n'
+            text += extra + "\n---\nbody\n"
+            self.write(path, text)
+
+        json_style = '---\n{"title": "x"}\n---\nbody\n'
+        self.write("documents/json_style_unmanaged.md", json_style)
+
+        _proc, report = self.validate()
+        for name, (extra, expected_features) in cases.items():
+            path = f"documents/{name}_managed.md"
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(doc["frontmatter"], "unsupported_for_editing", path)
+            self.assertEqual(set(doc["frontmatter_features"]), expected_features, path)
+            self.assertEqual(doc["errors"], [], path)
+
+        doc = support.doc_by_path(report, "documents/json_style_unmanaged.md")
+        self.assertEqual(doc["status"], "unmanaged")
+        self.assertEqual(doc["frontmatter"], "unsupported_for_editing")
+        self.assertIn("flow_mapping", doc["frontmatter_features"])
+        self.assertEqual(doc["errors"], [])
+
+
+class TestAmbiguousScalars(TempBrainTestCase):
+    def test_ambiguous_scalars(self):
+        self.write("documents/yes_title.md", note_doc(title="yes"))
+        self.write("documents/num_title.md", note_doc(title="12"))
+        self.write("documents/float_summary.md", note_doc(summary="1.5", needs_review=("created", "reviewed", "kind", "origin")))
+        self.write("documents/link_title.md", note_doc(title="[[Link]]"))
+        self.write("documents/yes_status.md", note_doc(status="yes"))
+
+        self.write("documents/quoted_ok.md", note_doc(title='"yes"', status='"draft"'))
+
+        _proc, report = self.validate()
+
+        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/yes_title.md")), {("title", "ambiguous_scalar")})
+        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/num_title.md")), {("title", "ambiguous_scalar")})
+        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/float_summary.md")), {("summary", "ambiguous_scalar")})
+        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/link_title.md")), {("title", "ambiguous_scalar")})
+        self.assertEqual(support.errors_multiset(support.doc_by_path(report, "documents/yes_status.md")), {("status", "ambiguous_scalar")})
+        self.assertEqual(support.doc_by_path(report, "documents/quoted_ok.md")["status"], "valid")
+
+
+class TestObsidianFixtureSetValid(TempBrainTestCase):
+    def test_obsidian_fixtures(self):
+        cases = {}
+
+        cases["quoted_colon_title"] = note_doc(title='"a title: with colon"')
+        cases["quoted_hash_value"] = note_doc(title='"a value with # hash"')
+        cases["unquoted_hash_no_space"] = note_doc(title="value#nospace")
+        cases["single_quoted"] = note_doc(title="'single quoted'")
+        cases["double_quoted"] = note_doc(title='"double quoted"')
+
+        text_with_comment = make_frontmatter(
+            {
+                "kb": "1",
+                "id": '"01arz3ndektsv4rrffq69g5fav"',
+                "type": '"note"',
+                "title": '"With comment"',
+                "summary": '""',
+                "status": '"draft"',
+                "created": None,
+                "reviewed": None,
+                "origin": '"unknown"',
+                "evidence": "[]",
+                "kind": '"unknown"',
+                "authored_by": '"human"',
+                "retention": '"durable"',
+                "tags": "\n  - \"a\"\n# a comment line between properties\n  - \"b\"",
+            },
+            needs_review=("created", "reviewed", "summary", "kind", "origin"),
+        ) + "body\n"
+        cases["comment_between_properties"] = text_with_comment
+
+        cases["indented_list"] = note_doc(evidence='\n    - "https://example.com/a"')
+        cases["zero_indent_list"] = note_doc(evidence='\n- "https://example.com/a"')
+        cases["empty_list"] = note_doc(evidence="[]")
+        cases["unquoted_date"] = note_doc(created="2026-01-01", needs_review=("reviewed", "summary", "kind", "origin"))
+        cases["quoted_date"] = note_doc(created='"2026-01-01"', needs_review=("reviewed", "summary", "kind", "origin"))
+        cases["empty_values"] = note_doc()
+
+        for name, content in cases.items():
+            self.write(f"documents/{name}.md", content)
+
+        long_value = "x" * 301
+        self.write(
+            "documents/comment_truncated_quoted.md",
+            note_doc(summary=f'"{long_value}"', needs_review=("created", "reviewed", "kind", "origin")),
+        )
+        self.write(
+            "documents/comment_truncated_unquoted.md",
+            note_doc(summary="short value # " + ("y" * 320), needs_review=("created", "reviewed", "kind", "origin")),
+        )
+
+        _proc, report = self.validate()
+
+        for name in cases:
+            doc = support.doc_by_path(report, f"documents/{name}.md")
+            self.assertEqual(doc["status"], "valid", "{}: {!r}".format(name, doc["errors"]))
+
+        truncated_quoted = support.doc_by_path(report, "documents/comment_truncated_quoted.md")
+        self.assertEqual(support.errors_multiset(truncated_quoted), {("summary", "too_long")})
+
+        truncated_unquoted = support.doc_by_path(report, "documents/comment_truncated_unquoted.md")
+        self.assertEqual(truncated_unquoted["errors"], [])
+
+
+class TestDates(TempBrainTestCase):
+    def test_dates(self):
+        self.write("documents/yaml_date.md", note_doc(created="2026-01-01", needs_review=("reviewed", "summary", "kind", "origin")))
+        self.write("documents/quoted_date.md", note_doc(created='"2026-01-01"', needs_review=("reviewed", "summary", "kind", "origin")))
+        self.write("documents/bad_short.md", note_doc(created='"2026-9-14"', needs_review=("reviewed", "summary", "kind", "origin")))
+        self.write("documents/bad_word.md", note_doc(created='"unknown"', needs_review=("reviewed", "summary", "kind", "origin")))
+        self.write("documents/bad_datetime.md", note_doc(created='"2026-09-14T10:00:00Z"', needs_review=("reviewed", "summary", "kind", "origin")))
+        self.write("documents/bad_datetime_unquoted.md", note_doc(created="2026-09-14T10:00:00Z", needs_review=("reviewed", "summary", "kind", "origin")))
+
+        _proc, report = self.validate()
+
+        for path in ("documents/yaml_date.md", "documents/quoted_date.md"):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(doc["errors"], [], path)
+
+        for path in ("documents/bad_short.md", "documents/bad_word.md", "documents/bad_datetime.md", "documents/bad_datetime_unquoted.md"):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(support.errors_multiset(doc), {("created", "bad_format")}, path)
+
+
+class TestFieldContractRejections(TempBrainTestCase):
+    def test_missing_required_fields(self):
+        required = [
+            "kb",
+            "id",
+            "type",
+            "title",
+            "summary",
+            "status",
+            "created",
+            "reviewed",
+            "origin",
+            "evidence",
+            "kind",
+            "authored_by",
+            "retention",
+        ]
+        base_fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"note"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"unknown"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+        }
+        for field in required:
+            fields = dict(base_fields)
+            del fields[field]
+            text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n"
+            self.write(f"documents/missing_{field}.md", text)
+
+        _proc, report = self.validate()
+        for field in required:
+            doc = support.doc_by_path(report, f"documents/missing_{field}.md")
+            if field == "kb":
+                self.assertEqual(doc["status"], "unmanaged", field)
+                self.assertEqual(doc["errors"], [], field)
+            else:
+                self.assertIn((field, "missing"), support.errors_multiset(doc), field)
+
+    def test_not_allowed_enums(self):
+        self.write("documents/bad_status.md", note_doc(status='"weird"'))
+        self.write("documents/bad_kind.md", note_doc(kind='"weird"', needs_review=("created", "reviewed", "summary", "origin")))
+        self.write("documents/bad_authored_by.md", note_doc(authored_by='"weird"'))
+        self.write("documents/bad_retention.md", note_doc(retention='"weird"'))
+
+        _proc, report = self.validate()
+        self.assertIn(("status", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_status.md")))
+        self.assertIn(("kind", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_kind.md")))
+        self.assertIn(("authored_by", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_authored_by.md")))
+        self.assertIn(("retention", "not_allowed"), support.errors_multiset(support.doc_by_path(report, "documents/bad_retention.md")))
+
+    def test_too_long_summary(self):
+        self.write(
+            "documents/summary_300.md",
+            note_doc(summary='"%s"' % ("é" * 300), needs_review=("created", "reviewed", "kind", "origin")),
+        )
+        self.write(
+            "documents/summary_301.md",
+            note_doc(summary='"%s"' % ("é" * 301), needs_review=("created", "reviewed", "kind", "origin")),
+        )
+        _proc, report = self.validate()
+        self.assertEqual(support.doc_by_path(report, "documents/summary_300.md")["errors"], [])
+        self.assertEqual(
+            support.errors_multiset(support.doc_by_path(report, "documents/summary_301.md")),
+            {("summary", "too_long")},
+        )
+
+    def test_document_type_required_fields(self):
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"document"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"source"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+        }
+        text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "origin")) + "body\n"
+        self.write("documents/doc_missing_source.md", text)
+
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/doc_missing_source.md")
+        errs = support.errors_multiset(doc)
+        self.assertIn(("source_identity", "missing"), errs)
+        self.assertIn(("original", "missing"), errs)
+        self.assertIn(("original_sha256", "missing"), errs)
+
+    def test_malformed_original_sha256(self):
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"document"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"source"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+            "source_identity": '"https://example.com/a"',
+            "original": '"original/a.md"',
+            "original_sha256": '"not-a-hash"',
+        }
+        text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "origin")) + "body\n"
+        self.write("documents/doc_bad_hash.md", text)
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/doc_bad_hash.md")
+        self.assertIn(("original_sha256", "bad_format"), support.errors_multiset(doc))
+
+    def test_unknown_type(self):
+        self.write("documents/unknown_type.md", note_doc(type='"gadget"'))
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/unknown_type.md")
+        self.assertEqual(support.errors_multiset(doc), {("type", "unknown_type")})
+
+    def test_wrong_zone(self):
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"document"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"source"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+            "source_identity": '"https://example.com/a"',
+            "original": '"original/a.md"',
+            "original_sha256": '"%s"' % ("a" * 64),
+        }
+        text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "origin")) + "body\n"
+        self.write("wiki/misplaced_document.md", text)
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "wiki/misplaced_document.md")
+        self.assertIn(("type", "wrong_zone"), support.errors_multiset(doc))
+
+    def test_evidence_bad_format(self):
+        self.write("documents/bad_evidence.md", note_doc(evidence='["ftp://x", "[[Link]]", "0123456789012345678901234"]'))
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/bad_evidence.md")
+        codes = [e["code"] for e in doc["errors"] if e["field"] == "evidence"]
+        self.assertEqual(codes, ["bad_format", "bad_format", "bad_format"])
+
+    def test_id_bad_format(self):
+        self.write("documents/upper_id.md", note_doc(id='"01ARZ3NDEKTSV4RRFFQ69G5FAV"'))
+        self.write("documents/u_id.md", note_doc(id='"01arz3ndektsv4rrffq69g5fau"'))
+        _proc, report = self.validate()
+        self.assertIn(("id", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/upper_id.md")))
+        self.assertIn(("id", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/u_id.md")))
+
+    def test_needs_review_bad_format(self):
+        text = note_doc(needs_review=("created", "created", "reviewed", "summary", "kind", "origin"))
+        self.write("documents/dup_needs_review.md", text)
+        self.write("documents/empty_origin_list.md", note_doc(origin="[]"))
+
+        _proc, report = self.validate()
+        self.assertIn(("needs_review", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/dup_needs_review.md")))
+        self.assertIn(("origin", "bad_format"), support.errors_multiset(support.doc_by_path(report, "documents/empty_origin_list.md")))
+
+    def test_three_faults_one_file(self):
+        text = note_doc(status='"weird"', evidence='["ftp://bad"]', id='"TOO-SHORT"')
+        self.write("documents/three_faults.md", text)
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/three_faults.md")
+        errs = support.errors_multiset(doc)
+        self.assertIn(("status", "not_allowed"), errs)
+        self.assertIn(("evidence", "bad_format"), errs)
+        self.assertIn(("id", "bad_format"), errs)
+
+
+class TestUncertaintyAndNeedsReview(TempBrainTestCase):
+    def test_valid_uncertainty_combinations(self):
+        self.write("documents/all_uncertain.md", note_doc())
+
+        shuffled = note_doc(needs_review=("origin", "kind", "created", "summary", "reviewed"))
+        self.write("documents/shuffled.md", shuffled)
+
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"document"',
+            "title": '"Sample"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '\n  - ref: "https://example.com/a"\n    retrieved: "2026-01-01"',
+            "evidence": "[]",
+            "kind": '"source"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+            "source_identity": '"https://example.com/a"',
+            "original": '"original/a.md"',
+            "original_sha256": '"%s"' % ("a" * 64),
+        }
+        known_origin_text = make_frontmatter(fields, needs_review=("created", "reviewed", "summary")) + "body\n"
+        self.write("documents/known_origin_empty_created.md", known_origin_text)
+
+        _proc, report = self.validate()
+        for path in ("documents/all_uncertain.md", "documents/shuffled.md", "documents/known_origin_empty_created.md"):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(doc["errors"], [], "{}: {!r}".format(path, doc["errors"]))
+
+    def test_needs_review_mismatch_cases(self):
+        self.write("documents/missing_origin_marker.md", note_doc(needs_review=("created", "reviewed", "summary", "kind")))
+        self.write(
+            "documents/extra_field.md",
+            note_doc(needs_review=("created", "reviewed", "summary", "kind", "origin", "title")),
+        )
+        self.write(
+            "documents/fresh_until_listed.md",
+            note_doc(fresh_until='"2026-01-01"', needs_review=("created", "reviewed", "summary", "kind", "origin", "fresh_until")),
+        )
+        self.write("documents/list_absent.md", note_doc(needs_review=()))
+
+        _proc, report = self.validate()
+        for path in (
+            "documents/missing_origin_marker.md",
+            "documents/extra_field.md",
+            "documents/fresh_until_listed.md",
+            "documents/list_absent.md",
+        ):
+            doc = support.doc_by_path(report, path)
+            self.assertEqual(support.errors_multiset(doc), {("needs_review", "needs_review_mismatch")}, path)
+
+
+class TestCustomTypesBothWays(TempBrainTestCase):
+    RECIPE_DEF = json.dumps(
+        {
+            "type": "recipe",
+            "zones": ["*"],
+            "required": [],
+            "allowed_values": {"cuisine": ["italian", "french"]},
+            "uncertainty_values": {"cuisine": None},
+            "display_fields": ["cuisine"],
+            "search_fields": ["cuisine"],
+        }
+    )
+
+    def test_recipe_type_valid_missing_not_allowed(self):
+        self.write(".brain/types/custom/recipe.json", self.RECIPE_DEF)
+
+        valid_fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"recipe"',
+            "title": '"Pasta"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"unknown"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+            "cuisine": '"italian"',
+        }
+        self.write(
+            "documents/recipe_valid.md",
+            make_frontmatter(valid_fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+
+        missing_fields = dict(valid_fields)
+        del missing_fields["cuisine"]
+        self.write(
+            "documents/recipe_missing_cuisine_disclosed.md",
+            make_frontmatter(missing_fields, needs_review=("created", "reviewed", "summary", "kind", "origin", "cuisine")) + "body\n",
+        )
+        self.write(
+            "documents/recipe_missing_cuisine_undisclosed.md",
+            make_frontmatter(missing_fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+
+        not_allowed_fields = dict(valid_fields)
+        not_allowed_fields["cuisine"] = '"klingon"'
+        self.write(
+            "documents/recipe_bad_cuisine.md",
+            make_frontmatter(not_allowed_fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+
+        _proc, report = self.validate()
+        self.assertEqual(support.doc_by_path(report, "documents/recipe_valid.md")["errors"], [])
+        self.assertEqual(support.doc_by_path(report, "documents/recipe_missing_cuisine_disclosed.md")["errors"], [])
+        self.assertIn(
+            ("needs_review", "needs_review_mismatch"),
+            support.errors_multiset(support.doc_by_path(report, "documents/recipe_missing_cuisine_undisclosed.md")),
+        )
+        self.assertIn(
+            ("cuisine", "not_allowed"),
+            support.errors_multiset(support.doc_by_path(report, "documents/recipe_bad_cuisine.md")),
+        )
+
+    def test_type_unknown_without_definition_file(self):
+        fields = {
+            "kb": "1",
+            "id": '"01arz3ndektsv4rrffq69g5fav"',
+            "type": '"recipe"',
+            "title": '"Pasta"',
+            "summary": '""',
+            "status": '"draft"',
+            "created": None,
+            "reviewed": None,
+            "origin": '"unknown"',
+            "evidence": "[]",
+            "kind": '"unknown"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+            "cuisine": '"italian"',
+        }
+        self.write(
+            "documents/recipe_no_def.md",
+            make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+        )
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/recipe_no_def.md")
+        self.assertEqual(support.errors_multiset(doc), {("type", "unknown_type")})
+
+    def test_definition_errors(self):
+        self.write(".brain/types/custom/note.json", json.dumps({"type": "note", "zones": ["*"]}))  # missing keys -> shadows or invalid
+        self.write("documents/base_note.md", note_doc())
+
+        proc, report = self.validate()
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        codes = {d["code"] for d in report["definitions"]}
+        self.assertTrue({"invalid_definition", "shadows_type"} & codes)
+        base_note_doc = support.doc_by_path(report, "documents/base_note.md")
+        self.assertEqual(base_note_doc["status"], "valid")
+
+    def test_shadows_type_explicit(self):
+        self.write(
+            ".brain/types/custom/note.json",
+            json.dumps(
+                {
+                    "type": "note",
+                    "zones": ["*"],
+                    "required": [],
+                    "allowed_values": {},
+                    "uncertainty_values": {},
+                    "display_fields": [],
+                    "search_fields": [],
+                }
+            ),
+        )
+        self.write("documents/base_note.md", note_doc())
+        _proc, report = self.validate()
+        codes = {d["code"] for d in report["definitions"]}
+        self.assertIn("shadows_type", codes)
+        self.assertEqual(support.doc_by_path(report, "documents/base_note.md")["status"], "valid")
+
+    def test_name_mismatch_and_dual_unknown(self):
+        self.write(
+            ".brain/types/custom/recipe.json",
+            json.dumps(
+                {
+                    "type": "dish",
+                    "zones": ["*"],
+                    "required": [],
+                    "allowed_values": {},
+                    "uncertainty_values": {},
+                    "display_fields": [],
+                    "search_fields": [],
+                }
+            ),
+        )
+        for type_name in ("recipe", "dish"):
+            fields = {
+                "kb": "1",
+                "id": '"01arz3ndektsv4rrffq69g5fav"',
+                "type": f'"{type_name}"',
+                "title": '"x"',
+                "summary": '""',
+                "status": '"draft"',
+                "created": None,
+                "reviewed": None,
+                "origin": '"unknown"',
+                "evidence": "[]",
+                "kind": '"unknown"',
+                "authored_by": '"human"',
+                "retention": '"durable"',
+            }
+            self.write(
+                f"documents/{type_name}_doc.md",
+                make_frontmatter(fields, needs_review=("created", "reviewed", "summary", "kind", "origin")) + "body\n",
+            )
+        _proc, report = self.validate()
+        codes = {d["code"] for d in report["definitions"]}
+        self.assertIn("name_mismatch", codes)
+        for type_name in ("recipe", "dish"):
+            doc = support.doc_by_path(report, f"documents/{type_name}_doc.md")
+            self.assertEqual(support.errors_multiset(doc), {("type", "unknown_type")})
+
+    def test_malformed_definition(self):
+        self.write(".brain/types/custom/broken.json", "{not valid json")
+        self.write("documents/base_note.md", note_doc())
+        _proc, report = self.validate()
+        codes = {d["code"] for d in report["definitions"]}
+        self.assertIn("malformed_definition", codes)
+
+
+class TestBaseTypesReadBesideCode(TempBrainTestCase):
+    def test_tampered_brain_side_base_type_ignored(self):
+        self.write(
+            ".brain/types/base/note.json",
+            json.dumps(
+                {
+                    "type": "note",
+                    "zones": [],
+                    "required": ["nonsense"],
+                    "allowed_values": {},
+                    "uncertainty_values": {},
+                    "display_fields": [],
+                    "search_fields": [],
+                }
+            ),
+        )
+        self.write("documents/note.md", note_doc())
+        _proc, report = self.validate()
+        doc = support.doc_by_path(report, "documents/note.md")
+        self.assertEqual(doc["status"], "valid", doc["errors"])
+
+    def test_runs_from_copied_layout_and_different_cwd(self):
+        copy_root = tempfile.mkdtemp(prefix="brain-copy-")
+        self.addCleanup(shutil.rmtree, copy_root, ignore_errors=True)
+        for name in ("bin", "brain_core", "vendor", "types"):
+            src = os.path.join(support.REPO_ROOT, name)
+            dst = os.path.join(copy_root, name)
+            shutil.copytree(src, dst)
+
+        brain_root = tempfile.mkdtemp(prefix="brain-data-")
+        self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)
+        support.write_file(brain_root, "documents/note.md", note_doc())
+
+        other_cwd = tempfile.mkdtemp(prefix="other-cwd-")
+        self.addCleanup(shutil.rmtree, other_cwd, ignore_errors=True)
+
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-B", "-S", "-E", os.path.join(copy_root, "bin", "brain"), "validate", "--root", brain_root],
+            cwd=other_cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(report["outcome"], "valid")
+
+
+class TestVendoredYamlRecord(TempBrainTestCase):
+    EXPECTED_HASHES: ClassVar[dict] = {
+        "vendor/yaml/__init__.py": "b19dfcc333d6a75dfd73073901164507252f271b41d3b5f7d85510033a0547a7",
+        "vendor/yaml/composer.py": "fcaa37d16afa783594794a5ab94193dcb720f503c19ce3d59539c8311189f453",
+        "vendor/yaml/constructor.py": "90d8247da78b524c10618fd0e857f54f3d97570fe91b5c5513d024ef3faf88b0",
+        "vendor/yaml/cyaml.py": "e99ac01bd7c062f7557b614aff0d21997a06ed962ca185306a91bc0a20bbd87d",
+        "vendor/yaml/dumper.py": "3cb72d66563064ba7b5e679477046ebf89d8399d940670c8532f3e94a7cb17ea",
+        "vendor/yaml/emitter.py": "8e086d694ede170837d5b1b407b45979aff6f40762f422a65eafd08e04290a44",
+        "vendor/yaml/error.py": "021f73fada072546c4f63f8cf18a7181244ce4280b09cc15cc980b2d1176171a",
+        "vendor/yaml/events.py": "e74fd392c810884e2ea7e94aa3f57e9c1cbeb402319083d0c58e6a0e1282787c",
+        "vendor/yaml/loader.py": "5156becc8aa6905482218abf3e04869b835226db4763645fff3438fdbd5f1cdd",
+        "vendor/yaml/nodes.py": "80f28d8fca4a09d87677882bde021820d9cf39a3b11a12405226211919cf13ce",
+        "vendor/yaml/parser.py": "8a55a9e6fbe0a07146cef3990c8b45a068c3e83e369e1959ad9ca30306b4a09a",
+        "vendor/yaml/reader.py": "d1d9b38ab3a20c6e17a38d519ee412ecaf6b918df18c78956ac7c330d4ea08dc",
+        "vendor/yaml/representer.py": "22e58ff9c016f6c1ca1274b4802a926bcf78935060e1c813c5a0f021c6d143e6",
+        "vendor/yaml/resolver.py": "f4bf9561f9b89961f1503d558385fbae30d12bfed565de9bf76c33abb63620a6",
+        "vendor/yaml/scanner.py": "60433788b652690c17710460da5d91e0c753d3318fd85f5e1e42862a71f25906",
+        "vendor/yaml/serializer.py": "0a1b85826854d35863e31808f0668abfabdf33606e8f06bd8bb7761401e3edc0",
+        "vendor/yaml/tokens.py": "953408cd2570f0c83dc2fe39f7e4e388e41eeb05738aa69196a5f6ffcf6ba79e",
+        "vendor/PyYAML-LICENSE": "8d3928f9dc4490fd635707cb88eb26bd764102a7282954307d3e5167a577e8a4",
+    }
+
+    def test_vendored_yaml_record(self):
+        vendored_files = [f for f in os.listdir(os.path.join(support.REPO_ROOT, "vendor", "yaml")) if f.endswith(".py")]
+        self.assertEqual(len(vendored_files), 17)
+
+        vendored_md = os.path.join(support.REPO_ROOT, "vendor", "VENDORED.md")
+        with open(vendored_md, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("PyYAML 6.0.3", content)
+        self.assertIn("d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f", content)
+        self.assertIn("https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz", content)
+
+        for rel_path, expected_hash in self.EXPECTED_HASHES.items():
+            full = os.path.join(support.REPO_ROOT, rel_path)
+            with open(full, "rb") as fh:
+                actual_hash = hashlib.sha256(fh.read()).hexdigest()
+            self.assertEqual(actual_hash, expected_hash, rel_path)
+            self.assertIn(expected_hash, content, rel_path)
+
+
+class TestVendoredYamlIsTheOneLoaded(TempBrainTestCase):
+    def test_decoy_package_is_not_used(self):
+        copy_root = tempfile.mkdtemp(prefix="brain-decoy-")
+        self.addCleanup(shutil.rmtree, copy_root, ignore_errors=True)
+        for name in ("bin", "brain_core", "vendor", "types"):
+            src = os.path.join(support.REPO_ROOT, name)
+            dst = os.path.join(copy_root, name)
+            shutil.copytree(src, dst)
+
+        decoy_dir = os.path.join(copy_root, "bin", "yaml")
+        os.makedirs(decoy_dir)
+        with open(os.path.join(decoy_dir, "__init__.py"), "w", encoding="utf-8") as fh:
+            fh.write("__version__ = '0.0-decoy'\nraise RuntimeError('decoy yaml was imported')\n")
+
+        brain_root = tempfile.mkdtemp(prefix="brain-data-")
+        self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)
+        support.write_file(brain_root, "documents/note.md", note_doc())
+
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-B", os.path.join(copy_root, "bin", "brain"), "validate", "--root", brain_root],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(report["outcome"], "valid")
+
+    def test_altered_vendor_version_errors(self):
+        copy_root = tempfile.mkdtemp(prefix="brain-altered-")
+        self.addCleanup(shutil.rmtree, copy_root, ignore_errors=True)
+        for name in ("bin", "brain_core", "vendor", "types"):
+            src = os.path.join(support.REPO_ROOT, name)
+            dst = os.path.join(copy_root, name)
+            shutil.copytree(src, dst)
+
+        init_path = os.path.join(copy_root, "vendor", "yaml", "__init__.py")
+        with open(init_path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        content = content.replace("__version__ = '6.0.3'", "__version__ = '6.0.3-altered'")
+        with open(init_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+        brain_root = tempfile.mkdtemp(prefix="brain-data-")
+        self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)
+        support.write_file(brain_root, "documents/note.md", note_doc())
+
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-B", "-S", "-E", os.path.join(copy_root, "bin", "brain"), "validate", "--root", brain_root],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(report, {"outcome": "error", "reason": "vendored_dependency"})
+
+
+class TestNoGitAndNoWrites(TempBrainTestCase):
+    def test_output_identical_without_git_and_with_git_history(self):
+        self.write("documents/note.md", note_doc())
+
+        env_no_git = dict(os.environ)
+        env_no_git["PATH"] = ""
+        proc1 = support.run_brain(["validate", "--root", self.tmpdir], env=env_no_git)
+        report1 = support.parse_single_json(proc1.stdout)
+
+        import subprocess
+
+        subprocess.run(["git", "init", "-q"], cwd=self.tmpdir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.tmpdir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.tmpdir, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=self.tmpdir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.tmpdir, check=True)
+
+        proc2 = support.run_brain(["validate", "--root", self.tmpdir])
+        report2 = support.parse_single_json(proc2.stdout)
+
+        self.assertEqual(report1, report2)
+
+        self.assertEqual(support.find_bytecode(self.tmpdir), [])
+        self.assertEqual(support.find_bytecode(support.REPO_ROOT), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

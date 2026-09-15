@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: b30899069c7451f6ba26d59e5e891a8601ed818d82296018137f35d4c7562617
+Version: ab2ce435b845fe92b04cffd11445683441f124b79570ac06edb653db01362935
 Publication: published — accepted by merge of #2
 Status: **Accepted specification; not implemented.** Nothing described here exists yet. Delivery stories are opened as issues referencing this version.
 
@@ -153,7 +153,7 @@ Each decision is numbered (C1…C17, with C5a and C13a) so stories can reference
   | Package | PyYAML 6.0.3 (MIT) |
   | Source | PyPI sdist `pyyaml-6.0.3.tar.gz`, `https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz` |
   | Source SHA-256 | `d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f` |
-  | Vendored files | the 16 files of the sdist's `lib/yaml/`, unmodified, at `vendor/yaml/`; the sdist's `LICENSE`, unmodified, at `vendor/PyYAML-LICENSE` |
+  | Vendored files | the 17 files of the sdist's `lib/yaml/`, unmodified, at `vendor/yaml/`; the sdist's `LICENSE`, unmodified, at `vendor/PyYAML-LICENSE` |
   | Record in the repository | `vendor/VENDORED.md`: package, version, source URL, source SHA-256, and the SHA-256 of every vendored file |
 
   - **Loading.** The code puts its own `vendor/` directory first on the import path. Before any use, it confirms that the loaded module's file lies inside that directory and that `yaml.__version__` is `6.0.3`. Otherwise it stops with exit `1` and `{"outcome": "error", "reason": "vendored_dependency"}`. An installed PyYAML elsewhere is never used.
@@ -286,7 +286,7 @@ Type definitions:
 
 **Scan.** `brain validate --root <brain>` scans every file whose name ends in lowercase `.md` under `documents/`, `wiki/` and installed module folders.
 - A module is installed when `.brain/modules/<module>/module.json` exists and names its folder (`{"module": "projects", "folder": "projects"}`). Without that file, no module folder is scanned.
-- It skips `inbox/`, `raw/`, hidden folders (names starting with `.`) and other files.
+- It skips `inbox/`, `raw/`, hidden folders and hidden files (names starting with `.`) and other files.
 - Symbolic links are not followed. Each is listed under `skipped` with reason `symlink`, so nothing is skipped silently.
 
 **Output.**
@@ -334,7 +334,7 @@ Type definitions:
 - Duplicate entries in `needs_review`, an `origin` list that is empty, and an `original_sha256` that is not 64 lowercase hexadecimal characters are each `bad_format`.
 - `source_identity` must be non-empty text.
 
-**Definitions.** A custom definition that cannot be parsed as JSON is `malformed_definition`. One with missing or wrongly typed keys is `invalid_definition`. One whose file name differs from its `type` is `name_mismatch`. One reusing a base or module type name is `shadows_type`. Documents whose type relies on a failed definition are `unknown_type`.
+**Definitions.** A custom definition that cannot be parsed as JSON is `malformed_definition`. One with missing or wrongly typed keys is `invalid_definition`. One whose file name differs from its `type` is `name_mismatch`. One reusing a base or module type name is `shadows_type`. A failed custom definition is ignored entirely: it defines no type and overrides nothing. A document is `unknown_type` exactly when no valid base, module or custom definition defines its `type`. So a failed `note.json` leaves the base `note` type in force, and a `recipe.json` declaring `dish` defines neither `recipe` nor `dish`.
 
 **Retained files.** Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. Role identity needs publication records from git history. Validate reads them only when the root is a git repository, runs git read-only, and treats a brain without git as having no retained files. A retained file whose bytes no longer match its recorded hash carries `retained_changed`; a retained path whose file is gone is still listed, with `retained_missing`.
 

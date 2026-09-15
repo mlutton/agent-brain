@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 002a151be516f8c5d4aeae8e790e3283a37a55b19ec2fbf6f7fe53de81911e72
+Version: 44bc910fad0d495961d15e022e71421a568161530adde829e57a1652d78a1bf1
 Publication: published — draft pull request for review; proposed, not accepted
 Status: **Proposed.** The beta is being specified, not implemented. Nothing described here exists yet.
 
@@ -26,7 +26,7 @@ A public starter repository, `agent-brain`, from which a user creates their own 
 
 - **Skills are the entry point.** A Claude session opened at the brain root uses skills to find knowledge, read selected evidence, save results and ingest new material. Claude is the required entry path for the beta; Codex support is optional and claimed only once demonstrated.
 - **Code does the mechanics.** Skills call a command-line interface that takes an explicit brain root and returns JSON. The code validates documents, persists them safely, maintains an index, discovers candidates, reads bounded excerpts, audits out-of-band changes and composes ingestion runs. The model proposes; the code validates and applies.
-- **Everything stays inspectable.** Documents remain readable Markdown. Each operation leaves a change record and, in a git-backed brain, a commit whose trailer declares exactly what changed. Generated state (index, intents, backups) is rebuildable and never committed.
+- **Everything stays inspectable.** Documents remain readable Markdown. Each operation leaves a change record and, in a git-backed brain, a commit whose trailer declares exactly what changed. Generated state — a rebuildable cache and a local operation journal — is never committed.
 - **Honest outcomes.** Discovery distinguishes a real match, an honest no-match and a partial result where coverage is incomplete. Persistence distinguishes refused, not applied, written, written-with-pending-bookkeeping and unexpected target content. Nothing incomplete is presented as complete.
 - **Human edits are respected.** Out-of-band edits are detected by code, corrected only additively, and suspend automatic agent maintenance of that document until a person explicitly restores it.
 
@@ -142,13 +142,13 @@ Each decision is numbered (C1…C17, with C5a and C13a) so stories can reference
 ### C1. Runtime and packaging
 
 - Supporting code is Python 3.11+ using the standard library plus **one vendored library, PyYAML** (pure-Python build, MIT licence, exact version pinned), used only to parse frontmatter. It also uses the `git` command (2.30+) for git-backed brains. No package installation, daemon, network service, MCP server or Obsidian dependency.
-- **Dependency policy (proposed in this revision).** A frontmatter reader must agree with how YAML — and therefore Obsidian — interprets properties. A hand-written subset parser cannot guarantee that. PyYAML's source and licence ship in the starter's `vendor/` folder, and setup copies them into the brain, so users still install nothing.
+- **Dependency policy (proposed in this revision).** Obsidian stores properties as YAML, so the frontmatter reader must follow YAML rather than an invented subset. The vendored parser implements YAML 1.1. The written form (C4) is chosen so that its values do not depend on YAML 1.1-versus-1.2 differences. How Obsidian's own parser treats these files has not been exercised; it is checked manually during acceptance (S-G4(g)). PyYAML's source and licence ship in the starter's `vendor/` folder, and setup copies them into the brain, so users still install nothing.
   - Tradeoff: upstream fixes are adopted by deliberately bumping the pinned copy, and the optional C accelerator is not used.
   - Alternative considered: require the user to install PyYAML. Rejected because it adds a setup step and version drift.
   - The dependency is never used to write frontmatter (C4).
 - One command-line entry point, `brain`, with subcommands `setup`, `validate`, `persist`, `recover`, `rebuild`, `discover`, `read`, `audit`, `ingest`, `grant`. It is invoked as `python3 bin/brain` from the starter repository root (development and tests) and as `python3 .brain/bin/brain` inside a brain; nothing is installed.
 - Every subcommand except `setup` requires `--root <brain>`; the root is never inferred from the working directory. Structured input is a JSON document on stdin or `--input <file>`. Output is exactly one JSON object on stdout carrying `outcome`.
-- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, `needs_resolution`, and `invalid` from `validate`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
+- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, and `invalid` from `validate`); `1` an unhandled error. The JSON `outcome` is authoritative; exit codes are a convenience.
 
 ### C2. Brain layout and folder categories
 
@@ -193,32 +193,32 @@ The setup skill wraps this command and explains the private-repository recommend
 
 **`kb` and versions.**
 - `kb` stands for *knowledge base*.
-- `kb: 1` (the unquoted integer) is the **managed-document format version**: the schema this specification defines. It is not a formatter setting, a content revision, a freshness indicator or an approval status.
+- `kb: 1` (the unquoted integer, not a boolean or string) is the **managed-document format version**: the schema this specification defines. It is not a formatter setting, a content revision, a freshness indicator or an approval status.
 - A document's **version** is the SHA-256 of its full file bytes.
 - A document **id** is minted once as a lowercase 26-character ULID (Crockford base32 alphabet, without `i`, `l`, `o`, `u`). It is never reused, never derived from the path, and survives renames.
 
-**Frontmatter is YAML, as in Obsidian properties.** A Markdown file has frontmatter when its first line, after an optional UTF-8 byte-order mark, is `---` and a later line is `---`. The block between is parsed with a YAML safe loader. Code additionally detects duplicate property names, which the loader alone would silently resolve to the last value. Each Markdown file is exactly one of:
+**Frontmatter is YAML, as in Obsidian properties.** A Markdown file has frontmatter when its first line, after an optional UTF-8 byte-order mark, is `---` and a later line is `---`. The block between is parsed with a YAML safe loader. Code additionally detects duplicate property names, which the loader alone would silently resolve to the last value. A file whose role is a retained original or attachment (C13a) is classified by role first and never by the table below. Every other Markdown file is exactly one of:
 
 | Class | Condition | Treatment |
 | --- | --- | --- |
 | `unmanaged` | no frontmatter, or a valid YAML mapping with no `kb` property | a user note; audit may bring it under management (C12) |
 | `managed` | valid YAML mapping with `kb: 1` | validated against C5 |
-| `unsupported_version` | `kb` holds any other integer | reported; never validated as `kb: 1`, indexed as a candidate, corrected or written |
+| `unsupported_version` | `kb` holds any other integer (booleans are not integers) | reported; never validated as `kb: 1`, indexed as a candidate, corrected or written |
 | `malformed` | unclosed block, invalid YAML, a top-level value that is not a mapping, duplicate property names, or `kb` holding a non-integer | reported `invalid`; never written |
 
 Valid YAML is **unsupported for editing**, but not malformed, when the block uses anchors, aliases, explicit tags, multiple documents, or flow style for the whole mapping (for example JSON-style frontmatter, which Obsidian also accepts). Such a note keeps its class above. Operations that would have to change the block refuse with `unsupported_frontmatter` and leave the file byte-identical.
 
 **Reading values.**
-- A text property must parse to a string.
-- An unquoted value that YAML reads as something else — `yes` becomes a boolean, `[[Link]]` becomes a nested list, `12` becomes a number — is `invalid` with code `ambiguous_scalar` and a hint to quote it. It is never coerced.
+- A text property must parse to a string; an empty value (`summary:`, which editors write) is accepted as the empty string.
+- An unquoted value that the parser reads as something else is `invalid` with code `ambiguous_scalar` and a hint to quote it. It is never coerced. Under the vendored YAML 1.1 parser, `yes` becomes a boolean, `[[Link]]` becomes a nested list and `12` becomes a number.
 - A date property accepts a YAML date or a `YYYY-MM-DD` string.
 - An empty value is YAML null.
 - `#` preceded by a space begins a YAML comment. An unquoted `: ` inside a value is a YAML error. Values containing either must be quoted.
 
-**Canonical written form.** Everything code writes parses to the same values under YAML 1.1 and 1.2, and uses Obsidian's property formats:
+**Canonical written form.** Code writes only forms whose values do not differ between YAML 1.1 and 1.2 — text always quoted, and only dates, the `kb` integer, empty values and `[]` left unquoted — using the property formats Obsidian documents:
 - a block-style mapping with one property per line, LF line endings, no comments written by code;
 - `kb: 1` as an unquoted integer;
-- every text value in double quotes, escaping only `\"` and `\\`; single-line fields reject line breaks;
+- every text value in double quotes, escaping only `\"` and `\\`, with an empty text value written `""`; single-line fields reject line breaks;
 - dates unquoted as `YYYY-MM-DD`; unknown or absent-by-design values written as an empty value (`created:`);
 - lists as block lists with two-space `  - "item"` entries, and an empty list as `[]`;
 - `origin` references as block-list mappings (`  - ref: "…"` then `    retrieved: 2026-09-14`). Obsidian shows nested properties only in source mode, a documented limitation accepted for this one field.
@@ -226,13 +226,14 @@ Valid YAML is **unsupported for editing**, but not malformed, when the block use
 **Editing existing frontmatter.** Two separate rules:
 - **Audit correction is additive** (C12). It appends missing properties in canonical form immediately before the closing `---`, and changes no existing byte, comment or ordering. Afterwards every original line must be byte-identical, and a re-parse must equal the previous mapping plus exactly the added properties; otherwise the file is restored and reported `correction_blocked`.
 - **Persist updates use targeted property replacement** (C6).
-  - For each property the request changes, only that property's lines are replaced: its key line and the indented continuation lines belonging to it. New properties are appended; removed properties have their lines deleted.
-  - Comments, ordering and every untouched property's bytes are preserved.
-  - A re-parse must equal the intended mapping. Otherwise, or when the block is unsupported for editing, the update is refused with `unsupported_frontmatter`.
+  - **A property's span** is computed from the parser's node positions, not from indentation. It runs from the first line of the property's key through the last line of its value node, so zero-indented block sequences are covered.
+  - **Replacing a property.** Its span is replaced, in place, by the canonical form of the new value. A new property is appended in canonical form immediately before the closing `---`. A removed property's span is deleted.
+  - **Comments are never silently deleted.** If a span to replace or remove contains a comment line, or its key line or value lines carry a trailing comment, the update is refused `unsupported_frontmatter`.
+  - **Two guards.** Every byte outside the replaced, removed and appended spans must be identical to the original (comments, ordering and untouched properties), and a re-parse must equal the intended mapping. Otherwise, or when the block is unsupported for editing, the update is refused `unsupported_frontmatter` and the file is left unchanged.
   - A reviewed write may instead supply the complete new frontmatter with `replace_frontmatter: true`. That always counts as an overwrite (C14).
 - Code never re-serialises a whole frontmatter block it did not create.
 
-**Editor rewrites.** Obsidian may re-save a block in its own style, for example rewriting JSON-style frontmatter as YAML, or changing quoting. Validity depends on parsed values, not on the exact text, so a semantically equal rewrite stays valid. It is still a byte change: a new document version and an out-of-band change for audit.
+**Editor rewrites.** Obsidian documents that it re-saves JSON-style frontmatter as YAML; other restyling by editors (for example changed quoting) is possible but not documented. Validity depends on parsed values, not on the exact text, so a semantically equal rewrite stays valid. It is still a byte change: a new document version and an out-of-band change for audit.
 
 ### C5. Field contract (`kb: 1`)
 
@@ -253,7 +254,7 @@ Optional: `fresh_until`, `first_seen`, `needs_review`, `supersedes`, `superseded
 | `evidence`, `derived_from`, `conflicts_with`, `supersedes` | lists of brain ids or external URLs |
 
 Rules:
-- **Uncertainty values** are valid for any origin: empty `created`, empty `reviewed`, `kind: unknown`, `type: unclassified`, empty `summary`, `origin: unknown`, any empty `retrieved` (named as field `origin`), and any value a type definition declares under `uncertainty_values` (which may be empty). Date properties use empty rather than a word such as `unknown` so that Obsidian, which assigns one type to a property name across the whole vault, keeps them valid dates.
+- **Uncertainty values** are valid for any origin: empty `created`, empty `reviewed`, `kind: unknown`, `type: unclassified`, empty `summary`, `origin: unknown`, any empty `retrieved` (named as field `origin`), and any value a type definition declares under `uncertainty_values` (which may be empty). Date properties use empty rather than a word such as `unknown` because Obsidian assigns one type to a property name across the whole vault and documents dates as `YYYY-MM-DD`; how Obsidian displays an empty date is checked in S-G4(g).
 - `needs_review` must list exactly the fields holding uncertainty values, in any order. It is absent or `[]` when there are none.
 - An absent `fresh_until` means freshness is unknown, but it is not an uncertainty value for `needs_review`.
 - A `kind: unknown` document never counts as a source.
@@ -295,7 +296,7 @@ Type definitions:
 
 ### C6. Single-file persist
 
-Request: `{operation: create|update|attach, path, frontmatter?, body?, content_base64?, for_document?, expected_version?, run_id?, replace_frontmatter?}`. `create` writes the canonical form. `update` applies targeted property replacement (C4). Writes to `retained` files, `unsupported_version` documents and unsupported-for-editing blocks are refused. Sequence:
+Request: `{operation: create|update|attach, path, frontmatter?, body?, content_base64?, for_document?, expected_version?, run_id?, replace_frontmatter?}`. `create` writes the canonical form. `update` applies targeted property replacement (C4). Writes to `unsupported_version` documents and unsupported-for-editing blocks are refused. Writes to `retained` files are refused, with one exception: `brain recover --restore-retained <path>`, a reviewed write that restores the bytes recorded by the ingest commit and resolves `retained_changed` or `retained_missing`. Accepting changed source bytes is never an in-place write; the changed content is ingested as a new version (C13). Sequence:
 
 1. Validate the request and the resulting document against C5 and its type.
 2. Record an intent in the journal (`.brain/journal/intents/`): `run_id`, `op_key`, `path`, `expected_prior` (`absent` or a hash), `intended_sha256`, temp path, backup path.
@@ -317,7 +318,7 @@ Request: `{operation: create|update|attach, path, frontmatter?, body?, content_b
 
 Stated limitation: the beta assumes one writer per brain. A write by another process between step 4 and step 5 of an `update` can be overwritten; the backup preserves displaced content only if that write landed before the backup.
 
-`recover`: for each open intent — target matches `expected_prior` → `not_applied` (close intent, remove temp); target matches `intended_sha256` → `applied` (finish missing bookkeeping exactly once, checking for an existing change record and an existing commit carrying the same `op_key`); otherwise → `target_unexpected`. A temp file with no intent → `orphan_temp`.
+`recover`: for each open intent — target matches `expected_prior` → `not_applied` (close intent, remove temp); target matches `intended_sha256` → `applied` (finish missing bookkeeping exactly once, checking for an existing change record and an existing commit carrying the same `op_key`); otherwise → `target_unexpected`. A temp file with no intent → `orphan_temp`. Intents that carry a run's `run_id` belong to that run's manifest: `recover` classifies them and reports `run_pending`, but makes no per-file change record or commit. Only an `ingest` retry of the same run, or `abandon`, completes or closes them. The open-intent refusal (Behaviour 21) does not apply to an `ingest` retry of the run that owns the intents.
 
 Fault injection for tests: when `BRAIN_TEST_FAULTS=1`, the environment variable `BRAIN_FAULT=<step>:<kill|fail>` stops the process (SIGKILL) or raises a failure at a named step (`after_intent`, `after_temp`, `before_apply`, `after_apply`, `before_change_record`, `before_index`, `before_commit`, `after_run_commit`, `before_raw_delete`). Without `BRAIN_TEST_FAULTS=1` the variable is ignored.
 
@@ -335,29 +336,30 @@ Brain-Review: approved|adopted|abandoned by=human                (reviewed write
 Brain-Unverified: <path> sha256=<hash>                            (journal-reset only)
 ```
 
-A trailer is **consistent** when the commit changes exactly the declared data-zone paths and each declared hash matches the committed content. Brain commits stage and commit only their declared paths, never other working-tree changes.
+A trailer is **consistent** when every data-zone path the commit changes is declared, every declared path's committed content matches its declared hash, and every declared path the commit does not change declares `prior` equal to that same hash. The last case lets an ingest retry declare roles for bytes that were already committed out of band; such a commit may be otherwise empty. Brain commits stage and commit only their declared paths, never other working-tree changes.
 
 ### C8. Index and publication visibility
 
-- **Index.** The index lives in the rebuildable cache. For each managed document it records: id, path, version, size, modification time, type, module, display and search fields, summary, label inputs, evidence and derivation lists, role and publication status. `rebuild` recreates it from files, git history and the journal.
+- **Index.** The index lives in the rebuildable cache. It records every data-zone file it has classified — retained files with their role and never as candidates — and for each managed document: id, path, version, size, modification time, type, module, display and search fields, summary, label inputs, evidence and derivation lists, role and publication status. `rebuild` recreates it from files, git history and the journal.
 - **Publication never depends on the index.** Recreating or deleting the index cannot publish or unpublish anything.
 - **Publication rule** (git brains). discover, read, rebuild, validate's `retained` status and audit all apply the same rule. The first matching rule wins.
 
   1. **`unpublished`.** An open intent or open run manifest in the journal names the file. This holds even when someone has committed the file out of band; audit then reports `run_file_committed_out_of_band`. The file is excluded from candidates, `read` returns `unpublished` without content, and it counts as `interrupted` coverage.
   2. **Retained original or attachment** (C13a). The file is never a candidate and never a note.
-  3. **Processed `document`.** Published only when its current path and bytes descend from a consistent `Brain-Op: ingest` commit that declared it `role=document`, or from an explicit `Brain-Op: adopt` commit, with later changes only through brain writes or audit-labelled edits. Otherwise it is **`unverified`** (`no_ingest_record`), even if a generic out-of-band or audit commit contains it.
-  4. **Other Markdown files** (notes, wiki pages, module documents, unmanaged notes):
-     - Committed: `published`. Out-of-band commits are ordinary human edits, labelled by audit.
-     - Uncommitted, journal present: `changed_out_of_band`. Returned as a candidate with that label, with metadata from the current file where it parses.
+  3. **Unresolved `Brain-Unverified` entry.** A file whose path is listed by a `journal-reset` commit and not yet resolved by a later ingest, adopt or resolve commit is `unverified`.
+  4. **Processed `document`.** Published only when its current path and bytes descend from a consistent `Brain-Op: ingest` commit that declared it `role=document`, or from an explicit `Brain-Op: adopt` commit, with later changes only through brain writes or audit-labelled edits. Otherwise it is **`unverified`** (`no_ingest_record`), even if a generic out-of-band or audit commit contains it.
+  5. **Every other data-zone file**, Markdown or not (notes, wiki pages, module documents, unmanaged notes, non-Markdown files):
+     - Committed: `published`. Out-of-band commits are ordinary human edits, labelled by audit. Only Markdown files can be candidates.
+     - Uncommitted, journal present: `changed_out_of_band`. A Markdown file is returned as a candidate with that label, with metadata from the current file where it parses.
      - Uncommitted, journal missing: `unverified` (`journal_missing`).
-  5. **`suspected_ingestion` hint.** Added to an `unverified` file when a surviving durable signal ties it to ingestion: an uncommitted `document` references it; its bytes equal a current `raw/` item (raw items are deleted only after a run commit); it sits in an item folder with such a file; or a `Brain-Unverified` trailer lists it.
+  6. **`suspected_ingestion` hint.** Added to an `unverified` file when a surviving durable signal ties it to ingestion: an uncommitted `document` references it; its bytes equal a current `raw/` item (raw items are deleted only after a run commit); it sits in an item folder with such a file; or a `Brain-Unverified` trailer lists it.
 - **`unverified` files** are excluded from candidates and listed separately. `read` returns `unverified` and gives content only when `include_unverified` is requested. They become published only through an explicit resolution (C12, C13): adoption, a retried ingestion, or abandonment.
 - **Journal missing.** While the journal is not present, operations that write refuse with `journal_missing`. The user resolves this with `brain recover --start-journal`, an explicit human step that:
   - creates a new journal epoch;
   - makes a `Brain-Op: journal-reset` commit;
-  - lists every currently unverified file as `Brain-Unverified: <path> sha256=<hash>`, so its status survives a later rebuild or cache loss.
+  - lists every currently unverified data-zone file, Markdown or not, as `Brain-Unverified: <path> sha256=<hash>`, so its status survives a later rebuild or cache loss.
 
-  After the reset, those files stay `unverified` until resolved. New uncommitted edits made after the reset are ordinary `changed_out_of_band` changes.
+  After the reset, those files stay `unverified` (rule 3) until resolved. New uncommitted files and edits made after the reset are ordinary `changed_out_of_band` changes.
 - **Brains without git.** Loss of the journal makes publication unverifiable for every file. `rebuild` marks all files `unverified` until the user runs `rebuild --accept-current-files`, which records that acknowledgement in a new journal. Non-git brains are outside beta acceptance.
 
 ### C9. Discover
@@ -396,8 +398,8 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
   - An existing key holding an invalid base-field value → `correction_blocked`, file unchanged. Malformed files → `invalid`, unchanged.
   - `managed_missing`: update the index (follow rename or mark removed); never write files.
   - Commit corrected and unattributed files with `Brain-Op: audit`, which becomes the new position.
-  - **Never corrected or committed by an audit commit:** `unpublished` and `run_file` files; retained originals and attachments; `unsupported_version` documents; processed `document`s without an ingest record; and any `unverified` file. `retained_changed` and `retained_missing` are reported for review. Restoring or accepting new bytes for a retained file is an overwrite (C14).
-- **Explicit adoption** (`brain audit --apply --adopt <path>…`): a human-confirmed resolution for `unverified` files the user identifies as their own notes, including files with a `suspected_ingestion` hint, which the report shows before confirmation. It applies the additive correction where needed, commits with `Brain-Op: adopt` and `Brain-Review: adopted by=human`, and publishes the files. An adopted `document` is published as a document and not as an ingestion.
+  - **Never corrected or committed by an audit commit:** `unpublished` and `run_file` files; retained originals and attachments; `unsupported_version` documents; processed `document`s without an ingest record; any `unverified` file or unresolved `Brain-Unverified` path; and any file with a `suspected_ingestion` hint. Audit commits unattributed files only while the journal is present. `retained_changed` and `retained_missing` are reported for review. Restoring or accepting new bytes for a retained file is an overwrite (C14).
+- **Explicit adoption** (`brain audit --apply --adopt <path>…`): a human-confirmed resolution for `unverified` files the user identifies as their own notes, including files with a `suspected_ingestion` hint, which the report shows before confirmation. It applies the additive correction where needed, commits with `Brain-Op: adopt` and `Brain-Review: adopted by=human`, and publishes the files. Adopting a `document` is refused unless its `original` and every `attachments` path are adopted in the same commit, declared with their roles; an adopted document is published as a document, not as an ingestion.
 - Audit never rewrites `authored_by` or any existing value, never writes because an event or hint was received, and makes no model call.
 
 ### C13. Ingestion runs
@@ -412,13 +414,13 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
   6. Once every file is at its intended hash, make one commit (`Brain-Op: ingest`, one `Brain-Path` per file with its `role`), close the run manifest, mark change records committed, apply staged index updates. Any `target_unexpected` stops the run before commit; nothing is published.
   7. Raw deletion: record a deletion intent with `raw_sha256`; re-read the raw item; if its hash differs, do not delete (`raw_changed`); otherwise delete and commit with `Brain-Op: delete-raw` and `prior=<hash>`.
 - **Run outcomes**: `ingested`, `ingested_raw_retained`, `not_published`, `target_unexpected`, `duplicate`, `new_version` (supersession pending review), `review_required`, `refused`.
-- **Retry** with the same `run_id`: skip files already at their intended hash, commit once, repeat the raw-deletion check. After the journal was lost and restarted, a create whose target already exists, is `unverified` and holds exactly the intended bytes is treated as applied; any other existing target is refused. The ingest commit resolves those paths' `Brain-Unverified` entries.
-- **Abandon** (`brain ingest abandon --run <run_id>` or `--paths <path>…`): a human-confirmed resolution. It removes uncommitted leftovers whose bytes equal the run manifest's intended hashes or the hashes recorded in `Brain-Unverified`. Files with any other bytes are left in place and reported. With the journal restarted, it commits `Brain-Op: resolve` with `Brain-Review: abandoned by=human`. Abandoning never deletes committed content or the `raw/` item.
+- **Retry** with the same `run_id`: skip files already at their intended hash (including files already committed out of band, which the ingest commit declares with `prior` equal to their hash and their role), commit once, close the manifest and intents, repeat the raw-deletion check. After the journal was lost and restarted, a create whose target already exists, is `unverified` and holds exactly the intended bytes is treated as applied; any other existing target is refused. The ingest commit resolves those paths' `Brain-Unverified` entries.
+- **Abandon** (`brain ingest abandon --run <run_id>` or `--paths <path>…`): a human-confirmed resolution. It removes uncommitted leftovers whose bytes equal the run manifest's intended hashes or the hashes recorded in `Brain-Unverified`. Files with any other bytes are left in place and reported. It closes the run manifest and its intents; with the journal restarted, it commits `Brain-Op: resolve` with `Brain-Review: abandoned by=human`. Run files already committed out of band are removed only by that reviewed resolve commit, so their bytes remain in history. Abandoning never touches the `raw/` item.
 
 ### C13a. Retained originals and attachments
 
 - **Role evidence.** A file's role as a retained original or attachment is established by durable evidence, checked in this order:
-  1. A published `document` references it through `original` or `attachments`.
+  1. It was committed in the same ingest or adopt commit that published a `document` referencing it through `original` or `attachments`, and its current bytes match the hash that commit recorded.
   2. A consistent `Brain-Op: ingest` commit declared it with `role=original` or `role=attachment`.
   3. An open run manifest in the journal names it.
 
@@ -427,7 +429,7 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
   - is listed as `retained` by validate;
   - is never parsed as frontmatter, validated, indexed as a candidate, matched on body text or corrected;
   - is readable as evidence (C10);
-  - has its bytes compared with `original_sha256` or the trailer hash. A mismatch is `retained_changed`, a missing file is `retained_missing`, and both are reported and never repaired automatically.
+  - has its bytes compared with the hash recorded by its ingest or adopt commit. A mismatch is `retained_changed`, a missing file is `retained_missing`, and both are reported and never repaired automatically. The reviewed resolution is `recover --restore-retained` (C6). A path whose role evidence exists only through a later reference, for example a note an editor linked as `original`, does not become retained.
 - **A Markdown original without role evidence** — for example left by an interrupted run after journal loss — is `unverified` with a `suspected_ingestion` hint when C8's signals apply. It is resolved by retry, adoption or abandonment, never by audit's automatic correction.
 
 ### C14. Review, authorship and maintenance grants
@@ -440,7 +442,7 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
   2. Audit correction: may append missing fields without review, commits separately; never applies to retained, unpublished, unverified or unsupported-version files.
   3. Automatic agent update, only when all hold: valid grant; current version agent-attributed; expected version matches; no unresolved values; the change does not delete, rename or move a document or replace an original or attachment.
   4. Anything else changing existing content requires review. A reviewed write carries `Brain-Review: approved by=human`; approving it does not create a grant.
-- **Overwrite**: any change to or removal of existing content not covered by rule 3. Replacing an original or attachment, accepting changed bytes of a retained file, `replace_frontmatter`, and deleting, renaming or moving a document, always count. Creating a new path never counts. Explicit adoption and abandonment are recorded human resolutions, not maintenance grants.
+- **Overwrite**: any change to or removal of existing content not covered by rule 3. Replacing an original or attachment, restoring a retained file, `replace_frontmatter`, and deleting, renaming or moving a document, always count. Creating a new path never counts. Explicit adoption and abandonment are recorded human resolutions, not maintenance grants.
 - `supersedes` and `superseded_by` are written only by a reviewed update approving a supersession assessment. The prior version stays citable; discovery flags citations of it with `newer_version_available`.
 
 ### C15. Projects module
@@ -496,10 +498,10 @@ Scenarios run against a brain created by `setup` from a pinned commit and popula
 | S-G | Out-of-band change and correction: body edit committed without trailer; new unmanaged note; rename; an editor-style write-temp-then-rename save; discover `partial` with labels; audit classifies and corrects; later discover finds all at current paths; no model call | forged consistent trailer without a record; inconsistent trailer; unrecorded trailer commit with the journal present |
 | S-G2 | Fresh clone or lost journal: consistent trailer commits `unverifiable`, never verified; writes refused `journal_missing` until `--start-journal`; unverified files hidden from candidates and published only by explicit adoption; a human note adopted and then discoverable | delete the journal; delete the cache |
 | S-G3 | Metadata correction and preservation: appended properties only; original lines, comments and order byte-identical; `correction_blocked` on invalid existing value and on JSON-style or anchored frontmatter; malformed untouched; ingested document with known origin and empty `created` validates | invalid existing value |
-| S-G4 | Obsidian-compatible frontmatter: <br>(a) fixtures — a title containing `: ` (quoted), a value containing ` #` (quoted) and `#` without a space, quoted strings, a comment line, block and empty lists, dates, empty values, an unquoted `yes` and an unquoted `[[Link]]` (`ambiguous_scalar`); <br>(b) every document created by persist re-parses to its intended values under YAML 1.1 and 1.2; <br>(c) a targeted update of one property preserves comments, order and all other property bytes; <br>(d) an editor-style rewrite (JSON-style block re-saved as YAML, quoting changed) stays valid and is reported out of band; <br>(e) `kb: 2` is `unsupported_version`, not corrected, not written, not a candidate; <br>(f) duplicate property names are `malformed` | unquote a colon-space title; strip a comment during update; treat `kb: 2` as unmanaged; drop duplicate-key detection |
+| S-G4 | Obsidian-compatible frontmatter: <br>(a) fixtures — a title containing `: ` (quoted), a value containing ` #` (quoted) and `#` without a space, quoted strings, a comment line, block and empty lists, dates, empty values, an unquoted `yes` and an unquoted `[[Link]]` (`ambiguous_scalar`); <br>(b) every document created by persist re-parses to its intended values under YAML 1.1 and 1.2; <br>(c) a targeted update of one property preserves comments, order and all other property bytes; <br>(d) an editor-style rewrite (JSON-style block re-saved as YAML, quoting changed) stays valid and is reported out of band; <br>(e) `kb: 2` is `unsupported_version`, not corrected, not written, not a candidate; <br>(f) duplicate property names are `malformed`; <br>(g) manual, recorded check in Obsidian during acceptance: representative generated documents (text, list, date, empty date, `[]`) open without property type warnings, and a property edited in Obsidian stays valid | unquote a colon-space title; strip a comment during update; treat `kb: 2` as unmanaged; drop duplicate-key detection |
 | S-H | Ingestion and projects module: raw article ingested with original kept and origin recorded; raw removed after commit; a new custom type added by file validates and is discoverable with display fields; unresolved field stops for review | missing required type field |
 | S-H3 | Retained originals: ingest one Markdown source without frontmatter and one with its own frontmatter (including a `kb` property); run `validate`, `rebuild`, `discover`, `audit` and `audit --apply`; only the processed documents are candidates; originals are `retained`, never corrected, and still match `original_sha256`; modifying an original yields `retained_changed` and no repair; deleting the index and journal leaves roles recognised from committed evidence | add frontmatter to an original; delete the cache and journal; rename an ordinary note into an `original/` folder (stays a note) |
-| S-H4 | Interrupted ingestion through reconciliation, in both variants (journal kept; journal deleted). Steps: <br>1. Interrupt ingestion before its run commit. <br>2. Remove generated state. <br>3. `rebuild`. <br>4. `discover` and `read`: no run file is a candidate; read returns `unpublished` (journal kept) or `unverified` with `suspected_ingestion` (journal deleted). <br>5. `audit --apply`: no run file is corrected or committed; a normal human note created alongside is adopted automatically (journal kept) or via explicit `--adopt` (journal deleted). <br>6. `rebuild` again and retry ingestion: one document, one ingest commit, raw deleted once; `abandon` instead removes only byte-identical leftovers | `kill` at `before_commit`; delete cache; delete journal; commit run files out of band with plain git |
+| S-H4 | Interrupted ingestion through reconciliation, in both variants (journal kept; journal deleted). Steps: <br>1. Interrupt ingestion before its run commit. <br>2. Remove generated state. <br>3. `rebuild`. <br>4. `discover` and `read`: no run file is a candidate; read returns `unpublished` (journal kept) or `unverified` with `suspected_ingestion` (journal deleted). <br>5. Journal deleted only: writes refuse `journal_missing`; `recover --start-journal` lists every unverified file, including the attachment. Both variants: `audit --apply` corrects and commits no run file; a normal human note created alongside is corrected and published by audit (journal kept) or published only via explicit `--adopt` (journal deleted); adopting the processed document alone is refused. <br>6. `rebuild` again and retry ingestion: one document, one ingest commit, raw deleted once; `abandon` instead removes only byte-identical leftovers | `kill` at `before_commit`; delete cache; delete journal; commit run files out of band with plain git (retry then publishes with roles declared) |
 | S-H2 | Ingestion recovery: kill before publish (nothing discoverable, rebuild agrees, read `unpublished`); kill after run commit before raw deletion; raw modified after proposal → `raw_changed`, not deleted; duplicate with a new retrieval date writes nothing; new version with supersession proposed, not applied; journal lost mid-run, restarted, then retry adopts identical files | `kill` at `before_commit`, `after_run_commit`; modify raw; delete the journal |
 | S-I | Review and maintenance: automatic update under a valid grant; stop after an out-of-band edit; one approved update does not restore automatic updates; explicit grant restores them; audit additions without review; open intent blocks writes; attachment replacement stops | out-of-band edit; open intent |
 | S-DEV | Development example: decision and evidence retrieved by a fresh process with evidence resolving; fresh Claude session answer cites the decision id and version | remove the decision's evidence target |
@@ -539,14 +541,14 @@ Responsibilities, when such an adapter exists:
 - **An event is a hint that storage changed at a path.** It does not say who changed it, whether a brain operation or an authorised ingestion caused it, or whether the content differs.
 - **The adapter only records changed paths and asks existing operations to reconcile them.** A path-scoped audit report is the intended call, and it would be added with the adapter. The adapter never writes notes, grants maintenance, adopts files or publishes anything.
 - **Code classifies.** Reconciliation compares current bytes with the journal's intents and run manifests, commit history and trailers, and the index. That is the same classification audit already performs.
-- **Duplicates, reordering and echoes are harmless by construction.** Reconciliation is a comparison, not an event replay. A repeated or reordered event, a rename-on-save sequence, the load-time `create` burst, and events caused by the brain's own writes (whose bytes match recorded intended hashes or commits) all converge on the same report and cause no writes, so there is no feedback loop.
+- **Duplicates, reordering and echoes are harmless by construction.** Reconciliation is a comparison, not an event replay. A repeated or reordered event, a rename-on-save sequence (whatever events an editor emits for it), the load-time `create` burst, and events caused by the brain's own writes (whose bytes match recorded intended hashes or commits) all converge on the same report and cause no writes, so there is no feedback loop.
 - **Missed events are covered by the headless path.** While the editor or adapter is inactive, correctness comes from discovery's quick check and a startup or on-demand audit. Events improve responsiveness; they are never the only source of correctness.
 - **No daemon, service or event framework** is designed now.
 
 **Documented now:** these responsibilities, and the guarantee that beta audit and reconciliation are editor-independent. **Deferred:** the adapter, a path-scoped report option, and any filesystem watcher.
 
 **Post-beta follow-up — storage-event reconciliation adapter.** Behaviour: a user running the adapter sees out-of-band changes reported soon after they happen, with results identical to an on-demand audit. Verification expectations:
-- Recorded event sequences are replayed against the command interface: duplicated, reordered, rename-on-save (create, modify, rename and delete of a temporary file), the load-time `create` burst, and echoes of brain writes. Each must produce the same report as a full audit, with no writes, commits, grants or publications.
+- Recorded event sequences are replayed against the command interface: duplicated, reordered, rename-on-save sequences as actually recorded from the editor, the load-time `create` burst, and echoes of brain writes. Each must produce the same report as a full audit, with no writes, commits, grants or publications.
 - Changes made while the adapter was inactive are found by startup reconciliation.
 - An event for a file in an interrupted run or a retained original never changes its status.
 - Removing the adapter changes responsiveness only, never outcomes.
@@ -559,7 +561,7 @@ Rationale needed to interpret a contract is written here or in an ADR. Earlier e
 
 ### Terms
 
-- **kb**: *knowledge base*. The `kb` property marks a managed document, and its value is the managed-document format version (`1` in this specification). It is not a content revision, freshness indicator or approval status.
+- **kb**: *knowledge base*. The `kb` property marks a managed document, and its value is the managed-document format version (`1` in this specification). It is not a formatter, content revision, freshness indicator or approval status.
 - **Operation journal**: the brain's local, ignored, non-rebuildable record of operations in flight (intents, run manifests, change records).
 - **Retained original**: the exact source bytes an ingestion kept alongside its processed document; evidence, never a note.
 - **Brain**: a user's own knowledge folder, created by setup from the starter; private by default.

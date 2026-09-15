@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: ab2ce435b845fe92b04cffd11445683441f124b79570ac06edb653db01362935
+Version: 81bee301b2e07639852942cfd1af1a6accda4bb346b8ed6cbc83df6076ec149a
 Publication: published — accepted by merge of #2
 Status: **Accepted specification; not implemented.** Nothing described here exists yet. Delivery stories are opened as issues referencing this version.
 
@@ -265,11 +265,13 @@ Optional: `fresh_until`, `first_seen`, `needs_review`, `supersedes`, `superseded
 | `summary` | at most 300 characters; empty means undescribed |
 | `origin` | list of `{ref, retrieved}` (`retrieved` a date, or empty meaning unknown), or `authored`, or `unknown` |
 | `evidence`, `derived_from`, `conflicts_with`, `supersedes` | lists of brain ids or external URLs |
+| `fresh_until`, `first_seen` | optional dates; null or empty means absent |
 
 Rules:
 - **Uncertainty values** are valid for any origin: empty `created`, empty `reviewed`, `kind: unknown`, `type: unclassified`, empty `summary`, `origin: unknown`, any empty `retrieved` (named as field `origin`), and any value a type definition declares under `uncertainty_values` (which may be empty). Date properties use empty rather than a word such as `unknown` because Obsidian assigns one type to a property name across the whole vault and documents dates as `YYYY-MM-DD`; how Obsidian displays an empty date is checked in S-G4(g).
 - `needs_review` must list exactly the fields holding uncertainty values, in any order. It is absent or `[]` when there are none.
 - An absent `fresh_until` means freshness is unknown, but it is not an uncertainty value for `needs_review`.
+- `fresh_until` and `first_seen` follow C4's date rule when a value is present. A null or empty value is read as absent, and neither absence nor an empty value is an uncertainty value for `needs_review`. A nonempty value that is not a valid date is `bad_format` on that field.
 - A `kind: unknown` document never counts as a source.
 - `evidence`, `derived_from`, `conflicts_with` and `supersedes` entries are each an id (C4 shape) or an `http`/`https` URL.
 - **Who may write `origin: unknown`.** Validation accepts the value; the writing operations enforce who may write it. Audit correction may write it. `persist` refuses it unless the request is a reviewed write (C14).
@@ -288,6 +290,7 @@ Type definitions:
 - A module is installed when `.brain/modules/<module>/module.json` exists and names its folder (`{"module": "projects", "folder": "projects"}`). Without that file, no module folder is scanned.
 - It skips `inbox/`, `raw/`, hidden folders and hidden files (names starting with `.`) and other files.
 - Symbolic links are not followed. Each is listed under `skipped` with reason `symlink`, so nothing is skipped silently.
+- A folder that cannot be listed, including a zone root, or a `.md` file that cannot be read is listed under `skipped` with reason `unreadable` and its path relative to the root; hidden paths, `inbox/`, `raw/` and symbolic links keep the rules above. It has no `documents` entry, no status and no version. Validation continues with every accessible path and still prints exactly one JSON object.
 
 **Output.**
 
@@ -296,7 +299,7 @@ Type definitions:
   "outcome": "valid | invalid",
   "counts": {"valid": 0, "invalid": 0, "unmanaged": 0, "unsupported_version": 0, "retained": 0},
   "definitions": [{"path": "…", "code": "malformed_definition | invalid_definition | name_mismatch | shadows_type", "message": "…"}],
-  "skipped": [{"path": "…", "reason": "symlink"}],
+  "skipped": [{"path": "…", "reason": "symlink | unreadable"}],
   "documents": [
     {"path": "documents/x/x.md", "status": "valid | invalid | unmanaged | unsupported_version | retained",
      "frontmatter": "none | supported | unsupported_for_editing | malformed",
@@ -339,7 +342,7 @@ Type definitions:
 **Retained files.** Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. Role identity needs publication records from git history. Validate reads them only when the root is a git repository, runs git read-only, and treats a brain without git as having no retained files. A retained file whose bytes no longer match its recorded hash carries `retained_changed`; a retained path whose file is gone is still listed, with `retained_missing`.
 
 **Result.**
-- `outcome` is `invalid` when any document is `invalid`, any retained entry carries an error, or any definition error exists. An empty brain is `valid`.
+- `outcome` is `invalid` when any document is `invalid`, any retained entry carries an error, any definition error exists, or any `skipped` entry has reason `unreadable`. An empty brain is `valid`.
 - Exit code: `0` for `valid`, `3` for `invalid`. A refused request — a missing, nonexistent or non-directory `--root`, or an unknown subcommand — exits `2` and still prints one JSON object with `outcome: "refused"` and a `reason`.
 - Validation never writes to the brain, including caches or bytecode.
 

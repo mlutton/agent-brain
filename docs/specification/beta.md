@@ -1,8 +1,8 @@
 # agent-brain beta specification
 
 Version: 831ae9c82b4ed02a5b6efc8cfbe3607d49dd052ebd050abf29c799155dda1d28
-Publication: published — draft pull request for review; proposed, not accepted
-Status: **Proposed.** The beta is being specified, not implemented. Nothing described here exists yet.
+Publication: published — accepted by merge of #2
+Status: **Accepted specification; not implemented.** Nothing described here exists yet. Delivery stories are opened as issues referencing this version.
 
 This document is the shared contract for the agent-brain beta. Delivery stories reference it by the version above (a SHA-256 over this document from the first `##` heading to the end) and by part — for example "Behaviour 12–15" or "Decision C5" — rather than restating it. Repository topology is recorded separately in [ADR 0001](../adr/0001-repository-topology.md).
 

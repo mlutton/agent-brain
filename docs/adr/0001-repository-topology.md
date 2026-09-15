@@ -1,6 +1,6 @@
 # ADR 0001: The starter repository and each brain are separate
 
-Status: Proposed (under review with the beta specification)
+Status: Accepted (merged with the beta specification in #2)
 Date: 2026-09-14
 
 ## Context

@@ -4,12 +4,12 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 
 ## Current status
 
-**Being specified, not implemented.** This repository contains no working code yet. The beta's behaviour is proposed in the specification below and is under review; nothing described there should be assumed to work today.
+**Specified, not implemented.** This repository contains no working code yet. The beta's behaviour is defined by the accepted specification below; nothing described there should be assumed to work today.
 
 | Capability | State |
 | --- | --- |
-| Beta specification | Proposed, under review |
-| Repository topology decision | Proposed, under review |
+| Beta specification | Accepted |
+| Repository topology decision | Accepted |
 | Setup, validation, persistence, discovery, read, audit, ingestion, projects module, Claude skills | Not started |
 | Codex entry path | Not started; optional for the beta, claimed only once demonstrated |
 

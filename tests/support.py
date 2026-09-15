@@ -55,6 +55,8 @@ def hash_tree(root):
 
 
 def list_paths(root):
+    """Every file and directory under root, so a validate run that creates or
+    removes an empty directory is caught even though it holds no file to hash."""
     paths = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         for f in filenames:
@@ -62,8 +64,8 @@ def list_paths(root):
             paths.append(os.path.relpath(full, root).replace(os.sep, "/"))
         for d in dirnames:
             full = os.path.join(dirpath, d)
-            if os.path.islink(full):
-                paths.append(os.path.relpath(full, root).replace(os.sep, "/") + "/")
+            rel = os.path.relpath(full, root).replace(os.sep, "/") + "/"
+            paths.append(rel + " (symlink)" if os.path.islink(full) else rel)
     return sorted(paths)
 
 

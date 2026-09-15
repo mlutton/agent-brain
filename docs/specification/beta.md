@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 21b99f2733ccb8bfb871c1cdd4b7409bfe3ea504b8db61f6f6d5fa0fd39ed94a
+Version: 9a9d7ed46d2914cb16ad85b0a7e170c785b9b6c43885a22eacd7baee7345bb81
 Publication: published — draft pull request for review; proposed, not accepted
 Status: **Proposed.** The beta is being specified, not implemented. Nothing described here exists yet.
 
@@ -131,7 +131,7 @@ Actors: **user** (a person owning a brain), **agent** (an agent session at the b
 
 64. As a user, I want a document marked with an unsupported format version (for example `kb: 2`) reported as `unsupported_version` and left untouched, so that a newer or foreign format is never treated as an unmanaged note and rewritten.
 65. As a user, I want every document the brain writes to be ordinary YAML frontmatter that Obsidian shows with the intended property types, and my comments, ordering and untouched properties preserved when an operation updates a field, so that editing in Obsidian and working through agents do not fight each other.
-66. As a user, I want retained originals and attachments recognised as source evidence, never validated, indexed, discovered or corrected as notes, with their bytes and recorded hashes intact, so that the evidence behind a document cannot be silently altered.
+66. As a user, I want retained originals and attachments — whether they came from an ingestion or an explicit adoption — to stay recognised as source evidence even after they are edited or deleted, never validated, indexed, discovered, adopted or corrected as notes, reported as changed or missing, and restorable only by a reviewed step from their recorded bytes, so that the evidence behind a document cannot be silently altered or lost.
 67. As a user, I want files from an interrupted ingestion to stay unpublished through rebuild, discovery, read and audit, even after local operation records are lost, so that recreating an index or making an audit commit never publishes half a run.
 68. As a user, I want an explicit way to adopt my own new notes, retry an interrupted ingestion, or abandon its leftovers when the brain cannot tell them apart, so that uncertainty is resolved by a recorded decision rather than a guess.
 
@@ -288,7 +288,7 @@ Type definitions:
 
 - `documents` lists every scanned file, sorted by path (POSIX, relative to the root).
 - An error's `field` is null only for `malformed` and `unsupported_frontmatter`.
-- Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. A retained file whose bytes no longer match its recorded hash carries `retained_changed`, which makes the outcome `invalid`.
+- Retained originals and attachments (C13a) are listed with status `retained` and are never validated as notes. A retained file whose bytes no longer match its recorded hash carries `retained_changed`; a retained path whose file is gone is still listed, with `retained_missing`. Either makes the outcome `invalid`. A retained file keeps status `retained` whatever its current bytes.
 - A document reports every error it has, not just the first.
 - `outcome` is `invalid` when any document is invalid or any definition error exists. An empty brain is `valid`.
 - Exit code: `0` for `valid`, `3` for `invalid`, `2` for a refused request (for example a missing or nonexistent `--root`).
@@ -296,7 +296,7 @@ Type definitions:
 
 ### C6. Single-file persist
 
-Request: `{operation: create|update|attach, path, frontmatter?, body?, content_base64?, for_document?, expected_version?, run_id?, replace_frontmatter?}`. `create` writes the canonical form. `update` applies targeted property replacement (C4). Writes to `unsupported_version` documents and unsupported-for-editing blocks are refused. Writes to `retained` files are refused, with one exception: `brain recover --restore-retained <path>`, a reviewed write that restores the bytes recorded by the ingest commit and resolves `retained_changed` or `retained_missing`. Accepting changed source bytes is never an in-place write; the changed content is ingested as a new version (C13). Sequence:
+Request: `{operation: create|update|attach, path, frontmatter?, body?, content_base64?, for_document?, expected_version?, run_id?, replace_frontmatter?}`. `create` writes the canonical form. `update` applies targeted property replacement (C4). Writes to `unsupported_version` documents and unsupported-for-editing blocks are refused. Writes to `retained` files are refused, with one exception: `brain recover --restore-retained <path>`, a reviewed write that restores the bytes recorded by the file's publication record (C13a) — an ingest or adopt commit — and resolves `retained_changed` or `retained_missing`. Accepting changed source bytes is never an in-place write; the changed content is ingested as a new version (C13). Sequence:
 
 1. Validate the request and the resulting document against C5 and its type.
 2. Record an intent in the journal (`.brain/journal/intents/`): `run_id`, `op_key`, `path`, `expected_prior` (`absent` or a hash), `intended_sha256`, temp path, backup path.
@@ -327,10 +327,10 @@ Fault injection for tests: when `BRAIN_TEST_FAULTS=1`, the environment variable 
 Every brain commit message ends with a single final paragraph of trailers (git ignores trailer lines placed in any earlier paragraph):
 
 ```
-Brain-Op: create | update | attach | ingest | delete-raw | audit | adopt | journal-reset | resolve | grant | setup
+Brain-Op: create | update | attach | ingest | delete-raw | audit | adopt | restore | journal-reset | resolve | grant | setup
 Brain-Run: <run_id>
 Brain-Key: <op_key>                      (one per applied write)
-Brain-Path: <path> sha256=<hash> prior=<absent|hash|deleted> [role=document|original|attachment]   (one per path; role on ingest)
+Brain-Path: <path> sha256=<hash> prior=<absent|hash|deleted> [role=document|original|attachment]   (one per path; role on ingest and adopt)
 Brain-Grant: <id> maintenance=agent by=<agent|human>            (create and grant only)
 Brain-Review: approved|adopted|abandoned by=human                (reviewed writes and explicit resolutions)
 Brain-Unverified: <path> sha256=<hash>                            (journal-reset only)
@@ -345,7 +345,7 @@ A trailer is **consistent** when every data-zone path the commit changes is decl
 - **Publication rule** (git brains). discover, read, rebuild, validate's `retained` status and audit all apply the same rule. The first matching rule wins.
 
   1. **`unpublished`.** An open intent or open run manifest in the journal names the file. This holds even when someone has committed the file out of band; audit then reports `run_file_committed_out_of_band`. The file is excluded from candidates, `read` returns `unpublished` without content, and it counts as `interrupted` coverage.
-  2. **Retained original or attachment** (C13a). The file is never a candidate and never a note.
+  2. **Retained original or attachment** (C13a) — decided by its recorded role, whatever its current bytes, presence or later commits. The file is never a candidate and never a note.
   3. **Unresolved `Brain-Unverified` entry.** A file whose path is listed by a `journal-reset` commit and not yet resolved by a later ingest, adopt or resolve commit is `unverified`.
   4. **Processed `document`.** Published only when its current path and bytes descend from a consistent `Brain-Op: ingest` commit that declared it `role=document`, or from an explicit `Brain-Op: adopt` commit, with later changes only through brain writes or audit-labelled edits. Otherwise it is **`unverified`** (`no_ingest_record`), even if a generic out-of-band or audit commit contains it.
   5. **Files of an unverified document.** A file referenced through `original` or `attachments` by a `document` that rule 4 makes `unverified` is itself `unverified` with a `suspected_ingestion` hint, even when it is committed. It is included in the journal-reset listing and is never corrected or committed by audit.
@@ -372,7 +372,7 @@ Request: `{query, module?, type?, zone?, limit (default 10), as_of, max_bytes}`.
 3. Labels per candidate: `freshness` (`fresh` when `as_of` ≤ `fresh_until`, `stale` when after, `unknown` when absent), `status`, `superseded_by`, `newer_version_available`, `summary_may_be_outdated`, `changed_out_of_band`, `needs_review`, `conflicts_with`, and the `support` summary (C11).
 4. `summary_may_be_outdated` is derived from history: the body changed through an out-of-band or unattributed change after the last brain write that set the summary. It is never written into the note.
 
-Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage: {indexed, undescribed, invalid, unsupported_version, interrupted, unverified, changed_out_of_band}, index: present|missing|stale, journal: present|missing, truncated, omitted_count}`. Retained originals and attachments never appear in `candidates` or `body_matches`.
+Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage: {indexed, undescribed, invalid, unsupported_version, interrupted, unverified, changed_out_of_band, retained_changed, retained_missing}, index: present|missing|stale, journal: present|missing, truncated, omitted_count}`. Retained originals and attachments never appear in `candidates` or `body_matches`.
 
 - `partial` when any coverage count other than `indexed` and `undescribed` is non-zero, or the index is missing or stale, or the journal is missing.
 - `no_match` only when there are no candidates and no body matches and coverage is complete.
@@ -399,8 +399,8 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
   - An existing key holding an invalid base-field value → `correction_blocked`, file unchanged. Malformed files → `invalid`, unchanged.
   - `managed_missing`: update the index (follow rename or mark removed); never write files.
   - Commit corrected and unattributed files with `Brain-Op: audit`, which becomes the new position.
-  - **Never corrected or committed by an audit commit:** `unpublished` and `run_file` files; retained originals and attachments; `unsupported_version` documents; processed `document`s without an ingest record; any `unverified` file or unresolved `Brain-Unverified` path; and any file with a `suspected_ingestion` hint. Audit commits unattributed files only while the journal is present. `retained_changed` and `retained_missing` are reported for review. Restoring a retained file is the reviewed `recover --restore-retained` (C6), which counts as an overwrite (C14); changed source content is ingested as a new version (C13).
-- **Explicit adoption** (`brain audit --apply --adopt <path>…`): a human-confirmed resolution for `unverified` files the user identifies as their own notes, including files with a `suspected_ingestion` hint, which the report shows before confirmation. It applies the additive correction where needed, commits with `Brain-Op: adopt` and `Brain-Review: adopted by=human`, and publishes the files. Adopting a `document` is refused unless its `original` and every `attachments` path are adopted in the same commit, declared with their roles; an adopted document is published as a document, not as an ingestion.
+  - **Never corrected or committed by an audit commit:** `unpublished` and `run_file` files; retained originals and attachments, including `retained_changed` and `retained_missing` ones and moved copies; `unsupported_version` documents; processed `document`s without an ingest record; any `unverified` file or unresolved `Brain-Unverified` path; and any file with a `suspected_ingestion` hint. Audit commits unattributed files only while the journal is present. `retained_changed` and `retained_missing` are reported for review. Restoring a retained file is the reviewed `recover --restore-retained` (C6), which counts as an overwrite (C14); changed source content is ingested as a new version (C13).
+- **Explicit adoption** (`brain audit --apply --adopt <path>…`): a human-confirmed resolution for `unverified` files the user identifies as their own notes, including files with a `suspected_ingestion` hint, which the report shows before confirmation. It applies the additive correction where needed, commits with `Brain-Op: adopt` and `Brain-Review: adopted by=human`, and publishes the files. Adopting a `document` is refused unless its `original` and every `attachments` path are adopted in the same commit, declared with `role=document`, `role=original` and `role=attachment`. The original and attachments are committed byte-for-byte, never corrected, and that commit is their publication record (C13a). An adopted document is published as a document, not as an ingestion.
 - Audit never rewrites `authored_by` or any existing value, never writes because an event or hint was received, and makes no model call.
 
 ### C13. Ingestion runs
@@ -420,18 +420,42 @@ Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outc
 
 ### C13a. Retained originals and attachments
 
-- **Role evidence.** A file's role as a retained original or attachment is established by durable evidence, checked in this order:
-  1. It was committed in the same ingest or adopt commit that published a `document` referencing it through `original` or `attachments`, and its current bytes match the hash that commit recorded.
-  2. A consistent `Brain-Op: ingest` commit declared it with `role=original` or `role=attachment`.
-  3. An open run manifest in the journal names it.
+**Role identity and current integrity are separate.** Role identity says what a path is. Integrity says whether its current bytes still match what was recorded. Integrity never changes identity.
 
-  Evidence 1 and 2 are in git and survive loss of the cache and the journal. A folder name alone never establishes a role, and an ordinary user note is never reclassified because of where it sits.
-- **A retained file with role evidence:**
-  - is listed as `retained` by validate;
-  - is never parsed as frontmatter, validated, indexed as a candidate, matched on body text or corrected;
-  - is readable as evidence (C10);
-  - has its bytes compared with the hash recorded by its ingest or adopt commit. A mismatch is `retained_changed`, a missing file is `retained_missing`, and both are reported and never repaired automatically. The reviewed resolution is `recover --restore-retained` (C6). A path whose role evidence exists only through a later reference, for example a note an editor linked as `original`, does not become retained.
-- **A Markdown original without role evidence** — for example left by an interrupted run after journal loss — is `unverified` with a `suspected_ingestion` hint when C8's signals apply. It is resolved by retry, adoption or abandonment, never by audit's automatic correction.
+**Publication record.** A path's publication record is the latest consistent `Brain-Op: ingest` or `Brain-Op: adopt` commit that declares it with `Brain-Path: <path> sha256=<hash> … role=original` or `role=attachment`, in the same commit as the `role=document` path that references it through `original` or `attachments`. Consistency is judged against that commit's own content (C7), never against the file as it is now. The record fixes the role and the **recorded bytes**: the blob committed at that path in that commit, whose SHA-256 is the declared hash.
+
+**Role identity** is established by, in order:
+1. a publication record (durable in git; survives loss of the cache and the journal);
+2. an open run manifest in the journal (in-flight only; the role becomes durable only through the run's ingest commit).
+
+A folder name alone never establishes a role. A later reference, for example a note an editor links as `original`, never makes a path retained. A recorded role is never ended by an external edit, a deletion, a move, or an out-of-band commit of different bytes. Only a later reviewed brain commit for that path — `restore`, or a `resolve` the user confirms — records a new state for it.
+
+**Integrity**, checked against the recorded bytes:
+
+| Status | Condition |
+| --- | --- |
+| `retained` | the file exists and matches the recorded hash |
+| `retained_changed` | the file exists with different bytes, whether uncommitted or committed out of band |
+| `retained_missing` | the file is gone |
+
+A file whose bytes equal a `retained_missing` path's recorded hash at another, unrecorded path is `unverified` with a `retained_moved` hint. It is never an ordinary note.
+
+**Treatment of every path with role identity, whatever its integrity:**
+- validate lists it as `retained`, with `retained_changed` or `retained_missing` where applicable;
+- it is never parsed as frontmatter, validated as a note, indexed as a candidate, matched on body text, adopted as a note, corrected, or included in an audit commit;
+- discover counts `retained_changed` and `retained_missing` in coverage, which makes the result `partial`;
+- it is readable as evidence (C10), with the current bytes labelled by integrity, and the recorded hash and publication commit named;
+- nothing repairs it automatically.
+
+**Reviewed restoration** (`brain recover --restore-retained <path>`, C6):
+- Reads the recorded blob from the publication commit, whether ingest or adopt, and verifies its SHA-256 against the declared hash.
+- Writes it through C6: `update` over changed bytes, or hard-link `create` for a missing file.
+- Commits `Brain-Op: restore` with `Brain-Path: <path> sha256=<recorded hash> prior=<current hash|absent> role=<role>` and `Brain-Review: approved by=human`.
+- Leaves the publication record unchanged.
+- Refuses with `record_unavailable` when the publication commit's objects are missing (for example in a shallow clone).
+- Accepting changed source bytes is never a restoration; the content is ingested as a new version (C13).
+
+**A Markdown original without role identity** — for example left by an interrupted run after journal loss — is `unverified` with a `suspected_ingestion` hint when C8's signals apply. It is resolved by retry, adoption or abandonment, never by audit's automatic correction.
 
 ### C14. Review, authorship and maintenance grants
 
@@ -501,7 +525,7 @@ Scenarios run against a brain created by `setup` from a pinned commit and popula
 | S-G3 | Metadata correction and preservation: appended properties only; original lines, comments and order byte-identical; `correction_blocked` on invalid existing value and on JSON-style or anchored frontmatter; malformed untouched; ingested document with known origin and empty `created` validates | invalid existing value |
 | S-G4 | Obsidian-compatible frontmatter: <br>(a) fixtures — a title containing `: ` (quoted), a value containing ` #` (quoted) and `#` without a space, quoted strings, a comment line, block and empty lists, dates, empty values, an unquoted `yes` and an unquoted `[[Link]]` (`ambiguous_scalar`); <br>(b) every document created by persist re-parses to its intended values under YAML 1.1 and 1.2; <br>(c) a targeted update of one property preserves comments (including a comment line between properties), order and all other property bytes; <br>(d) an editor-style rewrite (JSON-style block re-saved as YAML, quoting changed) stays valid and is reported out of band; <br>(e) `kb: 2` is `unsupported_version`, not corrected, not written, not a candidate; <br>(f) duplicate property names are `malformed`; <br>(g) manual, recorded check in Obsidian during acceptance: representative generated documents (text, list, date, empty date, `[]`) open without property type warnings, and a property edited in Obsidian stays valid | unquote a colon-space title; strip a comment during update; treat `kb: 2` as unmanaged; drop duplicate-key detection |
 | S-H | Ingestion and projects module: raw article ingested with original kept and origin recorded; raw removed after commit; a new custom type added by file validates and is discoverable with display fields; unresolved field stops for review | missing required type field |
-| S-H3 | Retained originals: ingest one Markdown source without frontmatter and one with its own frontmatter (including a `kb` property); run `validate`, `rebuild`, `discover`, `audit` and `audit --apply`; only the processed documents are candidates; originals are `retained`, never corrected, and still match `original_sha256`; modifying an original yields `retained_changed` and no repair; deleting the index and journal leaves roles recognised from committed evidence | add frontmatter to an original; delete the cache and journal; rename an ordinary note into an `original/` folder (stays a note) |
+| S-H3 | Retained originals: ingest one Markdown source without frontmatter and one with its own frontmatter (including a `kb` property); run `validate`, `rebuild`, `discover`, `audit` and `audit --apply`; only the processed documents are candidates; originals are `retained`, never corrected, and still match `original_sha256`; modifying an original yields `retained_changed` and no repair; deleting the index and journal leaves roles recognised from committed evidence. <br>**Adoption and integrity:** explicitly adopt a document with its Markdown original and an attachment. The adopt commit declares roles and commits the original byte-for-byte. Then: <br>(a) modify the adopted original externally, and commit it out of band; <br>(b) delete the adopted attachment; <br>(c) delete the cache and journal and `rebuild`. Before and after (c): validate, rebuild, discover, read and audit agree that the original is `retained_changed` and the attachment `retained_missing`. Neither is a candidate, an ordinary note, corrected, adopted as a note, or in an audit commit, and discover is `partial`. <br>(d) A copy of the deleted attachment at another path is `unverified` with `retained_moved`. <br>(e) Reviewed `recover --restore-retained` on both, including after (c), restores the bytes recorded by the adopt commit, commits `Brain-Op: restore`, and returns both to `retained`. The same holds for an ingested original. | add frontmatter to an original; delete the cache and journal; rename an ordinary note into an `original/` folder (stays a note); let role evidence depend on current bytes (the changed original must not become a note); drop `adopt` from the role check (the adopted attachment must not lose its role); restore from the current file instead of the recorded blob |
 | S-H4 | Interrupted ingestion through reconciliation, in both variants (journal kept; journal deleted). Steps: <br>1. Interrupt ingestion before its run commit. <br>2. Remove generated state. <br>3. `rebuild`. <br>4. `discover` and `read`: no run file is a candidate; read returns `unpublished` (journal kept) or `unverified` with `suspected_ingestion` (journal deleted). <br>5. Journal deleted only: writes refuse `journal_missing`; `recover --start-journal` lists every unverified file, including the attachment. Both variants: `audit --apply` corrects and commits no run file; a normal human note created alongside is corrected and published by audit (journal kept) or published only via explicit `--adopt` (journal deleted); adopting the processed document alone is refused. <br>6. `rebuild` again and retry ingestion: one document, one ingest commit, raw deleted once; `abandon` instead removes only byte-identical leftovers | `kill` at `before_commit`; delete cache; delete journal; commit run files out of band with plain git (retry then publishes with roles declared) |
 | S-H2 | Ingestion recovery: kill before publish (nothing discoverable, rebuild agrees, read `unpublished`); kill after run commit before raw deletion; raw modified after proposal → `raw_changed`, not deleted; duplicate with a new retrieval date writes nothing; new version with supersession proposed, not applied; journal lost mid-run, restarted, then retry adopts identical files | `kill` at `before_commit`, `after_run_commit`; modify raw; delete the journal |
 | S-I | Review and maintenance: automatic update under a valid grant; stop after an out-of-band edit; one approved update does not restore automatic updates; explicit grant restores them; audit additions without review; open intent blocks writes; attachment replacement stops | out-of-band edit; open intent |

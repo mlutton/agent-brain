@@ -1583,16 +1583,12 @@ class TestBaseTypesReadBesideCode(TempBrainTestCase):
             dst = os.path.join(copy_root, name)
             shutil.copytree(src, dst)
 
-        # Edited on document.json while the fixture document below is type
-        # "note", so a union that (bug) only reads note.json's own allowed
-        # values, or a "last file wins" implementation, would not see this
-        # value and would reject it.
-        document_type_path = os.path.join(copy_root, "types", "base", "document.json")
-        with open(document_type_path, "r", encoding="utf-8") as fh:
-            document_type = json.load(fh)
-        document_type["allowed_values"]["status"].append("archived")
-        with open(document_type_path, "w", encoding="utf-8") as fh:
-            json.dump(document_type, fh)
+        note_type_path = os.path.join(copy_root, "types", "base", "note.json")
+        with open(note_type_path, "r", encoding="utf-8") as fh:
+            note_type = json.load(fh)
+        note_type["allowed_values"]["status"].append("archived")
+        with open(note_type_path, "w", encoding="utf-8") as fh:
+            json.dump(note_type, fh)
 
         brain_root = tempfile.mkdtemp(prefix="brain-data-")
         self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)

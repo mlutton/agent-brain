@@ -55,7 +55,7 @@ class TempBrainTestCase(unittest.TestCase):
     def write(self, rel_path, content, **kwargs):
         return support.write_file(self.tmpdir, rel_path, content, **kwargs)
 
-    def validate(self, expect_paths, restrict=None, restore=None):
+    def validate(self, expect_paths, restrict=None, restore=None, prove_denial=None):
         """Runs `brain validate`, asserting the rules every call site needs: the
         brain's files, directories and hashes are unchanged, stdout is one JSON
         object, and the report's document paths are exactly expect_paths."""
@@ -65,13 +65,24 @@ class TempBrainTestCase(unittest.TestCase):
         if restrict is not None:
             self.addCleanup(restore)
             restricted = restrict()
-            for path, _mode in restricted:
-                if os.path.isdir(path):
-                    with self.assertRaises(PermissionError):
-                        os.listdir(path)
+            if prove_denial is not None:
+                try:
+                    prove_denial()
+                except PermissionError:
+                    pass
                 else:
-                    with self.assertRaises(PermissionError):
-                        open(path, "rb").close()
+                    self.skipTest("permission restriction did not deny the required access")
+            else:
+                for path, _mode in restricted:
+                    try:
+                        if os.path.isdir(path):
+                            os.listdir(path)
+                        else:
+                            with open(path, "rb"):
+                                pass
+                    except PermissionError:
+                        continue
+                    self.skipTest(f"permission restriction did not deny access to {path}")
         proc = support.run_brain(["validate", "--root", self.tmpdir])
         report = support.parse_single_json(proc.stdout)
         restricted_modes = [(path, os.stat(path).st_mode) for path, _mode in restricted]
@@ -2761,6 +2772,67 @@ class TestUnreadablePaths(TempBrainTestCase):
         )
         self._assert_counts(report)
 
+    def test_permission_fixture_controls_are_valid_when_accessible(self):
+        self.write("documents/visible.md", note_doc())
+        self.write("documents/locked/bad.md", note_doc())
+        self.write("documents/locked.md", note_doc())
+        self.write("wiki/page.md", note_doc())
+        _proc, report = self.validate(
+            {"documents/visible.md", "documents/locked/bad.md", "documents/locked.md", "wiki/page.md"}
+        )
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(report["skipped"], [])
+        self._assert_counts(report)
+
+    def test_listable_unsearchable_folder_reports_entries_by_rule(self):
+        self.write("documents/ok.md", note_doc())
+        folder = os.path.join(self.tmpdir, "documents", "ro")
+        x_md = self.write("documents/ro/x.md", note_doc())
+        sub = self.write("documents/ro/sub/y.md", note_doc())
+        self.write("documents/ro/n.txt", "text\n")
+        self.write("documents/ro/.h.md", note_doc())
+        os.symlink(x_md, os.path.join(folder, "link.md"))
+        original = [(folder, os.stat(folder).st_mode)]
+
+        def restrict():
+            os.chmod(folder, 0o644)
+            return [(folder, os.stat(folder).st_mode)]
+
+        def restore():
+            os.chmod(folder, original[0][1])
+
+        # Listing the parent is permitted, but traversing an entry is not.
+        restrict()
+        self.addCleanup(restore)
+        try:
+            names = os.listdir(folder)
+            with self.assertRaises(PermissionError):
+                open(x_md, "rb").close()
+            with self.assertRaises(PermissionError):
+                os.listdir(os.path.dirname(sub))
+        except PermissionError:
+            self.skipTest("0o644 does not provide the required listable-but-unsearchable condition")
+        self.assertEqual(set(names), {"x.md", "sub", "link.md", "n.txt", ".h.md"})
+        restore()
+
+        def prove_denial():
+            os.listdir(folder)
+            with open(x_md, "rb"):
+                pass
+
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore, prove_denial)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(
+            report["skipped"],
+            [
+                {"path": "documents/ro/link.md", "reason": "symlink"},
+                {"path": "documents/ro/sub", "reason": "unreadable"},
+                {"path": "documents/ro/x.md", "reason": "unreadable"},
+            ],
+        )
+        self._assert_counts(report)
+
 
 class TestOptionalDates(TempBrainTestCase):
     def test_invalid_optional_dates(self):
@@ -2821,6 +2893,14 @@ class TestCustomAllowedValuesShape(TempBrainTestCase):
         self.assertEqual(report["definitions"], [])
         support.assert_errors(self, support.doc_by_path(report, "documents/thai.md"), [])
         support.assert_errors(self, support.doc_by_path(report, "documents/martian.md"), [("cuisine", "not_allowed")])
+
+    def test_failed_note_definition_leaves_the_base_type_in_force(self):
+        self.write(".brain/types/custom/note.json", self._definition([1], name="note"))
+        self.write("documents/note.md", note_doc())
+        _proc, report = self.validate({"documents/note.md"})
+        self.assertEqual(len(report["definitions"]), 1)
+        self.assertEqual(report["definitions"][0]["code"], "invalid_definition")
+        support.assert_errors(self, support.doc_by_path(report, "documents/note.md"), [])
 
 
 

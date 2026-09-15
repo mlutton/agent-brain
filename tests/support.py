@@ -69,7 +69,7 @@ def list_paths(root):
     return sorted(paths)
 
 
-_EXCLUDED_DIR_NAMES = {".venv", ".git", ".dispatch"}
+_EXCLUDED_DIR_NAMES = {".venv", ".git"}
 
 
 def find_bytecode(root):

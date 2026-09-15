@@ -150,24 +150,15 @@ class TestScanScopeAndOrder(TempBrainTestCase):
         paths = [d["path"] for d in report["documents"]]
         self.assertEqual(paths, sorted(paths))
 
-        expected_absent = {
-            "inbox/skip.md",
-            "raw/skip.md",
-            ".hidden/skip.md",
-            "documents/.hidden.md",
-            "documents/UPPER.MD",
-            "documents/note.txt",
-            "root.md",
-        }
-        self.assertFalse(expected_absent & set(paths))
-
+        # expect_paths in self.validate() above already pins the exact
+        # document-path set, so inbox/, raw/, hidden entries, root.md,
+        # documents/note.txt, documents/UPPER.MD and the symlinks are proven
+        # absent by that equality, not by a further subset/intersection check.
         idx_ab_dash = paths.index("documents/a-b.md")
         idx_a_slash_b = paths.index("documents/a/b.md")
         self.assertLess(idx_ab_dash, idx_a_slash_b)
 
         self.assertEqual(report["skipped"], [{"path": "documents/a_link.md", "reason": "symlink"}])
-        self.assertNotIn("documents/a_link.md", paths)
-        self.assertNotIn("documents/.hidden_link.md", paths)
 
 
 class TestScanEdgeCases(TempBrainTestCase):
@@ -403,14 +394,40 @@ class TestMalformedConditions(TempBrainTestCase):
                 "documents/merge_merged_title.md",
             }
         )
-        for path in (
-            "documents/merge_top_level_override.md",
-            "documents/merge_nested_override.md",
-            "documents/merge_multi_shared_key.md",
-            "documents/merge_merged_title.md",
+        # None of these fixtures declare the field-contract fields (only kb
+        # plus merge scaffolding), so a non-malformed parse leaves exactly the
+        # required-field "missing" errors -- proving the merge itself never
+        # trips the malformed path. TestMergeAndUncertaintyRegressions below
+        # proves the actual override/preservation values with complete
+        # documents.
+        all_required_missing = [
+            (field, "missing")
+            for field in (
+                "id",
+                "type",
+                "title",
+                "summary",
+                "status",
+                "created",
+                "reviewed",
+                "origin",
+                "evidence",
+                "kind",
+                "authored_by",
+                "retention",
+            )
+        ]
+        # merge_merged_title.md merges "title" in from its source, so title
+        # is genuinely supplied and is not missing there.
+        title_supplied_missing = [pair for pair in all_required_missing if pair[0] != "title"]
+        for path, expected in (
+            ("documents/merge_top_level_override.md", all_required_missing),
+            ("documents/merge_nested_override.md", all_required_missing),
+            ("documents/merge_multi_shared_key.md", all_required_missing),
+            ("documents/merge_merged_title.md", title_supplied_missing),
         ):
             doc = support.doc_by_path(report, path)
-            self.assertNotIn((None, "malformed"), support.errors_multiset(doc), path)
+            support.assert_errors(self, doc, expected, path)
             self.assertNotEqual(doc["frontmatter"], "malformed", path)
 
     def test_invalid_utf8(self):
@@ -431,7 +448,27 @@ class TestMalformedConditions(TempBrainTestCase):
         _proc, report = self.validate(expect_paths={"documents/bomcrlf.md"})
         doc = support.doc_by_path(report, "documents/bomcrlf.md")
         self.assertNotEqual(doc["frontmatter"], "malformed")
-        self.assertIn(("id", "missing"), support.errors_multiset(doc))
+        support.assert_errors(
+            self,
+            doc,
+            [
+                (field, "missing")
+                for field in (
+                    "id",
+                    "type",
+                    "title",
+                    "summary",
+                    "status",
+                    "created",
+                    "reviewed",
+                    "origin",
+                    "evidence",
+                    "kind",
+                    "authored_by",
+                    "retention",
+                )
+            ],
+        )
 
     def test_unconstructible_tags_and_deep_nesting_are_malformed(self):
         self.write("documents/bad_timestamp.md", "---\nkb: 1\nx: !!timestamp nope\n---\nbody\n")
@@ -889,8 +926,9 @@ class TestFieldContractRejections(TempBrainTestCase):
         self.write("documents/bad_evidence.md", note_doc(evidence='["ftp://x", "[[Link]]", "0123456789012345678901234"]'))
         _proc, report = self.validate(expect_paths={"documents/bad_evidence.md"})
         doc = support.doc_by_path(report, "documents/bad_evidence.md")
-        codes = [e["code"] for e in doc["errors"] if e["field"] == "evidence"]
-        self.assertEqual(codes, ["bad_format", "bad_format", "bad_format"])
+        support.assert_errors(
+            self, doc, [("evidence", "bad_format"), ("evidence", "bad_format"), ("evidence", "bad_format")]
+        )
 
     def test_id_bad_format(self):
         self.write("documents/upper_id.md", note_doc(id='"01ARZ3NDEKTSV4RRFFQ69G5FAV"'))
@@ -1340,10 +1378,14 @@ class TestCustomTypesBothWays(TempBrainTestCase):
         doc = support.doc_by_path(report, "documents/recipe_no_def.md")
         support.assert_errors(self, doc, [("type", "unknown_type")])
 
-    def test_needs_review_not_checked_when_type_unresolved(self):
-        # When type does not resolve (unknown, or absent entirely), the type
-        # error is the only error reported -- needs_review is never checked
-        # against a field name that only a type definition could declare.
+    def test_unresolved_type_with_consistent_base_fields_reports_only_type_error(self):
+        # When type does not resolve (unknown, or absent entirely) and every
+        # base-uncertainty field is correctly disclosed, the type error is
+        # the only error reported: a needs_review entry naming a field only a
+        # type definition could declare (here, "cuisine") is not evaluated --
+        # neither required nor reported as extraneous.
+        # TestMergeAndUncertaintyRegressions.test_unresolved_type_needs_review
+        # covers the base-field mismatch cases this ruling also governs.
         unknown_fields = {
             "kb": "1",
             "id": '"01arz3ndektsv4rrffq69g5fav"',
@@ -1541,12 +1583,16 @@ class TestBaseTypesReadBesideCode(TempBrainTestCase):
             dst = os.path.join(copy_root, name)
             shutil.copytree(src, dst)
 
-        note_type_path = os.path.join(copy_root, "types", "base", "note.json")
-        with open(note_type_path, "r", encoding="utf-8") as fh:
-            note_type = json.load(fh)
-        note_type["allowed_values"]["status"].append("archived")
-        with open(note_type_path, "w", encoding="utf-8") as fh:
-            json.dump(note_type, fh)
+        # Edited on document.json while the fixture document below is type
+        # "note", so a union that (bug) only reads note.json's own allowed
+        # values, or a "last file wins" implementation, would not see this
+        # value and would reject it.
+        document_type_path = os.path.join(copy_root, "types", "base", "document.json")
+        with open(document_type_path, "r", encoding="utf-8") as fh:
+            document_type = json.load(fh)
+        document_type["allowed_values"]["status"].append("archived")
+        with open(document_type_path, "w", encoding="utf-8") as fh:
+            json.dump(document_type, fh)
 
         brain_root = tempfile.mkdtemp(prefix="brain-data-")
         self.addCleanup(shutil.rmtree, brain_root, ignore_errors=True)
@@ -1724,6 +1770,497 @@ class TestNoGitAndNoWrites(TempBrainTestCase):
 
         self.assertEqual(support.find_bytecode(self.tmpdir), [])
         self.assertEqual(support.find_bytecode(support.REPO_ROOT), [])
+
+
+class TestMergeAndUncertaintyRegressions(TempBrainTestCase):
+    """Merge-key and uncertainty-marker regression coverage: own-key-vs-
+    merged-key resolution is decided by position, not node identity;
+    duplicate keys inside an inline merge source are rejected exactly like
+    any other mapping's own duplicate keys; the null and "" uncertainty
+    markers behave identically; and needs_review evaluation of base fields
+    against an unresolved type follows the literal reading of C5a's "only
+    that error is reported for type-dependent rules"."""
+
+    _OTHER_VALID_FIELDS: ClassVar[list] = [
+        'id: "01arz3ndektsv4rrffq69g5fav"',
+        'type: "note"',
+        'summary: "S"',
+        'created: "2026-01-01"',
+        'reviewed: "2026-01-01"',
+        'origin: "authored"',
+        'evidence: []',
+        'kind: "source"',
+        'authored_by: "human"',
+        'retention: "durable"',
+    ]
+
+    def _doc(self, extra_lines, needs_review=()):
+        """A complete managed document: kb: 1, extra_lines (which must supply
+        title and status themselves, directly or via merge), and every other
+        required field holding an ordinary valid value."""
+        lines = ["---", "kb: 1"] + list(extra_lines) + list(self._OTHER_VALID_FIELDS)
+        if needs_review:
+            lines.append("needs_review:")
+            for item in needs_review:
+                lines.append(f'  - "{item}"')
+        lines.append("---")
+        return "\n".join(lines) + "\nbody\n"
+
+    def _assert_case(self, path, text, expected_errors):
+        self.write(path, text)
+        _proc, report = self.validate(expect_paths={path})
+        support.assert_errors(self, support.doc_by_path(report, path), expected_errors, path)
+
+    def _assert_cases(self, cases):
+        """Writes every (path, text, expected_errors) case, validates once
+        against the full set (so earlier cases in a multi-case test do not
+        leak into a later case's expect_paths), then checks each doc."""
+        for path, text, _expected in cases:
+            self.write(path, text)
+        _proc, report = self.validate(expect_paths={path for path, _text, _expected in cases})
+        for path, _text, expected in cases:
+            support.assert_errors(self, support.doc_by_path(report, path), expected, path)
+
+    # Explicit keys override merged keys, decided by position not node identity.
+
+    def test_explicit_key_overrides_merged_key_top_level(self):
+        self._assert_case(
+            "documents/r1_top_level_override.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    "defaults: &d",
+                    '  status: "bogus"',
+                    'status: "draft"',
+                    "<<: *d",
+                ]
+            ),
+            [],
+        )
+
+    def test_explicit_key_overrides_merged_key_top_level_reverse(self):
+        self._assert_case(
+            "documents/r1_top_level_override_reverse.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    "defaults: &d",
+                    '  status: "draft"',
+                    'status: "bogus"',
+                    "<<: *d",
+                ]
+            ),
+            [("status", "not_allowed")],
+        )
+
+    def test_explicit_key_overrides_merged_key_nested_chain_and_flow(self):
+        # Exercises a multi-level merge chain (top merges from wrapper, which
+        # itself merges from base) and a flow-style inline merge source
+        # ({c: 2, <<: *b}) nested under an unused key -- both must resolve
+        # without disturbing the top-level explicit override.
+        self._assert_case(
+            "documents/r1_nested_chain_and_flow.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    "base: &b",
+                    '  status: "bogus"',
+                    "wrapper: &w",
+                    "  <<: *b",
+                    "extra: {c: 2, <<: *b}",
+                    'status: "draft"',
+                    "<<: *w",
+                ]
+            ),
+            [],
+        )
+
+    def test_explicit_key_overrides_merged_key_aliased(self):
+        # The explicit key is a literal alias (*st) of the same scalar node
+        # used inside the merge source -- own-vs-merged is decided by the key
+        # pair's position in the mapping, never by node identity, so this is
+        # still a clean override, not a duplicate.
+        self._assert_case(
+            "documents/r1_aliased_override.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    '&st status: "draft"',
+                    'defaults: &d {*st : "bogus"}',
+                    "<<: *d",
+                ]
+            ),
+            [],
+        )
+
+    def test_explicit_key_overrides_merged_key_aliased_reverse(self):
+        self._assert_case(
+            "documents/r1_aliased_override_reverse.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    '&st status: "bogus"',
+                    'defaults: &d {*st : "draft"}',
+                    "<<: *d",
+                ]
+            ),
+            [("status", "not_allowed")],
+        )
+
+    # Duplicate keys inside a merge source are rejected wherever the
+    # source appears, including inline (never separately constructed).
+
+    def test_duplicate_keys_inside_inline_merge_source_top_level(self):
+        self._assert_case(
+            "documents/r2_inline_duplicate_top_level.md",
+            self._doc(['title: "T"', '<<: {status: "bogus", status: "draft"}']),
+            [(None, "malformed")],
+        )
+
+    def test_duplicate_keys_inside_inline_merge_source_sequence(self):
+        self._assert_case(
+            "documents/r2_inline_duplicate_sequence.md",
+            self._doc(['title: "T"', 'status: "draft"', "<<: [{c: 1, c: 2}]"]),
+            [(None, "malformed")],
+        )
+
+    def test_duplicate_keys_inside_inline_merge_source_nested_under_key(self):
+        self._assert_case(
+            "documents/r2_inline_duplicate_nested.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    'status: "draft"',
+                    "extra:",
+                    '  <<: {status: "bogus", status: "draft"}',
+                ]
+            ),
+            [(None, "malformed")],
+        )
+
+    def test_duplicate_keys_inside_anchored_merge_source(self):
+        self._assert_case(
+            "documents/r2_anchored_duplicate.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    'd: &d {status: "bogus", status: "draft"}',
+                    "<<: *d",
+                ]
+            ),
+            [(None, "malformed")],
+        )
+
+    def test_inline_merge_source_without_duplicates_is_not_malformed(self):
+        self._assert_case(
+            "documents/r2_control_no_duplicates.md",
+            self._doc(['title: "T"', '<<: {status: "draft"}']),
+            [],
+        )
+
+    def test_two_merge_sources_sharing_a_key_is_not_malformed(self):
+        self._assert_case(
+            "documents/r2_control_shared_key.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    'b1: &b1 {status: "bogus"}',
+                    'b2: &b2 {status: "draft"}',
+                    "<<: [*b1, *b2]",
+                ]
+            ),
+            [("status", "not_allowed")],
+        )
+
+    # Merged fields are preserved with their correct values when not
+    # explicitly overridden.
+
+    def test_merged_field_supplies_a_missing_field(self):
+        self._assert_case(
+            "documents/r3_merged_title_supplies_field.md",
+            self._doc(
+                [
+                    'status: "draft"',
+                    "defaults: &d",
+                    '  title: "Merged Title"',
+                    "<<: *d",
+                ]
+            ),
+            [],
+        )
+
+    def test_merged_field_not_overridden_keeps_its_value_not_allowed(self):
+        self._assert_case(
+            "documents/r3_merged_status_not_overridden.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    "defaults: &d",
+                    '  status: "bogus"',
+                    "<<: *d",
+                ]
+            ),
+            [("status", "not_allowed")],
+        )
+
+    def test_merged_field_not_overridden_keeps_its_value_ambiguous(self):
+        self._assert_case(
+            "documents/r3_merged_title_not_overridden.md",
+            self._doc(
+                [
+                    'status: "draft"',
+                    "defaults: &d",
+                    "  title: 12",
+                    "<<: *d",
+                ]
+            ),
+            [("title", "ambiguous_scalar")],
+        )
+
+    def test_multi_merge_shared_key_first_source_wins(self):
+        self._assert_case(
+            "documents/r3_multi_merge_first_wins.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    'b1: &b1 {status: "bogus"}',
+                    'b2: &b2 {status: "draft"}',
+                    "<<: [*b1, *b2]",
+                ]
+            ),
+            [("status", "not_allowed")],
+        )
+
+    def test_multi_merge_shared_key_first_source_wins_reversed(self):
+        self._assert_case(
+            "documents/r3_multi_merge_first_wins_reversed.md",
+            self._doc(
+                [
+                    'title: "T"',
+                    'b1: &b1 {status: "bogus"}',
+                    'b2: &b2 {status: "draft"}',
+                    "<<: [*b2, *b1]",
+                ]
+            ),
+            [],
+        )
+
+    # The null and "" uncertainty markers behave identically, for an
+    # optional and a required type-declared field.
+
+    WIDGET_OPTIONAL_DEF = json.dumps(
+        {
+            "type": "widget_optional",
+            "zones": ["*"],
+            "required": [],
+            "allowed_values": {},
+            "uncertainty_values": {"alpha": None, "beta": ""},
+            "display_fields": [],
+            "search_fields": [],
+        }
+    )
+    WIDGET_REQUIRED_DEF = json.dumps(
+        {
+            "type": "widget_required",
+            "zones": ["*"],
+            "required": ["alpha", "beta"],
+            "allowed_values": {},
+            "uncertainty_values": {"alpha": None, "beta": ""},
+            "display_fields": [],
+            "search_fields": [],
+        }
+    )
+
+    def _widget_doc(self, type_name, extra_lines, needs_review=()):
+        lines = ["---", "kb: 1", f'type: "{type_name}"', 'title: "T"', 'status: "draft"'] + list(extra_lines) + [
+            'id: "01arz3ndektsv4rrffq69g5fav"',
+            'summary: "S"',
+            'created: "2026-01-01"',
+            'reviewed: "2026-01-01"',
+            'origin: "authored"',
+            'evidence: []',
+            'kind: "source"',
+            'authored_by: "human"',
+            'retention: "durable"',
+        ]
+        if needs_review:
+            lines.append("needs_review:")
+            for item in needs_review:
+                lines.append(f'  - "{item}"')
+        lines.append("---")
+        return "\n".join(lines) + "\nbody\n"
+
+    def test_null_and_empty_string_markers_are_uncertain(self):
+        self.write(".brain/types/custom/widget_optional.json", self.WIDGET_OPTIONAL_DEF)
+        self.write(".brain/types/custom/widget_required.json", self.WIDGET_REQUIRED_DEF)
+
+        # present null/tilde/empty-string values are uncertain, whichever
+        # marker the field declares, for an optional and a required field.
+        present_uncertain_cases = [
+            ("r4_alpha_optional_null", "widget_optional", "alpha:"),
+            ("r4_alpha_optional_tilde", "widget_optional", "alpha: ~"),
+            ("r4_alpha_optional_empty_string", "widget_optional", 'alpha: ""'),
+            ("r4_beta_optional_null", "widget_optional", "beta:"),
+            ("r4_beta_optional_tilde", "widget_optional", "beta: ~"),
+            ("r4_beta_optional_empty_string", "widget_optional", 'beta: ""'),
+            ("r4_alpha_required_null", "widget_required", "alpha:"),
+            ("r4_alpha_required_empty_string", "widget_required", 'alpha: ""'),
+            ("r4_beta_required_null", "widget_required", "beta:"),
+            ("r4_beta_required_empty_string", "widget_required", 'beta: ""'),
+        ]
+        cases = []
+        for name, type_name, field_line in present_uncertain_cases:
+            field = field_line.split(":")[0]
+            other_field = "beta" if field == "alpha" else "alpha"
+            other_line = f'{other_field}: "known"'
+            cases.append(
+                (
+                    f"documents/{name}_listed.md",
+                    self._widget_doc(type_name, [field_line, other_line], needs_review=(field,)),
+                    [],
+                )
+            )
+            cases.append(
+                (
+                    f"documents/{name}_not_listed.md",
+                    self._widget_doc(type_name, [field_line, other_line]),
+                    [("needs_review", "needs_review_mismatch")],
+                )
+            )
+
+        # a non-empty value is not uncertain.
+        cases.append(
+            (
+                "documents/r4_alpha_non_empty_listed.md",
+                self._widget_doc("widget_optional", ['alpha: "known"', 'beta: "known"'], needs_review=("alpha",)),
+                [("needs_review", "needs_review_mismatch")],
+            )
+        )
+        cases.append(
+            (
+                "documents/r4_alpha_non_empty_not_listed.md",
+                self._widget_doc("widget_optional", ['alpha: "known"', 'beta: "known"']),
+                [],
+            )
+        )
+
+        # absent required -> missing; absent optional -> valid; absent but
+        # listed -> mismatch.
+        cases.append(
+            (
+                "documents/r4_required_absent.md",
+                self._widget_doc("widget_required", []),
+                [("alpha", "missing"), ("beta", "missing")],
+            )
+        )
+        cases.append(("documents/r4_optional_absent.md", self._widget_doc("widget_optional", []), []))
+        cases.append(
+            (
+                "documents/r4_optional_absent_but_listed.md",
+                self._widget_doc("widget_optional", [], needs_review=("alpha",)),
+                [("needs_review", "needs_review_mismatch")],
+            )
+        )
+
+        self._assert_cases(cases)
+
+    # Base-field needs_review rules apply even when the type is unresolved;
+    # entries naming a non-base field are not evaluated; at most one
+    # needs_review_mismatch is ever reported.
+
+    def _unresolved_type_doc(self, type_line, extra_lines, needs_review=()):
+        lines = ["---", "kb: 1"]
+        if type_line is not None:
+            lines.append(type_line)
+        lines += [
+            'id: "01arz3ndektsv4rrffq69g5fav"',
+            'title: "T"',
+            'status: "draft"',
+        ]
+        lines += extra_lines
+        if needs_review:
+            lines.append("needs_review:")
+            for item in needs_review:
+                lines.append(f'  - "{item}"')
+        lines.append("---")
+        return "\n".join(lines) + "\nbody\n"
+
+    def test_unresolved_type_needs_review(self):
+        base_valid = [
+            'summary: "S"',
+            'created: "2026-01-01"',
+            'reviewed: "2026-01-01"',
+            'origin: "authored"',
+            'evidence: []',
+            'kind: "source"',
+            'authored_by: "human"',
+            'retention: "durable"',
+        ]
+
+        self._assert_cases(
+            [
+                # unknown type, empty created not listed -> both the type
+                # error and the base-field mismatch are reported.
+                (
+                    "documents/r5_unknown_type_created_uncertain_not_listed.md",
+                    self._unresolved_type_doc(
+                        'type: "dish"',
+                        ['summary: "S"', "created:"] + base_valid[2:],
+                    ),
+                    [("type", "unknown_type"), ("needs_review", "needs_review_mismatch")],
+                ),
+                # unknown type, empty created correctly listed -> only the
+                # type error.
+                (
+                    "documents/r5_unknown_type_created_uncertain_listed.md",
+                    self._unresolved_type_doc(
+                        'type: "dish"',
+                        ['summary: "S"', "created:"] + base_valid[2:],
+                        needs_review=("created",),
+                    ),
+                    [("type", "unknown_type")],
+                ),
+                # unknown type, duplicate needs_review entries -> the shape
+                # rule fires independently of the type error, and only one
+                # needs_review error is ever reported alongside it.
+                (
+                    "documents/r5_unknown_type_duplicate_needs_review.md",
+                    self._unresolved_type_doc('type: "dish"', base_valid, needs_review=("created", "created")),
+                    [("type", "unknown_type"), ("needs_review", "bad_format")],
+                ),
+                # unknown type, only a custom field (cuisine) listed, no base
+                # uncertainty present -> the cuisine entry is not evaluated
+                # at all.
+                (
+                    "documents/r5_unknown_type_custom_field_only_listed.md",
+                    self._unresolved_type_doc('type: "dish"', base_valid, needs_review=("cuisine",)),
+                    [("type", "unknown_type")],
+                ),
+                # unknown type, kind listed but kind holds a non-uncertainty
+                # value ("source") -> an entry naming a base field that is
+                # not actually uncertain is a mismatch, exactly like the
+                # resolved-type rule.
+                (
+                    "documents/r5_unknown_type_kind_listed_but_not_uncertain.md",
+                    self._unresolved_type_doc('type: "dish"', base_valid, needs_review=("kind",)),
+                    [("type", "unknown_type"), ("needs_review", "needs_review_mismatch")],
+                ),
+                # absent type, empty summary not listed -> missing (not
+                # unknown_type) plus the base-field mismatch.
+                (
+                    "documents/r5_absent_type_summary_uncertain_not_listed.md",
+                    self._unresolved_type_doc(None, ['summary: ""'] + base_valid[1:]),
+                    [("type", "missing"), ("needs_review", "needs_review_mismatch")],
+                ),
+                # type: 12 (ambiguous scalar, unresolved) with a consistent
+                # list -> only the ambiguous_scalar error.
+                (
+                    "documents/r5_ambiguous_type_consistent_list.md",
+                    self._unresolved_type_doc("type: 12", base_valid),
+                    [("type", "ambiguous_scalar")],
+                ),
+            ]
+        )
 
 
 if __name__ == "__main__":

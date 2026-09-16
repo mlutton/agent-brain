@@ -2913,16 +2913,27 @@ class TestUnreadablePaths(TempBrainTestCase):
             os.chmod(folder, original[0][1])
 
         # Listing the parent is permitted, but traversing an entry is not.
-        restrict()
         self.addCleanup(restore)
+        restrict()
         try:
             names = os.listdir(folder)
-            with self.assertRaises(PermissionError):
-                open(x_md, "rb").close()
-            with self.assertRaises(PermissionError):
-                os.listdir(os.path.dirname(sub))
         except PermissionError:
-            self.skipTest("0o644 does not provide the required listable-but-unsearchable condition")
+            self.skipTest("restricting documents/ro denied listing it, so it is not listable")
+        undenied = []
+        try:
+            open(x_md, "rb").close()
+        except PermissionError:
+            pass
+        else:
+            undenied.append("reading documents/ro/x.md")
+        try:
+            os.listdir(os.path.dirname(sub))
+        except PermissionError:
+            pass
+        else:
+            undenied.append("listing documents/ro/sub")
+        if undenied:
+            self.skipTest("restricting documents/ro did not deny " + " and ".join(undenied))
         try:
             with os.scandir(folder) as iterator:
                 for entry in iterator:

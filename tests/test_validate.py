@@ -287,7 +287,7 @@ class TestExitCodesAndRefusals(TempBrainTestCase):
         self.assertEqual(report["outcome"], "refused")
 
     def test_known_but_not_implemented_subcommand_is_refused(self):
-        proc = support.run_brain(["setup", "--root", self.tmpdir])
+        proc = support.run_brain(["persist", "--root", self.tmpdir])
         report = support.parse_single_json(proc.stdout)
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(report, {"outcome": "refused", "reason": "not_implemented"})

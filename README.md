@@ -4,15 +4,28 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 
 ## Current status
 
-**Specification accepted; document validation implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). Everything else described in the specification below should still be assumed not to work today.
+**Specification accepted; document validation and setup implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). `python3 bin/brain setup --starter <checkout> --target <folder> [--git] [--module projects]` creates a new brain from a clean starter checkout (ST-04). Everything else described in the specification below should still be assumed not to work today.
 
 | Capability | State |
 | --- | --- |
 | Beta specification | Accepted |
 | Repository topology decision | Accepted |
 | Document validation | Implemented (`brain validate`; ST-01) |
-| Setup, persistence, discovery, read, audit, ingestion, projects module, Claude skills | Not started |
+| Setup | Implemented (`brain setup`; ST-04) — see [Setup](#setup) below |
+| Persistence, discovery, read, audit, ingestion, projects module data/integration, Claude skills | Not started |
 | Codex entry path | Not started; optional for the beta, claimed only once demonstrated |
+
+## Setup
+
+`brain setup --starter <checkout> --target <folder> [--git] [--module projects]` creates a new brain (C3):
+
+- Refuses a non-empty target, a target nested inside another repository's working tree, or a dirty/unresolvable starter checkout — nothing changes on refusal.
+- Copies the starter's skill payload, unaltered, into both `.claude/skills/` and `.agents/skills/`; copies code (including the vendored library) and base types under `.brain/`; installs a requested `--module` by copying whatever manifest and type definitions the named starter checkout supplies for it (a starter can name any module, not only `projects`) — a requested module the starter doesn't have, or whose manifest names an invalid destination folder, refuses before anything is written.
+- Writes `.brain/setup.json` naming the brain id, the resolved `starter_url` (the starter's first configured `origin` remote URL, or a `file:` URI when there is none — source-location metadata only, not an authenticity or reachability claim), the starter commit, the installed modules, and the hash of every copied file.
+- With `--git`, initialises a private local repository and makes one checkpoint commit whose trailer carries `Brain-Op: setup` and a freshly generated `Brain-Run: <run_id>` — this commit exists even if the smoke check below then fails. Without `--git`, no repository is created; setup itself never pushes or adds a remote.
+- Only then runs a smoke check: supported Python (3.11+) and git (2.30+) versions, real hard-link creation and collision refusal in a data zone and in `.brain/state/`, and validation of the freshly copied, still-empty brain through its own copied runtime. Any failure returns `setup_failed` naming the check (`python_version`, `git_version`, `hardlink_data`, `hardlink_state`, or `empty_brain_validate`) and leaves the brain unusable for `create` per C3 — except a starter carrying a broken vendored dependency, which is reported as the copied runtime's own `error`/`vendored_dependency` outcome (exit 1), never folded into `setup_failed`.
+
+**Honest limits, as shipped today:** this starter repository ships **no production skills and no module content at all** — `skills/` and `modules/` are absent here, so a real setup run against this checkout produces empty `.claude/skills/`, `.agents/skills/` and `.brain/types/custom/` folders, and any `--module` request refuses with `module_not_found`. The operational skills (including a setup skill that wraps this command) and the real `projects` module content are separate, later stories; an empty production skill set here is not a bug in this command. `brain setup`'s own tests supply their own synthetic, committed skill and module fixtures to exercise the installation mechanics.
 
 ## What the beta is for
 

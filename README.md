@@ -4,13 +4,14 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 
 ## Current status
 
-**Specified, not implemented.** This repository contains no working code yet. The beta's behaviour is defined by the accepted specification below; nothing described there should be assumed to work today.
+**Specification accepted; document validation implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). Everything else described in the specification below should still be assumed not to work today.
 
 | Capability | State |
 | --- | --- |
 | Beta specification | Accepted |
 | Repository topology decision | Accepted |
-| Setup, validation, persistence, discovery, read, audit, ingestion, projects module, Claude skills | Not started |
+| Document validation | Implemented (`brain validate`; ST-01) |
+| Setup, persistence, discovery, read, audit, ingestion, projects module, Claude skills | Not started |
 | Codex entry path | Not started; optional for the beta, claimed only once demonstrated |
 
 ## What the beta is for
@@ -42,6 +43,11 @@ Planned work and its status are tracked in this repository's [issues](https://gi
 - GitHub issues and pull requests are the authority for work state; documents link to them rather than tracking status.
 - Changes to behaviour update the specification (and its version) in the same pull request.
 - Public content is freshly authored; examples are synthetic. Third-party code is added only as a pinned, vendored library with its licence, named in the specification.
+- Run the full check suite with `python3 -B -m unittest discover -s tests -t .` from the repository root. `-B` stops the interpreter writing bytecode caches so a test run leaves the tree exactly as it found it.
+- Tests exercise `bin/brain` only as a subprocess (`[sys.executable, "-B", "-S", "-E", "bin/brain", …]`), against fixture brains written as literal text into temporary directories; no test imports a product module or mocks the filesystem. A behaviour is proven by showing its test fail first — write the test, watch it fail (or mutate the code/fixture to observe the failure), then make it pass.
+- Every check asserts on outcomes a user could observe: the JSON on stdout, the exit code, and the brain's files and hashes before and after — never on internal module structure.
+- Error assertions compare the full error multiset by exact equality (`tests/support.py`'s `errors_multiset`/`assert_errors`, backed by `collections.Counter`), not a subset check — a spurious extra error must fail a test, not pass it silently.
+- Document-set assertions compare the full set of `documents` paths a report returns, not a subset.
 
 ## License
 

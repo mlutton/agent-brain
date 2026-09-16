@@ -1,0 +1,14 @@
+{
+  "type": "note",
+  "zones": ["*"],
+  "required": [],
+  "allowed_values": {
+    "status": ["draft", "incomplete", "complete", "superseded"],
+    "kind": ["source", "synthesis", "query-output", "decision", "project-context", "unknown"],
+    "authored_by": ["human", "agent", "mixed"],
+    "retention": ["ephemeral", "durable"]
+  },
+  "uncertainty_values": {},
+  "display_fields": ["status", "kind"],
+  "search_fields": ["tags"]
+}

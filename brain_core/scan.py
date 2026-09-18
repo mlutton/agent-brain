@@ -7,6 +7,24 @@ def _rel_posix(root, full):
     return os.path.relpath(full, root).replace(os.sep, "/")
 
 
+def unreadable_entry(root, path):
+    """The `skipped` entry for a path that could not be read."""
+    return {"path": _rel_posix(root, path), "reason": "unreadable"}
+
+
+def can_enter(root):
+    """Whether the brain root's children can be reached at all.
+
+    A root can be listed without being entered (no search permission), and
+    then every path beneath it looks absent rather than unreadable.
+    """
+    try:
+        os.stat(os.path.join(root, os.curdir))
+    except OSError:
+        return False
+    return True
+
+
 def scan_zones(root, module_folders):
     """Returns (entries, skipped).
 
@@ -18,32 +36,37 @@ def scan_zones(root, module_folders):
     entries = []
     skipped = []
     def add_unreadable(path):
-        skipped.append({"path": _rel_posix(root, path), "reason": "unreadable"})
+        skipped.append(unreadable_entry(root, path))
 
-    def walk(folder, zone):
-        try:
-            with os.scandir(folder) as iterator:
-                children = sorted(iterator, key=lambda entry: entry.name)
-        except OSError:
-            add_unreadable(folder)
-            return
-
-        for entry in children:
-            if entry.name.startswith("."):
-                continue
+    def walk(zone_path, zone):
+        # An explicit stack, not recursion, so nesting depth is bounded by
+        # the filesystem rather than by the interpreter's recursion limit.
+        pending = [zone_path]
+        while pending:
+            folder = pending.pop()
             try:
-                if entry.is_symlink():
-                    skipped.append({"path": _rel_posix(root, entry.path), "reason": "symlink"})
-                    continue
-                is_directory = entry.is_dir(follow_symlinks=False)
+                with os.scandir(folder) as iterator:
+                    children = sorted(iterator, key=lambda entry: entry.name)
             except OSError:
-                if entry.name.endswith(".md"):
-                    add_unreadable(entry.path)
+                add_unreadable(folder)
                 continue
-            if is_directory:
-                walk(entry.path, zone)
-            elif entry.name.endswith(".md"):
-                entries.append((_rel_posix(root, entry.path), zone))
+
+            for entry in children:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_symlink():
+                        skipped.append({"path": _rel_posix(root, entry.path), "reason": "symlink"})
+                        continue
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    if entry.name.endswith(".md"):
+                        add_unreadable(entry.path)
+                    continue
+                if is_directory:
+                    pending.append(entry.path)
+                elif entry.name.endswith(".md"):
+                    entries.append((_rel_posix(root, entry.path), zone))
 
     for zone in zones:
         zone_path = os.path.join(root, zone)

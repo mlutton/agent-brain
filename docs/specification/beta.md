@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 15b9f0b7f65c2e7ef0e5eb800d6d9406d2931826c86cdfd661dec1166254c5a7
+Version: c091dbf81f4579e9e1e095e762f5f0103dcb30f2acc1c38585ab7138167032b0
 Publication: published — accepted by merge of #2
 Status: **Accepted specification; not implemented.** Nothing described here exists yet. Delivery stories are opened as issues referencing this version.
 
@@ -295,6 +295,9 @@ Type definitions:
 - It skips `inbox/`, `raw/`, hidden folders and hidden files (names starting with `.`) and other files.
 - Symbolic links are not followed. Each is listed under `skipped` with reason `symlink`, so nothing is skipped silently.
 - A folder that cannot be listed, including a zone root, or a `.md` file that cannot be read is listed under `skipped` with reason `unreadable` and its path relative to the root; hidden paths, `inbox/`, `raw/` and symbolic links keep the rules above. It has no `documents` entry, no status and no version. Validation continues with every accessible path and still prints exactly one JSON object.
+- `.brain` is hidden, and validation still reads three things under it: the folder `.brain/types/custom/` (custom definitions, C5), the folder `.brain/modules/` and each `.brain/modules/<module>/module.json`. A folder among those that exists but cannot be listed, or a `module.json` that exists but cannot be read or is not a regular file, is listed under `skipped` with reason `unreadable` and its path relative to the root, and the outcome is `invalid`. A module whose `module.json` cannot be read or is not a regular file is not installed, since that file names its folder. A folder or file that does not exist is not an error. A custom definition file that cannot be read is not this case: it stays a `definitions` error, `malformed_definition` (C5).
+- A brain root that can be listed but not entered is listed under `skipped` with reason `unreadable` and path `"."`, the root relative to itself, and the outcome is `invalid`; nothing beneath it is examined.
+- Directory listings are assumed to report each entry's type (folder, symbolic link or file). The scan defines no behaviour for a filesystem whose listings withhold it.
 
 **Output.**
 

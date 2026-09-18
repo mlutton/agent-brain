@@ -321,7 +321,7 @@ def _allowed_zone(root, base_dir, zone):
     folder")."""
     if zone in _DATA_ZONES:
         return True
-    return zone in typedefs.detect_installed_modules(root).values()
+    return zone in typedefs.detect_installed_modules(root)[0].values()
 
 
 def run_persist(request, root, base_dir, yaml_module, duplicate_loader):

@@ -47,6 +47,64 @@ def _parse_options(argv):
     return options
 
 
+def _guarded(run):
+    """Runs a subcommand's `run()`, which returns (report, exit code).
+
+    C1 (docs/specification/beta.md:163-164): any unexpected error, including
+    a failure to load the subcommand's own modules, stays inside the
+    single-JSON-object output envelope, exit 1, rather than an escaping
+    traceback with empty stdout. `except Exception`, not `BaseException`, so
+    SystemExit and KeyboardInterrupt are never captured here. Refusals,
+    `vendored_dependency` and every other defined outcome are ordinary return
+    values from `run`, never exceptions, so this boundary cannot swallow them.
+    """
+    try:
+        return run()
+    except Exception:
+        return {"outcome": "error"}, 1
+
+
+def _run_setup(options):
+    from brain_core import setup
+
+    return setup.run_setup(options)
+
+
+def _run_validate(root):
+    from brain_core import vendor_yaml
+
+    try:
+        yaml_module = vendor_yaml.load(_BASE_DIR)
+    except vendor_yaml.VendoredDependencyError:
+        return {"outcome": "error", "reason": "vendored_dependency"}, 1
+
+    duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+
+    from brain_core import validate
+
+    report = validate.run_validate(root, _BASE_DIR, yaml_module, duplicate_loader)
+    return report, 0 if report["outcome"] == "valid" else 3
+
+
+def _run_persist(root, options):
+    from brain_core import vendor_yaml
+
+    try:
+        yaml_module = vendor_yaml.load(_BASE_DIR)
+    except vendor_yaml.VendoredDependencyError:
+        return {"outcome": "error", "reason": "vendored_dependency"}, 1
+
+    duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+
+    request = _read_request(options)
+    if request is None:
+        return {"outcome": "refused", "reason": "invalid_request"}, 2
+
+    from brain_core import persist
+
+    return persist.run_persist(request, root, _BASE_DIR, yaml_module, duplicate_loader)
+
+
 def main(argv):
     if not argv:
         return _refuse("missing_subcommand")
@@ -57,72 +115,24 @@ def main(argv):
 
     options = _parse_options(argv[1:])
 
-    if subcommand == "setup":
-        sys.path.insert(0, _BASE_DIR)
-
-        try:
-            from brain_core import setup
-
-            report, code = setup.run_setup(options)
-        except Exception:
-            # C1 (docs/specification/beta.md:163-164): any unexpected setup
-            # error stays inside the single-JSON-object output envelope,
-            # exit 1, rather than an escaping traceback with empty stdout.
-            # `except Exception`, not `BaseException`, so SystemExit and
-            # KeyboardInterrupt are never captured here. Refusals (exit 2),
-            # setup_failed (exit 3), vendored_dependency and setup_complete
-            # are ordinary return values from run_setup, never exceptions,
-            # so this boundary cannot swallow them.
-            report, code = {"outcome": "error"}, 1
-        print(json.dumps(report))
-        return code
-
-    if subcommand not in ("validate", "persist"):
-        return _refuse("not_implemented")
-
-    root = options.get("--root")
-    if not isinstance(root, str):
-        return _refuse("missing_root")
-    if not os.path.isdir(root):
-        return _refuse("invalid_root")
-
     sys.path.insert(0, _BASE_DIR)
 
-    from brain_core import vendor_yaml
-
-    try:
-        yaml_module = vendor_yaml.load(_BASE_DIR)
-    except vendor_yaml.VendoredDependencyError:
-        print(json.dumps({"outcome": "error", "reason": "vendored_dependency"}))
-        return 1
-
-    duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
-
-    if subcommand == "persist":
-        request = _read_request(options)
-        if request is None:
-            return _refuse("invalid_request")
-
-        from brain_core import persist
-
-        try:
-            report, code = persist.run_persist(request, root, _BASE_DIR, yaml_module, duplicate_loader)
-        except Exception:
-            # Mirrors setup's own boundary (C1): an unhandled persist error
-            # stays inside the single-JSON-object envelope, exit 1, rather
-            # than an escaping traceback. Refusals, failed_before_apply,
-            # written, written_incomplete and target_unexpected are all
-            # ordinary return values from run_persist, never exceptions, so
-            # this boundary cannot swallow them.
-            report, code = {"outcome": "error"}, 1
-        print(json.dumps(report))
-        return code
-
-    from brain_core import validate
-
-    report = validate.run_validate(root, _BASE_DIR, yaml_module, duplicate_loader)
+    if subcommand == "setup":
+        report, code = _guarded(lambda: _run_setup(options))
+    elif subcommand in ("validate", "persist"):
+        root = options.get("--root")
+        if not isinstance(root, str):
+            return _refuse("missing_root")
+        if not os.path.isdir(root):
+            return _refuse("invalid_root")
+        if subcommand == "validate":
+            report, code = _guarded(lambda: _run_validate(root))
+        else:
+            report, code = _guarded(lambda: _run_persist(root, options))
+    else:
+        return _refuse("not_implemented")
     print(json.dumps(report))
-    return 0 if report["outcome"] == "valid" else 3
+    return code
 
 
 def _read_request(options):

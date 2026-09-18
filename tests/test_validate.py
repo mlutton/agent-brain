@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from typing import ClassVar
@@ -3084,3 +3085,188 @@ class TestCustomAllowedValuesShape(TempBrainTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModuleLoadingBoundary(unittest.TestCase):
+    """C1: every run prints exactly one JSON object carrying `outcome`, and exit
+    `1` is an unhandled error. A broken installation -- `brain_core` absent, or
+    present and raising on import -- is built as a disposable runtime tree in a
+    temporary directory outside every repository."""
+
+    def _validate_with(self, **runtime_options):
+        with tempfile.TemporaryDirectory(prefix="brain-disposable-runtime-") as owned:
+            runtime = support.disposable_runtime(owned, **runtime_options)
+            brain = os.path.join(owned, "brain")
+            os.makedirs(brain)
+            return support.run_runtime_brain(runtime, ["validate", "--root", brain])
+
+    def test_intact_disposable_runtime_validates_an_empty_brain(self):
+        proc = self._validate_with()
+        self.assertEqual(support.parse_single_json(proc.stdout)["outcome"], "valid")
+        self.assertEqual(proc.returncode, 0)
+
+    def test_missing_brain_core_reports_error(self):
+        proc = self._validate_with(include_brain_core=False)
+        self.assertEqual(support.parse_single_json(proc.stdout), {"outcome": "error"})
+        self.assertEqual(proc.returncode, 1)
+
+    def test_validate_module_raising_on_import_reports_error(self):
+        proc = self._validate_with(break_module="validate")
+        self.assertEqual(support.parse_single_json(proc.stdout), {"outcome": "error"})
+        self.assertEqual(proc.returncode, 1)
+
+    def test_vendor_loader_raising_on_import_reports_error(self):
+        proc = self._validate_with(break_module="vendor_yaml")
+        self.assertEqual(support.parse_single_json(proc.stdout), {"outcome": "error"})
+        self.assertEqual(proc.returncode, 1)
+
+
+class TestDeepNesting(TempBrainTestCase):
+    """C1: a brain nested past the interpreter's recursion limit (default 1000)
+    still gets exactly one JSON object. The fixture is built and torn down one
+    level at a time; `shutil.rmtree` recurses and would raise on it."""
+
+    DEPTH = 1200
+
+    def test_brain_nested_past_the_recursion_limit_reports_its_document(self):
+        documents = os.path.join(self.tmpdir, "documents")
+        os.makedirs(documents)
+        support.build_deep_chain(documents, self.DEPTH, "note.md", note_doc())
+        self.addCleanup(support.remove_deep_chain, documents, self.DEPTH, "note.md")
+
+        proc = support.run_brain(["validate", "--root", self.tmpdir])
+
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(report["skipped"], [])
+        self.assertEqual(support.document_paths(report), {"documents/" + "d/" * self.DEPTH + "note.md"})
+
+
+class TestUnreadableBrainState(TempBrainTestCase):
+    """C5a: a path under `.brain` that validation reads and cannot is listed under
+    `skipped` with reason `unreadable`, and the outcome is `invalid` -- an
+    incomplete scan is never a successful validation."""
+
+    _locked = TestUnreadablePaths._locked
+    _path = TestUnreadablePaths._path
+
+    MODULE_JSON = json.dumps({"module": "projects", "folder": "projects"})
+
+    def _brain_with_custom_type(self):
+        self.write("documents/ok.md", note_doc())
+        self.write(".brain/types/custom/recipe.json", json.dumps({
+            "type": "recipe", "zones": ["*"], "required": [], "allowed_values": {},
+            "display_fields": [], "search_fields": [],
+        }))
+        return self._path(".brain/types/custom")
+
+    def _brain_with_module(self):
+        self.write("documents/ok.md", note_doc())
+        self.write(".brain/modules/projects/module.json", self.MODULE_JSON)
+        self.write("projects/alpha/alpha.md", note_doc())
+        return self._path(".brain/modules")
+
+    def test_unlistable_custom_types_folder_is_skipped(self):
+        locked = self._brain_with_custom_type()
+        restrict, restore = self._locked([locked])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["skipped"], [{"path": ".brain/types/custom", "reason": "unreadable"}])
+
+    def test_unlistable_modules_folder_is_skipped(self):
+        locked = self._brain_with_module()
+        restrict, restore = self._locked([locked])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["skipped"], [{"path": ".brain/modules", "reason": "unreadable"}])
+
+    def test_unreadable_module_manifest_is_skipped(self):
+        self._brain_with_module()
+        manifest = self._path(".brain/modules/projects/module.json")
+        restrict, restore = self._locked([manifest])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(
+            report["skipped"], [{"path": ".brain/modules/projects/module.json", "reason": "unreadable"}]
+        )
+
+    def test_root_that_lists_but_cannot_be_entered_is_skipped(self):
+        self._brain_with_module()
+        root = self.tmpdir
+        original_mode = os.stat(root).st_mode
+
+        def restrict():
+            os.chmod(root, 0o444)
+            return [(root, os.stat(root).st_mode)]
+
+        def restore():
+            os.chmod(root, original_mode)
+
+        def prove_denial():
+            try:
+                os.listdir(root)
+            except PermissionError:
+                self.fail("the fixture root cannot be listed, so it is not the listable-but-unenterable case")
+            os.stat(os.path.join(root, "documents"))
+
+        proc, report = self.validate(set(), restrict, restore, prove_denial)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["skipped"], [{"path": ".", "reason": "unreadable"}])
+        self.assertEqual(report["documents"], [])
+
+    def test_unreadable_custom_definition_stays_a_malformed_definition(self):
+        self._brain_with_custom_type()
+        definition = self._path(".brain/types/custom/recipe.json")
+        restrict, restore = self._locked([definition])
+        proc, report = self.validate({"documents/ok.md"}, restrict, restore)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(
+            [(d["path"], d["code"]) for d in report["definitions"]],
+            [(".brain/types/custom/recipe.json", "malformed_definition")],
+        )
+        self.assertEqual(report["skipped"], [])
+
+    def test_same_brains_with_permissions_intact_are_valid(self):
+        self._brain_with_custom_type()
+        proc, report = self.validate({"documents/ok.md"})
+        self.assertEqual((report["outcome"], report["skipped"], report["definitions"]), ("valid", [], []))
+        self.assertEqual(proc.returncode, 0)
+        self._new_brain()
+        self._brain_with_module()
+        proc, report = self.validate({"documents/ok.md", "projects/alpha/alpha.md"})
+        self.assertEqual((report["outcome"], report["skipped"]), ("valid", []))
+        self.assertEqual(proc.returncode, 0)
+
+    def test_module_manifest_that_is_not_a_regular_file_is_skipped_as_unreadable(self):
+        """A FIFO blocks `open()` until a writer appears, so reading it would
+        leave validate printing nothing and never exiting. It is also a manifest
+        this command cannot use, so it is reported like an unreadable one. The
+        run is timed so that a regression fails this test instead of hanging
+        the suite."""
+        self._brain_with_module()
+        manifest = self._path(".brain/modules/projects/module.json")
+        os.remove(manifest)
+        os.mkfifo(manifest)
+
+        try:
+            proc = support.run_brain(["validate", "--root", self.tmpdir], timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("validate did not exit within 20 seconds of meeting a FIFO module.json")
+
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(support.document_paths(report), {"documents/ok.md"})
+        self.assertEqual(
+            report["skipped"], [{"path": ".brain/modules/projects/module.json", "reason": "unreadable"}]
+        )
+
+    def _new_brain(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="brain-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)

@@ -4,7 +4,7 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 
 ## Current status
 
-**Specification accepted; document validation and setup implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). `python3 bin/brain setup --starter <checkout> --target <folder> [--git] [--module projects]` creates a new brain from a clean starter checkout (ST-04). Everything else described in the specification below should still be assumed not to work today.
+**Specification accepted; document validation, setup and single-file persist implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). `python3 bin/brain setup --starter <checkout> --target <folder> [--git] [--module projects]` creates a new brain from a clean starter checkout (ST-04). `python3 bin/brain persist --root <brain>` creates, updates and attaches one file at a time per C6 (ST-02) — see [Persist](#persist) below. Everything else described in the specification below should still be assumed not to work today.
 
 | Capability | State |
 | --- | --- |
@@ -12,8 +12,22 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 | Repository topology decision | Accepted |
 | Document validation | Implemented (`brain validate`; ST-01) |
 | Setup | Implemented (`brain setup`; ST-04) — see [Setup](#setup) below |
-| Persistence, discovery, read, audit, ingestion, projects module data/integration, Claude skills | Not started |
+| Single-file persist (create, update, attach) | Implemented (`brain persist`; ST-02) — see [Persist](#persist) below |
+| Index bookkeeping, `recover`, discovery, read, audit, ingestion, projects module data/integration, Claude skills | Not started |
 | Codex entry path | Not started; optional for the beta, claimed only once demonstrated |
+
+## Persist
+
+`brain persist --root <brain>` with a JSON request on stdin (or `--input <file>`) creates, updates or attaches one file (C6):
+
+- `create`: writes a new document in the canonical frontmatter form (C4); refuses `exists` if the target is already present, with no overwriting fallback.
+- `update`: applies a targeted, byte-preserving replacement of only the named properties' spans (C4) — comments, hand ordering and untouched properties (including zero-indented block sequences) are left exactly as they were; refuses `unsupported_frontmatter` byte-identical when a touched span holds a comment or the block uses anchors, aliases, explicit tags, multiple YAML documents or flow style; refuses `version_mismatch` when `expected_version` no longer matches the current file.
+- `attach`: persists binary content (for example an image) alongside a document, with its hash recorded and matching.
+- Every write is journalled as an intent before any bytes move, applied by hard-link (`create`/`attach`, so a create can never overwrite) or backup-and-replace (`update`), and left with a change record and, in a git-backed brain, one commit whose final trailer paragraph names the operation, run, `op_key` and each changed path with its hash (C7) — a brain commit never sweeps in an unrelated uncommitted change. `kill`/`fail` fault injection at the C6 fault points leaves the target at either its prior bytes or the intended bytes, never truncated, and a bookkeeping failure returns `written_incomplete` naming exactly the pending step.
+- Persist mints the document's id itself on every `create`; refuses `open_intent` on a path with unresolved interrupted work, `review_required` on a non-reviewed write of `origin: unknown`, `unsupported_version` on a `kb` value other than 1, and `journal_missing` while the brain's operation journal is absent.
+- Every document persist writes re-parses to its intended values under both the vendored YAML 1.1 parser and a YAML 1.2 core-schema reading (the one documented difference is an unquoted date, read as a date under 1.1 and as a string under 1.2; both are accepted).
+
+**Honest limits, as shipped today:** the `target_unexpected` outcome and `recover` (interrupted-write recovery, and the `--restore-retained` path) are ST-03's, not this story's — `persist` never retries after an unexpected target, and reaching that state today leaves the brain requiring ST-03 to resolve it. Index bookkeeping (C8) is ST-06's; `written_incomplete`'s pending list never names `index` before then. `brain grant`, maintenance-grant validity and invalidation are out of scope; persist only records a create-time grant trailer for an agent-authored document. `discover`, `read`, `audit` and `ingest` do not exist yet, so nothing published by persist is yet findable except by reading the brain's files directly.
 
 ## Setup
 

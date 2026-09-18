@@ -164,6 +164,38 @@ class CreateTests(PersistTestCase):
             after = fh.read()
         self.assertEqual(before, after)
 
+    def test_apply_step_itself_refuses_to_overwrite_a_target_that_appears_after_the_precheck(self):
+        """P2/Behaviour 14, decided by injection at the true TOCTOU gap: an
+        ordinary run can never reach the apply step with the target already
+        present, because create's `expected_prior` is always "absent" (A7)
+        and step 4's own re-check already refuses whenever the target exists
+        at that moment. The only way to exercise the apply step's own
+        no-overwrite guarantee is to land a conflicting write in the gap
+        between that re-check and the apply itself -- exactly what the
+        BRAIN_TEST_CONFLICT hook does."""
+        path = "documents/raceoverwrite/race.md"
+        request = {
+            "operation": "create",
+            "path": path,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Intended body -- must never land.\n",
+        }
+        proc = support.run_brain(
+            ["persist", "--root", self.root],
+            input_data=json.dumps(request),
+            env=dict(os.environ, BRAIN_TEST_FAULTS="1", BRAIN_TEST_CONFLICT=path),
+        )
+        doc = support.parse_single_json(proc.stdout)
+        self.assertEqual(doc["outcome"], "failed_before_apply", doc)
+
+        full = os.path.join(self.root, path)
+        with open(full, "rb") as fh:
+            actual = fh.read()
+        # The conflicting bytes injected into the gap must survive
+        # untouched: no fallback (an os.replace, for example) may land the
+        # intended content over them.
+        self.assertEqual(actual, b"conflicting out-of-band content")
+
 
 class CreateAlwaysMintsIdTests(PersistTestCase):
     """A7: persist mints the document id itself -- C6's request carries no
@@ -265,6 +297,38 @@ class AttachTests(PersistTestCase):
             actual = fh.read()
         self.assertEqual(actual, content)
         self.assertEqual(doc["version"], hashlib.sha256(content).hexdigest())
+
+
+class AttachGitBrainTests(PersistTestCase):
+    """X1: P4/A6's "hash recorded" half, in a git brain -- the attach commit's
+    Brain-Path trailer carries the same hash as the change record. No
+    existing attach test runs in a git brain, so nothing in the suite
+    observed the trailer amendment A6 pins the record to."""
+
+    def test_attach_in_git_brain_leaves_change_record_and_matching_trailer(self):
+        import base64
+        import hashlib
+
+        root = self.git_root()
+        content = b"\x89PNG\r\n\x1a\nsynthetic image bytes"
+        path = "documents/withimg/attachments/pic.png"
+        request = {
+            "operation": "attach",
+            "path": path,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+        }
+        proc, doc = self.persist(request, root=root)
+        self.assertEqual(doc["outcome"], "written", doc)
+        expected_hash = hashlib.sha256(content).hexdigest()
+        self.assertEqual(doc["version"], expected_hash)
+
+        change_records = os.listdir(os.path.join(root, ".brain", "journal", "change_records"))
+        self.assertEqual(len(change_records), 1)
+
+        log = subprocess.run(
+            ["git", "log", "--format=%B"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout
+        self.assertIn(f"Brain-Path: {path} sha256={expected_hash} prior=absent", log)
 
 
 class OpenIntentTests(PersistTestCase):
@@ -715,6 +779,66 @@ class FrontmatterPreservationTests(PersistTestCase):
         with open(full, "r", encoding="utf-8", newline="") as fh:
             after = fh.read()
         self.assertEqual(after, hand_written)
+
+
+class MintedIdIsUlidTests(PersistTestCase):
+    """X4: the id persist mints is a real ULID (C4) -- a 48-bit millisecond
+    timestamp reflecting the time of minting, followed by 80 bits of
+    randomness, with the first character bounded so the encoding stays
+    within 128 bits -- not merely 26 characters drawn from the Crockford
+    alphabet. Expected values are grounded independently: this test decodes
+    the id's own bits with a decoder it writes itself (plain base32 place
+    value, never calling into brain_core), and compares the decoded
+    timestamp against a wall-clock window captured around the mint."""
+
+    _CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"
+
+    @classmethod
+    def _decode_timestamp_ms(cls, ulid):
+        value = 0
+        for ch in ulid:
+            value = (value << 5) | cls._CROCKFORD.index(ch)
+        return value >> 80  # the low 80 bits are randomness; the rest is the 48-bit timestamp
+
+    def _create(self, path):
+        request = {
+            "operation": "create",
+            "path": path,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        _, doc = self.persist(request)
+        self.assertEqual(doc["outcome"], "written", doc)
+        return doc["id"]
+
+    def test_minted_id_timestamp_reflects_time_of_minting(self):
+        import time
+
+        before_ms = int(time.time() * 1000)
+        minted = self._create("documents/ulidtime/ulidtime.md")
+        after_ms = int(time.time() * 1000)
+
+        timestamp = self._decode_timestamp_ms(minted)
+        # Generous slack for clock skew and subprocess start-up, but still a
+        # world away from a uniformly random 48-bit value (which would land
+        # outside this window with near certainty).
+        self.assertGreaterEqual(timestamp, before_ms - 1000, minted)
+        self.assertLessEqual(timestamp, after_ms + 1000, minted)
+
+    def test_minted_id_first_character_stays_within_128_bit_bound(self):
+        minted = self._create("documents/ulidbound/ulidbound.md")
+        # 26 base32 characters hold 130 bits; a real ULID's 128-bit value
+        # forces the first character's top two bits to zero, so it is one of
+        # the alphabet's first 8 symbols only.
+        self.assertIn(minted[0], "01234567", minted)
+
+    def test_minted_ids_sort_in_minting_order(self):
+        import time
+
+        first = self._create("documents/ulidseq/first.md")
+        time.sleep(0.005)
+        second = self._create("documents/ulidseq/second.md")
+        self.assertLess(first, second)
 
 
 if __name__ == "__main__":

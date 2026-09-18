@@ -9,18 +9,16 @@ writing a change record and making a git commit with consistent trailers --
 is mechanics hidden behind that one call; no caller ever sequences those
 steps itself.
 
-Design note (see the codebase-design and deepening references staged under
-.dispatch/reference/ for this residency): `brain_core/setup.py` already has
-its own module-private `_git`, `_hash_file` and `_hardlink_probe` helpers.
-Persist needs a subprocess `git` wrapper and a file-hash helper too. Rather
-than reach into `setup`'s private helpers (coupling two independent command
-modules through each other's internals) or duplicate them silently, the
-small, genuinely shared primitives live in `brain_core/gitutil.py`: a real
-second seam (two call sites -- setup.py, once ST-06/later stories land, and
-persist.py, now), not a hypothetical one. `setup.py` itself is left
-unchanged this round: it already passes its own tests, and touching a
-working module outside the TDD loop that owns it is a refactor, not a
-behaviour change (see <deviations> in the handback).
+Design note: `brain_core/setup.py` already has its own module-private `_git`,
+`_hash_file` and `_hardlink_probe` helpers. Persist needs a subprocess `git`
+wrapper and a file-hash helper too. Rather than reach into `setup`'s private
+helpers (coupling two independent command modules through each other's
+internals) or duplicate them silently, the small, genuinely shared
+primitives live in `brain_core/gitutil.py`: a real second seam (two call
+sites -- setup.py, once ST-06/later stories land, and persist.py, now), not
+a hypothetical one. `setup.py` itself is left unchanged this round: it
+already passes its own tests, and touching a working module outside the TDD
+loop that owns it is a refactor, not a behaviour change.
 """
 
 import os
@@ -58,10 +56,46 @@ def _check_fault(step):
         raise _Fault(step)
 
 
-def _mint_id():
-    import secrets
+_CONFLICT_ENV = "BRAIN_TEST_CONFLICT"
 
-    return "".join(secrets.choice(_ID_ALPHABET) for _ in range(26))
+
+def _check_conflict_injection(root, path, target_full):
+    """Test-only instrumentation, gated behind BRAIN_TEST_FAULTS like
+    `_check_fault` but not part of C6's kill/fail fault contract: it writes a
+    conflicting file at the target path, landing deliberately in the gap
+    between step 4's re-check (just above this call's own call site in
+    run_persist) and step 5's apply. This is the only way to reach the apply
+    step with the target already present -- the request shape gives create
+    no way to declare `expected_prior` as anything but "absent" (A7), so an
+    ordinary run's own step-4 check always catches a target that exists
+    before persist starts. Exercises the apply step's own no-overwrite
+    guarantee (Behaviour 14) directly, rather than assuming it from reading
+    `_apply_create_or_attach`."""
+    if os.environ.get(FAULT_ENV) != "1":
+        return
+    if os.environ.get(_CONFLICT_ENV) != path:
+        return
+    with open(target_full, "wb") as fh:
+        fh.write(b"conflicting out-of-band content")
+
+
+def _mint_id():
+    """Mints a real ULID (C4): a 48-bit millisecond timestamp followed by 80
+    bits of randomness, encoded as 26 lowercase Crockford base32 characters.
+    The 128-bit value fits inside the 130 bits the 26 characters can hold,
+    so the first character's own top two bits are always zero -- it never
+    exceeds the alphabet's eighth symbol."""
+    import secrets
+    import time
+
+    timestamp_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFF
+    randomness = int.from_bytes(secrets.token_bytes(10), "big")
+    value = (timestamp_ms << 80) | randomness
+    chars = []
+    for i in range(26):
+        shift = 5 * (25 - i)
+        chars.append(_ID_ALPHABET[(value >> shift) & 0x1F])
+    return "".join(chars)
 
 
 def _refused(reason, observed_hash=None):
@@ -321,6 +355,7 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
             refusal_doc["observed_sha256"] = observed_hash
         return refusal_doc, 2
 
+    _check_conflict_injection(root, path, target_full)
     _check_fault("before_apply")
 
     backup_path = None

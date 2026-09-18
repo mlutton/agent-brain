@@ -157,7 +157,8 @@ def detect_installed_modules(root):
     """Returns ({module_name: folder_name}, skipped entries) for modules with a valid module.json (C15).
 
     A module.json naming a reserved, hidden, parent-escaping or multi-component
-    folder is ignored: that module is treated as not installed.
+    folder is ignored: that module is treated as not installed. A module.json
+    that cannot be used, whether denied or not a regular file, is `unreadable`.
     """
     modules_dir = os.path.join(root, ".brain", "modules")
     installed = {}
@@ -166,16 +167,17 @@ def detect_installed_modules(root):
     for name in names:
         module_json = os.path.join(modules_dir, name, "module.json")
         try:
-            # Anything but a regular file is not a manifest, and opening a FIFO
-            # would block until a writer appears.
+            # Opening a FIFO would block until a writer appears, so anything but
+            # a regular file is a manifest this command cannot use.
             if not stat.S_ISREG(os.stat(module_json).st_mode):
+                skipped.append(scan.unreadable_entry(root, module_json))
                 continue
             with open(module_json, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except (FileNotFoundError, NotADirectoryError):
             continue
         except OSError:
-            # The manifest names the module's folder, so an unreadable one
+            # The manifest names the module's folder, so an unusable one
             # leaves nothing to scan: report it rather than count it absent.
             skipped.append(scan.unreadable_entry(root, module_json))
             continue

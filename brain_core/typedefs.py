@@ -3,6 +3,8 @@
 import json
 import os
 
+from . import scan
+
 _REQUIRED_KEYS = {
     "type": str,
     "zones": list,
@@ -85,12 +87,28 @@ def load_base_types(base_dir):
     return registry
 
 
+def _list_folder(root, folder):
+    """Returns (sorted names, skipped entries) for a folder under `.brain`.
+
+    A folder that is absent is not an error and reports nothing; a folder
+    that exists but cannot be listed is `unreadable` (C5a).
+    """
+    try:
+        return sorted(os.listdir(folder)), []
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []
+    except OSError:
+        return [], [scan.unreadable_entry(root, folder)]
+
+
 def load_custom_types(registry, root):
-    """Loads custom type definitions from <root>/.brain/types/custom/*.json."""
+    """Loads custom type definitions from <root>/.brain/types/custom/*.json.
+
+    Returns the `skipped` entries for what could not be listed.
+    """
     custom_dir = os.path.join(root, ".brain", "types", "custom")
-    if not os.path.isdir(custom_dir):
-        return
-    for name in sorted(os.listdir(custom_dir)):
+    names, skipped = _list_folder(root, custom_dir)
+    for name in names:
         if not name.endswith(".json"):
             continue
         rel_path = os.path.relpath(os.path.join(custom_dir, name), root).replace(os.sep, "/")
@@ -118,6 +136,7 @@ def load_custom_types(registry, root):
             )
             continue
         registry.types[declared_type] = TypeDef(data)
+    return skipped
 
 
 _RESERVED_ZONE_FOLDERS = {"documents", "wiki", "inbox", "raw"}
@@ -134,24 +153,28 @@ def _valid_module_folder(folder):
 
 
 def detect_installed_modules(root):
-    """Returns {module_name: folder_name} for modules with a valid module.json (C15).
+    """Returns ({module_name: folder_name}, skipped entries) for modules with a valid module.json (C15).
 
     A module.json naming a reserved, hidden, parent-escaping or multi-component
     folder is ignored: that module is treated as not installed.
     """
     modules_dir = os.path.join(root, ".brain", "modules")
     installed = {}
-    if not os.path.isdir(modules_dir):
-        return installed
+    names, skipped = _list_folder(root, modules_dir)
     used_folders = set()
-    for name in sorted(os.listdir(modules_dir)):
+    for name in names:
         module_json = os.path.join(modules_dir, name, "module.json")
-        if not os.path.isfile(module_json):
-            continue
         try:
             with open(module_json, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+            continue
+        except OSError:
+            # The manifest names the module's folder, so an unreadable one
+            # leaves nothing to scan: report it rather than count it absent.
+            skipped.append(scan.unreadable_entry(root, module_json))
+            continue
+        except ValueError:
             continue
         if not isinstance(data, dict):
             continue
@@ -165,4 +188,4 @@ def detect_installed_modules(root):
             continue
         used_folders.add(folder)
         installed[module] = folder
-    return installed
+    return installed, skipped

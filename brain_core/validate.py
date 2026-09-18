@@ -122,10 +122,18 @@ def _message(field, code):
 
 def run_validate(root, base_dir, yaml_module, duplicate_loader):
     type_registry = typedefs.load_base_types(base_dir)
-    typedefs.load_custom_types(type_registry, root)
-    module_folders = typedefs.detect_installed_modules(root)
-
-    entries, skipped = scan.scan_zones(root, module_folders)
+    skipped = []
+    entries = []
+    if scan.can_enter(root):
+        skipped += typedefs.load_custom_types(type_registry, root)
+        module_folders, unreadable_modules = typedefs.detect_installed_modules(root)
+        skipped += unreadable_modules
+        entries, scanned_skipped = scan.scan_zones(root, module_folders)
+        skipped += scanned_skipped
+    else:
+        # Nothing beneath the root can be examined, so the root itself is the
+        # one unreadable path, named relative to itself.
+        skipped.append({"path": ".", "reason": "unreadable"})
 
     documents = []
     counts = {"valid": 0, "invalid": 0, "unmanaged": 0, "unsupported_version": 0, "retained": 0}

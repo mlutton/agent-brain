@@ -5,6 +5,7 @@ import collections
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -19,6 +20,75 @@ def run_brain(args, isolated=True, env=None):
         cmd = [sys.executable, "-B", BRAIN] + list(args)
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=env, check=False)
     return proc
+
+
+def disposable_runtime(owned_dir, include_brain_core=True, break_module=None):
+    """Copies the runtime tree (`bin/`, `brain_core/`, `types/`, `vendor/`) into
+    `owned_dir/runtime` and returns that path. `include_brain_core=False` leaves
+    the package out; `break_module="validate"` makes `brain_core/validate.py`
+    raise when it is imported. Never touches this checkout."""
+    runtime = os.path.join(owned_dir, "runtime")
+    os.makedirs(runtime)
+    names = ["bin", "vendor", "types"]
+    if include_brain_core:
+        names.append("brain_core")
+    for name in names:
+        shutil.copytree(
+            os.path.join(REPO_ROOT, name),
+            os.path.join(runtime, name),
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+    if break_module is not None:
+        module_path = os.path.join(runtime, "brain_core", break_module + ".py")
+        with open(module_path, encoding="utf-8") as fh:
+            original = fh.read()
+        with open(module_path, "w", encoding="utf-8") as fh:
+            fh.write('raise RuntimeError("disposable fixture: unloadable module")\n' + original)
+    return runtime
+
+
+def run_runtime_brain(runtime, args):
+    """Runs the disposable runtime's own `bin/brain`, isolated like run_brain."""
+    cmd = [sys.executable, "-B", "-S", "-E", os.path.join(runtime, "bin", "brain")] + list(args)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def build_deep_chain(top, depth, leaf_name, leaf_content, level_name="d"):
+    """Creates `depth` nested folders under `top`, each holding the next, with a
+    file at the bottom. Descends one level at a time through a directory file
+    descriptor, holding only one open at once, so neither the depth nor the
+    length of the absolute path is limited by the filesystem."""
+    fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(depth):
+            os.mkdir(level_name, dir_fd=fd)
+            child = os.open(level_name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        leaf = os.open(leaf_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=fd)
+        with os.fdopen(leaf, "w", encoding="utf-8", newline="") as fh:
+            fh.write(leaf_content)
+    finally:
+        os.close(fd)
+
+
+def remove_deep_chain(top, depth, leaf_name, level_name="d"):
+    """Undoes build_deep_chain level by level. `shutil.rmtree` recurses, so on a
+    chain this deep it raises and leaves the tree behind."""
+    fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(depth):
+            child = os.open(level_name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        os.unlink(leaf_name, dir_fd=fd)
+        for _ in range(depth):
+            parent = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            os.rmdir(level_name, dir_fd=parent)
+            fd = parent
+    finally:
+        os.close(fd)
 
 
 def parse_single_json(stdout):

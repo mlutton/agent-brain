@@ -288,7 +288,11 @@ class TestExitCodesAndRefusals(TempBrainTestCase):
         self.assertEqual(report["outcome"], "refused")
 
     def test_known_but_not_implemented_subcommand_is_refused(self):
-        proc = support.run_brain(["persist", "--root", self.tmpdir])
+        # `persist` (ST-02) now exists, so it is no longer an example of a
+        # known-but-unimplemented subcommand (see the story's amendment B3);
+        # `recover` (ST-03) still is, per C1's subcommand list and bin/brain's
+        # dispatch, so it keeps this generic dispatch behaviour under test.
+        proc = support.run_brain(["recover", "--root", self.tmpdir])
         report = support.parse_single_json(proc.stdout)
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(report, {"outcome": "refused", "reason": "not_implemented"})

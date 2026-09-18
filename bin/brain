@@ -86,6 +86,25 @@ def _run_validate(root):
     return report, 0 if report["outcome"] == "valid" else 3
 
 
+def _run_persist(root, options):
+    from brain_core import vendor_yaml
+
+    try:
+        yaml_module = vendor_yaml.load(_BASE_DIR)
+    except vendor_yaml.VendoredDependencyError:
+        return {"outcome": "error", "reason": "vendored_dependency"}, 1
+
+    duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+
+    request = _read_request(options)
+    if request is None:
+        return {"outcome": "refused", "reason": "invalid_request"}, 2
+
+    from brain_core import persist
+
+    return persist.run_persist(request, root, _BASE_DIR, yaml_module, duplicate_loader)
+
+
 def main(argv):
     if not argv:
         return _refuse("missing_subcommand")
@@ -100,17 +119,35 @@ def main(argv):
 
     if subcommand == "setup":
         report, code = _guarded(lambda: _run_setup(options))
-    elif subcommand == "validate":
+    elif subcommand in ("validate", "persist"):
         root = options.get("--root")
         if not isinstance(root, str):
             return _refuse("missing_root")
         if not os.path.isdir(root):
             return _refuse("invalid_root")
-        report, code = _guarded(lambda: _run_validate(root))
+        if subcommand == "validate":
+            report, code = _guarded(lambda: _run_validate(root))
+        else:
+            report, code = _guarded(lambda: _run_persist(root, options))
     else:
         return _refuse("not_implemented")
     print(json.dumps(report))
     return code
+
+
+def _read_request(options):
+    """Reads the C1 structured-input JSON: --input <file>, else stdin."""
+    input_path = options.get("--input")
+    try:
+        if isinstance(input_path, str):
+            with open(input_path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        else:
+            text = sys.stdin.read()
+        data = json.loads(text)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 if __name__ == "__main__":

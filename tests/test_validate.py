@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from typing import ClassVar
@@ -3237,6 +3238,26 @@ class TestUnreadableBrainState(TempBrainTestCase):
         proc, report = self.validate({"documents/ok.md", "projects/alpha/alpha.md"})
         self.assertEqual((report["outcome"], report["skipped"]), ("valid", []))
         self.assertEqual(proc.returncode, 0)
+
+    def test_module_manifest_that_is_not_a_regular_file_is_not_an_installed_module(self):
+        """A FIFO blocks `open()` until a writer appears, so reading it would
+        leave validate printing nothing and never exiting. The run is timed so
+        that a regression fails this test instead of hanging the suite."""
+        self._brain_with_module()
+        manifest = self._path(".brain/modules/projects/module.json")
+        os.remove(manifest)
+        os.mkfifo(manifest)
+
+        try:
+            proc = support.run_brain(["validate", "--root", self.tmpdir], timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("validate did not exit within 20 seconds of meeting a FIFO module.json")
+
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(report["outcome"], "valid")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(support.document_paths(report), {"documents/ok.md"})
+        self.assertEqual(report["skipped"], [])
 
     def _new_brain(self):
         self.tmpdir = tempfile.mkdtemp(prefix="brain-test-")

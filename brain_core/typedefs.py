@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 
 from . import scan
 
@@ -165,9 +166,13 @@ def detect_installed_modules(root):
     for name in names:
         module_json = os.path.join(modules_dir, name, "module.json")
         try:
+            # Anything but a regular file is not a manifest, and opening a FIFO
+            # would block until a writer appears.
+            if not stat.S_ISREG(os.stat(module_json).st_mode):
+                continue
             with open(module_json, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        except (FileNotFoundError, NotADirectoryError):
             continue
         except OSError:
             # The manifest names the module's folder, so an unreadable one

@@ -1,13 +1,36 @@
 """Tests for `brain persist` (ST-02), against docs/specification/beta.md C4/C6/C7."""
 
+import datetime
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 from tests import support
+from tests.yaml12 import make_yaml12_loader
+
+# The vendored YAML library is a pinned dependency, not a product module (see
+# vendor/VENDORED.md): tests read a persisted file's frontmatter block with it
+# directly, exactly as a real consumer (or Obsidian) would, never by importing
+# brain_core to assert on internal structure (see this file's own module
+# docstring convention, mirrored from README.md's Contributing section).
+sys.path.insert(0, os.path.join(support.REPO_ROOT, "vendor"))
+import yaml as _yaml_module  # noqa: E402
+
+_YAML12_LOADER = make_yaml12_loader(_yaml_module)
+
+
+def _frontmatter_block(text):
+    """Splits a canonical `---\\n<block>---\\n<body>` file's own frontmatter
+    block out for reparsing, by the same plain marker rule C4 defines --
+    without importing brain_core's own frontmatter module."""
+    lines = text.splitlines(keepends=True)
+    assert lines[0].rstrip("\r\n") == "---"
+    close_idx = next(i for i in range(1, len(lines)) if lines[i].rstrip("\r\n") == "---")
+    return "".join(lines[1:close_idx])
 
 
 def _run_git(args, cwd):
@@ -140,6 +163,32 @@ class CreateTests(PersistTestCase):
         with open(full, "rb") as fh:
             after = fh.read()
         self.assertEqual(before, after)
+
+
+class CreateAlwaysMintsIdTests(PersistTestCase):
+    """A7: persist mints the document id itself -- C6's request carries no
+    `id` field, and C4 requires the id minted once, never derived from the
+    path or accepted from the caller. A caller-supplied `frontmatter.id` must
+    never end up as the document's id."""
+
+    def test_create_ignores_a_caller_supplied_id_and_mints_its_own(self):
+        fm = dict(NOTE_FRONTMATTER)
+        fm["id"] = "zzzzzzzzzzzzzzzzzzzzzzzzzz"  # a caller-supplied, well-formed id
+        request = {
+            "operation": "create",
+            "path": "documents/mint/mint.md",
+            "frontmatter": fm,
+            "body": "Body.\n",
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(doc["outcome"], "written", doc)
+        self.assertNotEqual(doc["id"], "zzzzzzzzzzzzzzzzzzzzzzzzzz")
+
+        full = os.path.join(self.root, "documents/mint/mint.md")
+        with open(full, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn("zzzzzzzzzzzzzzzzzzzzzzzzzz", text)
+        self.assertIn(f'id: "{doc["id"]}"', text)
 
 
 class UpdateTests(PersistTestCase):
@@ -475,6 +524,197 @@ class FaultInjectionTests(PersistTestCase):
 
         change_records = os.listdir(os.path.join(self.root, ".brain", "journal", "change_records"))
         self.assertEqual(len(change_records), 1)
+
+
+class YamlDualParseTests(PersistTestCase):
+    """P9: every document created by persist re-parses to its intended
+    values under YAML 1.1 (the vendored parser persist itself uses) and
+    under a YAML 1.2 core-schema reader (S-G4(b)). C4 documents exactly one
+    reader difference for the canonical written form: an unquoted
+    `YYYY-MM-DD` date reads as a date under 1.1 and as a string under 1.2,
+    and both readings are accepted (C4's *Reading values*); every other
+    value the canonical form leaves unquoted (`kb: 1`, empty scalars, `[]`)
+    reads identically under both."""
+
+    def test_created_document_reparses_under_yaml_11_and_12(self):
+        fm = dict(NOTE_FRONTMATTER)
+        fm["origin"] = [{"ref": "https://example.invalid/source", "retrieved": "2026-02-03"}]
+        fm["evidence"] = ["https://example.invalid/evidence"]
+        request = {
+            "operation": "create",
+            "path": "documents/dual/dual.md",
+            "frontmatter": fm,
+            "body": "Body text.\n",
+        }
+        _, doc = self.persist(request)
+        self.assertEqual(doc["outcome"], "written", doc)
+
+        full = os.path.join(self.root, "documents/dual/dual.md")
+        with open(full, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        block = _frontmatter_block(text)
+
+        under_11 = next(iter(_yaml_module.load_all(block, Loader=_yaml_module.SafeLoader)))
+        under_12 = next(iter(_yaml_module.load_all(block, Loader=_YAML12_LOADER)))
+
+        # The one documented difference (C4): an unquoted date reads as a
+        # `date` object under 1.1 and as its literal string under 1.2.
+        self.assertEqual(under_11["created"], datetime.date(2026, 1, 1))
+        self.assertEqual(under_12["created"], "2026-01-01")
+        self.assertEqual(under_11["reviewed"], datetime.date(2026, 1, 1))
+        self.assertEqual(under_12["reviewed"], "2026-01-01")
+        self.assertEqual(under_11["origin"][0]["retrieved"], datetime.date(2026, 2, 3))
+        self.assertEqual(under_12["origin"][0]["retrieved"], "2026-02-03")
+
+        # Every other value the canonical form emits is quoted text, `kb: 1`,
+        # or `[]` -- identical under both readers.
+        for field in ("kb", "id", "type", "title", "summary", "status", "kind", "authored_by", "retention", "evidence"):
+            self.assertEqual(under_11[field], under_12[field], field)
+        self.assertEqual(under_11["id"], doc["id"])
+
+
+class FrontmatterPreservationTests(PersistTestCase):
+    """P10: a single-property update on a note with comments, hand-ordered
+    properties and a zero-indented list changes only that property's span
+    and leaves every other byte identical; updating a property whose span
+    holds a comment, and any block using anchors or JSON style, is refused
+    `unsupported_frontmatter` byte-identical (S-G4(c))."""
+
+    HAND_WRITTEN = (
+        "---\n"
+        "kb: 1\n"
+        "id: \"01arz3ndektsv4rrffq69g5fav\"\n"
+        "type: \"note\"\n"
+        "title: \"Hand note\"\n"
+        "# a comment sitting between two properties\n"
+        "summary: \"A hand-authored note.\"\n"
+        "status: \"draft\"\n"
+        "created: 2026-01-01\n"
+        "reviewed: 2026-01-01\n"
+        "origin: \"authored\"\n"
+        "evidence:\n"
+        "- \"https://example.invalid/a\"\n"
+        "- \"https://example.invalid/b\"\n"
+        "kind: \"decision\"\n"
+        "authored_by: \"human\"\n"
+        "retention: \"durable\"\n"
+        "---\n"
+        "Body text, hand written.\n"
+    )
+
+    def _write_hand_written(self, path):
+        full = os.path.join(self.root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(self.HAND_WRITTEN)
+        import hashlib
+
+        with open(full, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def test_single_property_update_changes_only_that_span(self):
+        path = "documents/hand/hand.md"
+        version = self._write_hand_written(path)
+        full = os.path.join(self.root, path)
+
+        request = {
+            "operation": "update",
+            "path": path,
+            "expected_version": version,
+            "frontmatter": {"status": "complete"},
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(doc["outcome"], "written", doc)
+
+        with open(full, "r", encoding="utf-8", newline="") as fh:
+            after = fh.read()
+        before_lines = self.HAND_WRITTEN.splitlines(keepends=True)
+        after_lines = after.splitlines(keepends=True)
+        self.assertEqual(len(before_lines), len(after_lines))
+        changed = [i for i in range(len(before_lines)) if before_lines[i] != after_lines[i]]
+        self.assertEqual(changed, [7])  # only the `status:` line
+        self.assertEqual(after_lines[7], 'status: "complete"\n')
+        # Comment, hand order and the zero-indented list are untouched.
+        self.assertIn("# a comment sitting between two properties\n", after_lines)
+        self.assertIn('- "https://example.invalid/a"\n', after_lines)
+        self.assertIn('- "https://example.invalid/b"\n', after_lines)
+
+    def test_update_of_property_whose_span_holds_comment_is_refused_byte_identical(self):
+        path = "documents/handcomment/handcomment.md"
+        hand_written = self.HAND_WRITTEN.replace(
+            'title: "Hand note"\n',
+            'title: "Hand note"  # inline comment on the title itself\n',
+        ).replace(
+            "# a comment sitting between two properties\n", ""
+        )
+        full = os.path.join(self.root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(hand_written)
+        import hashlib
+
+        with open(full, "rb") as fh:
+            version = hashlib.sha256(fh.read()).hexdigest()
+
+        request = {
+            "operation": "update",
+            "path": path,
+            "expected_version": version,
+            "frontmatter": {"title": "Renamed"},
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(doc, {"outcome": "refused", "reason": "unsupported_frontmatter"})
+        self.assertEqual(proc.returncode, 2)
+        with open(full, "r", encoding="utf-8", newline="") as fh:
+            after = fh.read()
+        self.assertEqual(after, hand_written)
+
+    def test_update_of_anchor_using_block_is_refused_byte_identical(self):
+        path = "documents/handanchor/handanchor.md"
+        # An anchor with no alias reference elsewhere: isolates anchor
+        # detection specifically (C4's list -- anchors, aliases, explicit
+        # tags, multiple documents, flow style -- names each independently,
+        # so a fixture combining an anchor with its alias would leave the
+        # anchor-only case unobserved).
+        hand_written = (
+            "---\n"
+            "kb: 1\n"
+            "id: \"01arz3ndektsv4rrffq69g5fav\"\n"
+            "type: \"note\"\n"
+            "title: &t \"Hand note\"\n"
+            "summary: \"A hand-authored note.\"\n"
+            "status: \"draft\"\n"
+            "created: 2026-01-01\n"
+            "reviewed: 2026-01-01\n"
+            "origin: \"authored\"\n"
+            "evidence: []\n"
+            "kind: \"decision\"\n"
+            "authored_by: \"human\"\n"
+            "retention: \"durable\"\n"
+            "---\n"
+            "Body text, hand written.\n"
+        )
+        full = os.path.join(self.root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(hand_written)
+        import hashlib
+
+        with open(full, "rb") as fh:
+            version = hashlib.sha256(fh.read()).hexdigest()
+
+        request = {
+            "operation": "update",
+            "path": path,
+            "expected_version": version,
+            "frontmatter": {"status": "complete"},
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(doc, {"outcome": "refused", "reason": "unsupported_frontmatter"})
+        self.assertEqual(proc.returncode, 2)
+        with open(full, "r", encoding="utf-8", newline="") as fh:
+            after = fh.read()
+        self.assertEqual(after, hand_written)
 
 
 if __name__ == "__main__":

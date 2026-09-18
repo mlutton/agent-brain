@@ -448,8 +448,11 @@ def _prepare_create(request, path, root, base_dir, zone, current_bytes):
 
     mapping = dict(frontmatter_fields)
     mapping["kb"] = 1
-    if "id" not in mapping or not mapping.get("id"):
-        mapping["id"] = _mint_id()
+    # A7: persist mints the id itself on every create -- C6's request shape
+    # carries no `id` field, and C4 requires an id minted once, never derived
+    # from the path or accepted from a caller. Any `id` a caller supplied in
+    # `frontmatter` is discarded, not merely defaulted.
+    mapping["id"] = _mint_id()
 
     if mapping.get("origin") == "unknown":
         return {"refused": "review_required"}

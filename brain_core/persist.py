@@ -21,6 +21,7 @@ already passes its own tests, and touching a working module outside the TDD
 loop that owns it is a refactor, not a behaviour change.
 """
 
+import datetime
 import os
 import signal
 
@@ -240,21 +241,31 @@ def _apply_create_or_attach(temp_path, target_path):
     os.link(temp_path, target_path)
 
 
-def _apply_update(root, temp_path, target_path, backup_dir):
-    os.makedirs(backup_dir, exist_ok=True)
-    backup_path = os.path.join(backup_dir, gitutil.hash_text(target_path) + ".bak")
+def _apply_update(temp_path, target_path, backup_path):
+    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
     with open(target_path, "rb") as fh:
         current_bytes = fh.read()
     with open(backup_path, "wb") as fh:
         fh.write(current_bytes)
     os.replace(temp_path, target_path)
-    return backup_path
 
 
-def _write_temp(directory, content_bytes):
-    os.makedirs(directory, exist_ok=True)
+def _plan_temp_path(directory):
+    """Decides the temp file's path before it is written (C6 step 2 needs it
+    recorded in the intent before step 3 creates it)."""
     temp_name = f".brain-persist-tmp-{os.getpid()}-{_mint_id()}"
-    temp_path = os.path.join(directory, temp_name)
+    return os.path.join(directory, temp_name)
+
+
+def _plan_backup_path(root, target_path):
+    """Decides update's backup path before it exists, same reasoning as
+    `_plan_temp_path`; create/attach have no backup (C6 step 5)."""
+    backup_dir = os.path.join(root, ".brain", "state", "backups")
+    return os.path.join(backup_dir, gitutil.hash_text(target_path) + ".bak")
+
+
+def _write_temp(temp_path, content_bytes):
+    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
     fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -267,7 +278,6 @@ def _write_temp(directory, content_bytes):
         except OSError:
             pass
         raise
-    return temp_path
 
 
 def _remove_if_exists(path):
@@ -275,6 +285,43 @@ def _remove_if_exists(path):
         os.remove(path)
     except FileNotFoundError:
         pass
+
+
+def _failed_before_apply(temp_path):
+    """F6 (Owner ruling): report `temp_path` only when a temp file genuinely
+    remains after this failure's own cleanup -- a path to a file already
+    deleted reports nothing true."""
+    doc = {"outcome": "failed_before_apply"}
+    if temp_path is not None and os.path.exists(temp_path):
+        doc["temp_path"] = temp_path
+    return doc, 3
+
+
+def _normalize_dates(value):
+    """Reduces a `datetime.date` (never `datetime.datetime`, which the
+    canonical form never emits unquoted) to its ISO string, recursively,
+    so a YAML 1.1 reparse of a date field compares equal to the plain
+    string the caller supplied (F2)."""
+    if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _normalize_dates(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_dates(item) for item in value]
+    return value
+
+
+def _allowed_zone(root, base_dir, zone):
+    """F3: attach had no zone check at all, unlike create/update which at
+    least route through a document type's declared `zones`. A write path
+    that reaches `.brain/types/custom/` lets content edit the rules that
+    validate content (C2 separates data zones from `.brain/`), so attach is
+    confined to the same durable data zones or installed module folders any
+    document type may declare (spec: "any durable data zone or module
+    folder")."""
+    if zone in _DATA_ZONES:
+        return True
+    return zone in typedefs.detect_installed_modules(root).values()
 
 
 def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
@@ -302,6 +349,8 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
     current_bytes = _read_current(root, path)
 
     if operation == "attach":
+        if not _allowed_zone(root, base_dir, zone):
+            return _refused("invalid")
         outcome = _prepare_attach(request, path, current_bytes)
     else:
         outcome = _prepare_document(request, operation, path, root, base_dir, zone, current_bytes, yaml_module, duplicate_loader)
@@ -317,6 +366,12 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
     target_full = os.path.join(root, path)
     target_dir = os.path.dirname(target_full)
 
+    # F4: both paths are decided now, before either file exists, so C6 step
+    # 2's intent record can name them -- `recover` needs them to close an
+    # intent and remove its temp without reconstructing either.
+    temp_path = _plan_temp_path(target_dir)
+    backup_path = _plan_backup_path(root, target_full) if operation == "update" else None
+
     intent_record = {
         "run_id": run_id,
         "op_key": op_key,
@@ -324,22 +379,25 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
         "path": path,
         "expected_prior": expected_prior,
         "intended_sha256": intended_sha256,
+        "temp_path": temp_path,
+        "backup_path": backup_path,
     }
     _write_intent(root, path, intent_record)
     _check_fault("after_intent")
 
     try:
-        temp_path = _write_temp(target_dir, intended_bytes)
+        _write_temp(temp_path, intended_bytes)
     except OSError:
+        _remove_if_exists(temp_path)
         _remove_intent(root, path)
-        return {"outcome": "failed_before_apply", "temp_path": None}, 3
+        return _failed_before_apply(temp_path)
 
     with open(temp_path, "rb") as fh:
         written_hash = gitutil.hash_bytes(fh.read())
     if written_hash != intended_sha256:
         _remove_if_exists(temp_path)
         _remove_intent(root, path)
-        return {"outcome": "failed_before_apply", "temp_path": None}, 3
+        return _failed_before_apply(temp_path)
 
     _check_fault("after_temp")
 
@@ -358,17 +416,21 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
     _check_conflict_injection(root, path, target_full)
     _check_fault("before_apply")
 
-    backup_path = None
     try:
         if operation in ("create", "attach"):
             _apply_create_or_attach(temp_path, target_full)
+            # F1: nothing removed the temp after a successful hard link, so
+            # every create/attach left a hidden `.brain-persist-tmp-*`
+            # sibling behind -- a C6 `orphan_temp` in waiting, and a dirty
+            # git brain after every write. `update` already consumes its
+            # temp via `os.replace`.
+            _remove_if_exists(temp_path)
         else:
-            backup_dir = os.path.join(root, ".brain", "state", "backups")
-            backup_path = _apply_update(root, temp_path, target_full, backup_dir)
+            _apply_update(temp_path, target_full, backup_path)
     except OSError:
         _remove_if_exists(temp_path)
         _remove_intent(root, path)
-        return {"outcome": "failed_before_apply", "temp_path": temp_path}, 3
+        return _failed_before_apply(temp_path)
 
     _check_fault("after_apply")
 
@@ -554,13 +616,18 @@ def _prepare_update(request, path, root, base_dir, zone, current_bytes, yaml_mod
     # ever rewrites the named field's own span) plus guard 2 below, which
     # would fail if unrelated content had drifted.
 
-    # Guard 2: a re-parse of the new block equals the intended mapping.
+    # Guard 2: a re-parse of the new block equals the intended mapping. A
+    # date field (F2) is the one documented reader difference (C4): the
+    # YAML 1.1 loader used here reads an unquoted `YYYY-MM-DD` as a `date`
+    # object, while the caller's intended value is the plain string it
+    # supplied -- normalize both sides to comparable forms rather than
+    # comparing a `date` to a string that can never equal it.
     try:
         reparsed_docs = list(yaml_module.load_all(new_block_text, Loader=duplicate_loader))
     except yaml_module.YAMLError:
         return {"refused": "unsupported_frontmatter"}
     reparsed = reparsed_docs[0] if reparsed_docs else {}
-    if reparsed != intended_mapping:
+    if _normalize_dates(reparsed) != _normalize_dates(intended_mapping):
         return {"refused": "unsupported_frontmatter"}
 
     errors = _mapping_errors(intended_mapping, root, base_dir, zone)

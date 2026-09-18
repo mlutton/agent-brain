@@ -133,6 +133,25 @@ class CreateTests(PersistTestCase):
         change_records = os.listdir(os.path.join(self.root, ".brain", "journal", "change_records"))
         self.assertEqual(len(change_records), 1)
 
+    def test_create_leaves_no_temp_file_sibling_in_target_directory(self):
+        """F1: `_apply_create_or_attach` hard-links the temp onto the target
+        and nothing removed the temp afterwards, so every successful create
+        left a hidden `.brain-persist-tmp-<pid>-<ulid>` sibling behind.
+        Assert the whole directory listing, not merely the temp prefix's
+        absence -- a listing check still catches the defect even if the
+        prefix ever changes."""
+        request = {
+            "operation": "create",
+            "path": "documents/notemp/notemp.md",
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body text.\n",
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(doc["outcome"], "written", doc)
+
+        target_dir = os.path.join(self.root, "documents/notemp")
+        self.assertEqual(os.listdir(target_dir), ["notemp.md"])
+
     def test_second_create_on_same_path_is_refused_exists_and_file_unchanged(self):
         """P2: a second create on the same path returns refused (exists), the
         file is unchanged, and there is no code path that overwrites."""
@@ -187,6 +206,10 @@ class CreateTests(PersistTestCase):
         )
         doc = support.parse_single_json(proc.stdout)
         self.assertEqual(doc["outcome"], "failed_before_apply", doc)
+        # F6 (Owner ruling): the temp file this failure's own cleanup just
+        # removed is genuinely gone, so `temp_path` must not be reported at
+        # all -- a path to an already-deleted file reports nothing true.
+        self.assertNotIn("temp_path", doc, doc)
 
         full = os.path.join(self.root, path)
         with open(full, "rb") as fh:
@@ -274,6 +297,35 @@ class UpdateTests(PersistTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertNotEqual(doc["version"], created["version"])
 
+    def test_update_of_date_field_is_written_and_reparses_to_new_date(self):
+        """F2: `_prepare_update`'s guard 2 re-parses the rendered block with
+        the YAML 1.1 loader, which reads an unquoted `YYYY-MM-DD` as a `date`
+        object, and compares it to the caller's string -- they never compare
+        equal, so every update of a date field (`reviewed`, `created`,
+        `fresh_until`, `first_seen`, `decided`) was refused
+        unsupported_frontmatter. The README documents `update` applying any
+        named property, so this must actually work."""
+        created = self._create("documents/dateupd/dateupd.md")
+        update_request = {
+            "operation": "update",
+            "path": "documents/dateupd/dateupd.md",
+            "expected_version": created["version"],
+            "frontmatter": {"reviewed": "2026-03-01"},
+        }
+        proc, doc = self.persist(update_request)
+        self.assertEqual(doc["outcome"], "written", doc)
+        self.assertEqual(proc.returncode, 0)
+
+        full = os.path.join(self.root, "documents/dateupd/dateupd.md")
+        with open(full, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        block = _frontmatter_block(text)
+
+        under_11 = next(iter(_yaml_module.load_all(block, Loader=_yaml_module.SafeLoader)))
+        under_12 = next(iter(_yaml_module.load_all(block, Loader=_YAML12_LOADER)))
+        self.assertEqual(under_11["reviewed"], datetime.date(2026, 3, 1))
+        self.assertEqual(under_12["reviewed"], "2026-03-01")
+
 
 class AttachTests(PersistTestCase):
     """P4: an attachment persists with its hash recorded and matching."""
@@ -297,6 +349,27 @@ class AttachTests(PersistTestCase):
             actual = fh.read()
         self.assertEqual(actual, content)
         self.assertEqual(doc["version"], hashlib.sha256(content).hexdigest())
+
+    def test_attach_outside_data_zones_is_refused_and_writes_nothing(self):
+        """F3: no zone check exists for `attach`; `_DATA_ZONES` is defined in
+        persist.py and never used. An attach to `.brain/types/custom/evil.json`
+        must be refused rather than writing into the custom type definitions
+        that drive validation -- that write path lets content edit the rules
+        that validate content. Cover both `.brain/` and the brain root."""
+        import base64
+
+        content = base64.b64encode(b"evil bytes").decode("ascii")
+
+        for path in (".brain/types/custom/evil.json", "evil-at-root.md"):
+            with self.subTest(path=path):
+                request = {
+                    "operation": "attach",
+                    "path": path,
+                    "content_base64": content,
+                }
+                proc, doc = self.persist(request)
+                self.assertEqual(doc["outcome"], "refused", doc)
+                self.assertFalse(os.path.exists(os.path.join(self.root, path)))
 
 
 class AttachGitBrainTests(PersistTestCase):
@@ -357,6 +430,71 @@ class OpenIntentTests(PersistTestCase):
         proc2, doc2 = self.persist(request)
         self.assertEqual(doc2, {"outcome": "refused", "reason": "open_intent"})
         self.assertEqual(proc2.returncode, 2)
+
+    def test_intent_record_carries_temp_path_and_backup_path(self):
+        """F4: C6 step 2 lists run_id, op_key, path, expected_prior,
+        intended_sha256, temp path, backup path -- the record written
+        carried only the first five. Both the temp path and the backup path
+        are decided before step 2 runs (before either file exists), so both
+        must be computed and recorded at intent-write time. A create has no
+        backup path (only update backs up); an update has both."""
+        create_path = "documents/intentcreate/intentcreate.md"
+        create_request = {
+            "operation": "create",
+            "path": create_path,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        proc = support.run_brain(
+            ["persist", "--root", self.root],
+            input_data=json.dumps(create_request),
+            env=dict(os.environ, BRAIN_TEST_FAULTS="1", BRAIN_FAULT="after_intent:kill"),
+        )
+        self.assertLess(proc.returncode, 0, proc)
+        intent_dir = os.path.join(self.root, ".brain", "journal", "intents")
+        intent_files = os.listdir(intent_dir)
+        self.assertEqual(len(intent_files), 1)
+        with open(os.path.join(intent_dir, intent_files[0]), "r", encoding="utf-8") as fh:
+            create_intent = json.load(fh)
+        self.assertIn("temp_path", create_intent)
+        self.assertTrue(create_intent["temp_path"])
+        self.assertIn("backup_path", create_intent)
+        self.assertIsNone(create_intent["backup_path"])
+        os.remove(os.path.join(intent_dir, intent_files[0]))
+
+        update_path = "documents/intentupdate/intentupdate.md"
+        created = self._create(update_path)
+        update_request = {
+            "operation": "update",
+            "path": update_path,
+            "expected_version": created["version"],
+            "frontmatter": {"status": "complete"},
+        }
+        proc = support.run_brain(
+            ["persist", "--root", self.root],
+            input_data=json.dumps(update_request),
+            env=dict(os.environ, BRAIN_TEST_FAULTS="1", BRAIN_FAULT="after_intent:kill"),
+        )
+        self.assertLess(proc.returncode, 0, proc)
+        intent_files = os.listdir(intent_dir)
+        self.assertEqual(len(intent_files), 1)
+        with open(os.path.join(intent_dir, intent_files[0]), "r", encoding="utf-8") as fh:
+            update_intent = json.load(fh)
+        self.assertIn("temp_path", update_intent)
+        self.assertTrue(update_intent["temp_path"])
+        self.assertIn("backup_path", update_intent)
+        self.assertTrue(update_intent["backup_path"])
+
+    def _create(self, path):
+        request = {
+            "operation": "create",
+            "path": path,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        _, doc = self.persist(request)
+        self.assertEqual(doc["outcome"], "written", doc)
+        return doc
 
 
 class ReviewRequiredTests(PersistTestCase):

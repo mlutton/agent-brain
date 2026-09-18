@@ -12,12 +12,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BRAIN = os.path.join(REPO_ROOT, "bin", "brain")
 
 
-def run_brain(args, isolated=True, env=None):
+def run_brain(args, isolated=True, env=None, input_data=None):
     if isolated:
         cmd = [sys.executable, "-B", "-S", "-E", BRAIN] + list(args)
     else:
         cmd = [sys.executable, "-B", BRAIN] + list(args)
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=env, check=False)
+    proc = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=env, input=input_data, check=False
+    )
     return proc
 
 

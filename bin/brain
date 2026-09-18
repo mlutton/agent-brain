@@ -77,7 +77,7 @@ def main(argv):
         print(json.dumps(report))
         return code
 
-    if subcommand != "validate":
+    if subcommand not in ("validate", "persist"):
         return _refuse("not_implemented")
 
     root = options.get("--root")
@@ -98,11 +98,46 @@ def main(argv):
 
     duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
 
+    if subcommand == "persist":
+        request = _read_request(options)
+        if request is None:
+            return _refuse("invalid_request")
+
+        from brain_core import persist
+
+        try:
+            report, code = persist.run_persist(request, root, _BASE_DIR, yaml_module, duplicate_loader)
+        except Exception:
+            # Mirrors setup's own boundary (C1): an unhandled persist error
+            # stays inside the single-JSON-object envelope, exit 1, rather
+            # than an escaping traceback. Refusals, failed_before_apply,
+            # written, written_incomplete and target_unexpected are all
+            # ordinary return values from run_persist, never exceptions, so
+            # this boundary cannot swallow them.
+            report, code = {"outcome": "error"}, 1
+        print(json.dumps(report))
+        return code
+
     from brain_core import validate
 
     report = validate.run_validate(root, _BASE_DIR, yaml_module, duplicate_loader)
     print(json.dumps(report))
     return 0 if report["outcome"] == "valid" else 3
+
+
+def _read_request(options):
+    """Reads the C1 structured-input JSON: --input <file>, else stdin."""
+    input_path = options.get("--input")
+    try:
+        if isinstance(input_path, str):
+            with open(input_path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        else:
+            text = sys.stdin.read()
+        data = json.loads(text)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 if __name__ == "__main__":

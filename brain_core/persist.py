@@ -19,6 +19,16 @@ sites -- setup.py, once ST-06/later stories land, and persist.py, now), not
 a hypothetical one. `setup.py` itself is left unchanged this round: it
 already passes its own tests, and touching a working module outside the TDD
 loop that owns it is a refactor, not a behaviour change.
+
+A second interface lives beside `run_persist`, for `brain_core/recover.py`: the
+intent journal, the temp-file naming, the change record and the commit, each
+in the one form persist writes them, under public names. It exists so that
+recovery finishes an interrupted write by calling the same code that would have
+finished it, and never keeps its own copy of the record shape, the intent path
+scheme or the trailer format. Those names are: `journal_present`,
+`open_intents`, `close_intent`, `TEMP_PREFIX`, `is_temp_name`, `DATA_ZONES`,
+`change_record_exists`, `record_change`, `is_git_brain`, `commit_exists` and
+`commit_write`.
 """
 
 import datetime
@@ -33,7 +43,12 @@ _ID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"  # Crockford base32, lowercase
 FAULT_ENV = "BRAIN_TEST_FAULTS"
 FAULT_VAR = "BRAIN_FAULT"
 
-_DATA_ZONES = ("inbox", "raw", "documents", "wiki")
+DATA_ZONES = ("inbox", "raw", "documents", "wiki")
+
+# The temp file persist writes beside its target (C6 step 3). The name is
+# contract: `recover` reports any file carrying it that no open intent owns as
+# an `orphan_temp`, so persist and recover both read it from here.
+TEMP_PREFIX = ".brain-persist-tmp-"
 
 
 class _Fault(Exception):
@@ -110,7 +125,7 @@ def _zone_of(path):
     return path.split("/", 1)[0]
 
 
-def _journal_present(root):
+def journal_present(root):
     epoch_path = os.path.join(root, ".brain", "journal", "epoch.json")
     if not os.path.isfile(epoch_path):
         return False
@@ -153,6 +168,55 @@ def _remove_intent(root, path):
         pass
 
 
+_INTENT_FIELDS = {
+    "run_id": str,
+    "op_key": str,
+    "operation": str,
+    "path": str,
+    "expected_prior": str,
+    "intended_sha256": str,
+    "temp_path": str,
+}
+
+
+def _well_formed_intent(record):
+    """True when `record` carries every field C6 step 2 records, with the right
+    types. `backup_path` is a string or null (only `update` backs up)."""
+    if not isinstance(record, dict):
+        return False
+    for name, kind in _INTENT_FIELDS.items():
+        if not isinstance(record.get(name), kind):
+            return False
+    return record.get("backup_path") is None or isinstance(record.get("backup_path"), str)
+
+
+def open_intents(root):
+    """Every open intent in the journal, as `(file_name, record)` sorted by
+    file name. `record` is the intent as persist wrote it, or None when the
+    file cannot be read as JSON or lacks a field C6 step 2 records -- an intent
+    the caller must not act on but must not lose sight of either."""
+    directory = _intents_dir(root)
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            record = gitutil.read_json(os.path.join(directory, name))
+        except (OSError, ValueError):
+            record = None
+        found.append((name, record if _well_formed_intent(record) else None))
+    return found
+
+
+def close_intent(root, path):
+    """Removes the intent for `path` (one file per data-zone path)."""
+    _remove_intent(root, path)
+
+
 def _write_change_record(root, op_key, record):
     directory = _change_records_dir(root)
     os.makedirs(directory, exist_ok=True)
@@ -160,6 +224,27 @@ def _write_change_record(root, op_key, record):
     if os.path.isfile(path):
         return  # at most one change record per op_key (C6)
     gitutil.write_json(path, record)
+
+
+def change_record_exists(root, op_key):
+    return os.path.isfile(os.path.join(_change_records_dir(root), op_key + ".json"))
+
+
+def record_change(root, intent, applied_hash):
+    """C6 step 7's change record for the write `intent` describes, once per
+    `op_key`: a record that already exists is left exactly as it is."""
+    _write_change_record(
+        root,
+        intent["op_key"],
+        {
+            "op_key": intent["op_key"],
+            "operation": intent["operation"],
+            "run_id": intent["run_id"],
+            "path": intent["path"],
+            "sha256": applied_hash,
+            "prior": intent["expected_prior"],
+        },
+    )
 
 
 def _read_current(root, path):
@@ -235,6 +320,40 @@ def _commit_trailers(op, run_id, path_entries, grant=None):
     return "\n".join(lines)
 
 
+def is_git_brain(root):
+    return os.path.isdir(os.path.join(root, ".git"))
+
+
+def commit_exists(root, op_key):
+    """True when a commit reachable from HEAD carries `Brain-Key: <op_key>` as
+    a line of its final trailer paragraph (C7). Raises RuntimeError when git
+    cannot answer, so a caller never commits on the strength of a guess."""
+    if gitutil.run_git(["rev-parse", "--verify", "-q", "HEAD"], root).returncode != 0:
+        return False  # a repository with no commits has no commit for any key
+    proc = gitutil.run_git(
+        ["log", "-F", "--grep", f"Brain-Key: {op_key}", "--format=%B%x00"], root
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("git log failed")
+    for message in proc.stdout.split("\0"):
+        paragraphs = message.strip().split("\n\n")
+        if f"Brain-Key: {op_key}" in paragraphs[-1].splitlines():
+            return True
+    return False
+
+
+def commit_write(root, intent, applied_hash, grant=None):
+    """C6 step 7's commit for the write `intent` describes: exactly its own
+    path, with the C7 trailers. Callers decide whether one is due."""
+    path_entry = f"{intent['path']} sha256={applied_hash} prior={intent['expected_prior']}"
+    trailer_paths = {"keys": [intent["op_key"]], "paths": [path_entry]}
+    gitutil.commit_paths(
+        root,
+        [intent["path"]],
+        _commit_trailers(intent["operation"], intent["run_id"], trailer_paths, grant=grant),
+    )
+
+
 def _apply_create_or_attach(temp_path, target_path):
     """Hard-links temp onto target; the link fails (no fallback) if target
     already exists (C6 step 5)."""
@@ -250,10 +369,15 @@ def _apply_update(temp_path, target_path, backup_path):
     os.replace(temp_path, target_path)
 
 
+def is_temp_name(name):
+    """True when a file name is one persist gives its temp files."""
+    return name.startswith(TEMP_PREFIX)
+
+
 def _plan_temp_path(directory):
     """Decides the temp file's path before it is written (C6 step 2 needs it
     recorded in the intent before step 3 creates it)."""
-    temp_name = f".brain-persist-tmp-{os.getpid()}-{_mint_id()}"
+    temp_name = f"{TEMP_PREFIX}{os.getpid()}-{_mint_id()}"
     return os.path.join(directory, temp_name)
 
 
@@ -319,7 +443,7 @@ def _allowed_zone(root, base_dir, zone):
     confined to the same durable data zones or installed module folders any
     document type may declare (spec: "any durable data zone or module
     folder")."""
-    if zone in _DATA_ZONES:
+    if zone in DATA_ZONES:
         return True
     return zone in typedefs.detect_installed_modules(root)[0].values()
 
@@ -337,7 +461,7 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
     if not isinstance(path, str) or not path or path.startswith("/") or ".." in path.split("/"):
         return _refused("invalid_request")
 
-    if not _journal_present(root):
+    if not journal_present(root):
         return _refused("journal_missing")
 
     if _has_open_intent(root, path):
@@ -453,35 +577,17 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
         if request["frontmatter"].get("authored_by") == "agent":
             grant_id = _mint_id()
 
-    path_entry = f"{path} sha256={applied_hash} prior={expected_prior}"
-    trailer_paths = {"keys": [op_key], "paths": [path_entry]}
-
     pending = []
     change_record_done = False
     commit_done = False
     try:
         _check_fault("before_change_record")
-        _write_change_record(
-            root,
-            op_key,
-            {
-                "op_key": op_key,
-                "operation": operation,
-                "run_id": run_id,
-                "path": path,
-                "sha256": applied_hash,
-                "prior": expected_prior,
-            },
-        )
+        record_change(root, intent_record, applied_hash)
         change_record_done = True
 
         _check_fault("before_commit")
-        if os.path.isdir(os.path.join(root, ".git")):
-            gitutil.commit_paths(
-                root,
-                [path],
-                _commit_trailers(operation, run_id, trailer_paths, grant=grant_id),
-            )
+        if is_git_brain(root):
+            commit_write(root, intent_record, applied_hash, grant=grant_id)
         commit_done = True
     except _Fault:
         if not change_record_done:

@@ -8,12 +8,35 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BRAIN = os.path.join(REPO_ROOT, "bin", "brain")
 
 
+def _inside(path, folder):
+    return os.path.commonpath([path, folder]) == folder
+
+
+def assert_temp_root(root):
+    """Refuses a brain root that is not strictly inside the system temp
+    directory, or that is (or resolves to somewhere) inside this repository.
+    `recover` and `persist` mutate their root, so a test that named a real brain
+    would change it for real. Symbolic links are resolved first."""
+    resolved = os.path.realpath(root)
+    temp = os.path.realpath(tempfile.gettempdir())
+    if resolved == temp or not _inside(resolved, temp) or _inside(resolved, os.path.realpath(REPO_ROOT)):
+        raise AssertionError(f"test root is not a temporary directory outside the repository: {root!r}")
+
+
+def _assert_roots_are_temporary(args):
+    for index, arg in enumerate(args[:-1]):
+        if arg == "--root":
+            assert_temp_root(args[index + 1])
+
+
 def run_brain(args, isolated=True, env=None, input_data=None, timeout=None):
+    _assert_roots_are_temporary(args)
     if isolated:
         cmd = [sys.executable, "-B", "-S", "-E", BRAIN] + list(args)
     else:
@@ -58,6 +81,7 @@ def disposable_runtime(owned_dir, include_brain_core=True, break_module=None):
 
 def run_runtime_brain(runtime, args):
     """Runs the disposable runtime's own `bin/brain`, isolated like run_brain."""
+    _assert_roots_are_temporary(args)
     cmd = [sys.executable, "-B", "-S", "-E", os.path.join(runtime, "bin", "brain")] + list(args)
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 

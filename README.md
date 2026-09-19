@@ -4,7 +4,7 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 
 ## Current status
 
-**Specification accepted; document validation, setup and single-file persist implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). `python3 bin/brain setup --starter <checkout> --target <folder> [--git] [--module projects]` creates a new brain from a clean starter checkout (ST-04). `python3 bin/brain persist --root <brain>` creates, updates and attaches one file at a time per C6 (ST-02) — see [Persist](#persist) below. Everything else described in the specification below should still be assumed not to work today.
+**Specification accepted; document validation, setup, single-file persist and interrupted-write recovery implemented.** `python3 bin/brain validate --root <brain>` scans a brain's Markdown documents and reports a single JSON object per the specification's C5, C5a and C15 decisions (ST-01). `python3 bin/brain setup --starter <checkout> --target <folder> [--git] [--module projects]` creates a new brain from a clean starter checkout (ST-04). `python3 bin/brain persist --root <brain>` creates, updates and attaches one file at a time per C6 (ST-02) — see [Persist](#persist) below. `python3 bin/brain recover --root <brain>` classifies every intent an interrupted persist left open and finishes the missing bookkeeping exactly once (ST-03) — see [Recover](#recover) below. Everything else described in the specification below should still be assumed not to work today.
 
 | Capability | State |
 | --- | --- |
@@ -13,7 +13,8 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 | Document validation | Implemented (`brain validate`; ST-01) |
 | Setup | Implemented (`brain setup`; ST-04) — see [Setup](#setup) below |
 | Single-file persist (create, update, attach) | Implemented (`brain persist`; ST-02) — see [Persist](#persist) below |
-| Index bookkeeping, `recover`, discovery, read, audit, ingestion, projects module data/integration, Claude skills | Not started |
+| Interrupted-write recovery (`brain recover`, plain mode) | Implemented (ST-03) — see [Recover](#recover) below |
+| Index bookkeeping, `recover --restore-retained` and `--start-journal`, discovery, read, audit, ingestion, projects module data/integration, Claude skills | Not started |
 | Codex entry path | Not started; optional for the beta, claimed only once demonstrated |
 
 ## Persist
@@ -27,7 +28,20 @@ An Obsidian-compatible knowledge workspace for people who work with coding agent
 - Persist mints the document's id itself on every `create`; refuses `open_intent` on a path with unresolved interrupted work, `review_required` on a non-reviewed write of `origin: unknown`, `unsupported_version` on a `kb` value other than 1, and `journal_missing` while the brain's operation journal is absent.
 - Every document persist writes re-parses to its intended values under both the vendored YAML 1.1 parser and a YAML 1.2 core-schema reading (the one documented difference is an unquoted date, read as a date under 1.1 and as a string under 1.2; both are accepted).
 
-**Honest limits, as shipped today:** the `target_unexpected` outcome and `recover` (interrupted-write recovery, and the `--restore-retained` path) are ST-03's, not this story's — `persist` never retries after an unexpected target, and reaching that state today leaves the brain requiring ST-03 to resolve it. Index bookkeeping (C8) is ST-06's; `written_incomplete`'s pending list never names `index` before then. `brain grant`, maintenance-grant validity and invalidation are out of scope; persist only records a create-time grant trailer for an agent-authored document. `discover`, `read`, `audit` and `ingest` do not exist yet, so nothing published by persist is yet findable except by reading the brain's files directly.
+**Honest limits, as shipped today:** `persist` never retries after an unexpected target, and its own `target_unexpected` outcome cannot be reached through the command line today ([#37](https://github.com/mlutton/agent-brain/issues/37)); the state it stands for is observed from `recover`, below. Index bookkeeping (C8) is ST-06's; `written_incomplete`'s pending list never names `index` before then. `brain grant`, maintenance-grant validity and invalidation are out of scope; persist only records a create-time grant trailer for an agent-authored document. `discover`, `read`, `audit` and `ingest` do not exist yet, so nothing published by persist is yet findable except by reading the brain's files directly.
+
+## Recover
+
+`brain recover --root <brain>` takes no request body. It reads every open intent in the journal, compares each one's target with the hashes the intent recorded, and prints one JSON object (C6; the report shape is under "Recover report" in the specification):
+
+- `not_applied` (the target still matches its prior state, and does not hold the intended bytes): the intent is closed and its temp file removed. `kill` at `after_intent` and `before_apply` lands here.
+- `applied` (the target holds the intended bytes; this is tested first, so an update that changed no bytes counts as applied): the missing bookkeeping is finished exactly once. A change record is written only if none exists for the `op_key`, and a commit is made only if no commit in `HEAD`'s history already carries that `op_key`, so running recovery again, or after a `written_incomplete`, never adds a second of either. `kill` at `after_apply` and `fail` at `before_change_record` or `before_commit` land here. If a step still cannot be finished, the intent stays open and the report's outcome is `recovery_incomplete`; on that intent the signal is an `applied` entry with a non-empty `pending`.
+- `target_unexpected` (the target matches neither): reported with the observed hash and the backup path (`null` for `create` and `attach`, which never take a backup). **Recovery does not resolve this state.** It cannot tell what happened, so it overwrites nothing, closes nothing, and keeps reporting the intent on every run; the path stays locked against `persist` (`open_intent`) until a person deals with the file and the intent.
+- `orphan_temps` lists temp files no intent owns. They are reported and left in place, and they never change the outcome.
+
+The aggregate `outcome` is `target_unexpected` (exit 3) over `recovery_incomplete` (exit 3) over `recovered` (exit 0); no open intent is `recovered`. `recovery_incomplete` is an outcome only, never an intent's classification.
+
+**Honest limits, as shipped today:** `run_pending` is defined but never reported, because it needs a run manifest and nothing creates one before ingestion. `recover --restore-retained` and `--start-journal` are refused `not_implemented`. A recovered commit carries no `Brain-Grant` trailer, so an interrupted agent-authored `create` needs `brain grant` to get one. Index bookkeeping does not exist yet, so recovery finishes only the change record and the commit. A temp file left beside an already-applied target is not removed, and is reported as an orphan once its intent closes. Git refuses a commit that changes no bytes, so an applied update that changed none has its change record written but its commit stays `pending`: the outcome is `recovery_incomplete` and the intent stays open. Recovery assumes one writer per brain (C6).
 
 ## Setup
 
@@ -72,6 +86,7 @@ Planned work and its status are tracked in this repository's [issues](https://gi
 - Public content is freshly authored; examples are synthetic. Third-party code is added only as a pinned, vendored library with its licence, named in the specification.
 - Run the full check suite with `python3 -B -m unittest discover -s tests -t .` from the repository root. `-B` stops the interpreter writing bytecode caches so a test run leaves the tree exactly as it found it.
 - Tests exercise `bin/brain` only as a subprocess (`[sys.executable, "-B", "-S", "-E", "bin/brain", …]`), against fixture brains written as literal text into temporary directories; no test imports a product module or mocks the filesystem. A behaviour is proven by showing its test fail first — write the test, watch it fail (or mutate the code/fixture to observe the failure), then make it pass.
+- Tests that interrupt a write do it only through the specification's `BRAIN_TEST_FAULTS` / `BRAIN_FAULT` variables on a real `persist` run, show that the injection landed (the process died by SIGKILL, or reported `written_incomplete`, and the disk holds what that leaves) before claiming anything about recovery, and register their fixture's removal before building it so a failing or killed run leaves nothing behind.
 - Every check asserts on outcomes a user could observe: the JSON on stdout, the exit code, and the brain's files and hashes before and after — never on internal module structure.
 - Error assertions compare the full error multiset by exact equality (`tests/support.py`'s `errors_multiset`/`assert_errors`, backed by `collections.Counter`), not a subset check — a spurious extra error must fail a test, not pass it silently.
 - Document-set assertions compare the full set of `documents` paths a report returns, not a subset.

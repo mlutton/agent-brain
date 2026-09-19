@@ -1,8 +1,8 @@
 # agent-brain beta specification
 
-Version: c091dbf81f4579e9e1e095e762f5f0103dcb30f2acc1c38585ab7138167032b0
+Version: bba7a2e64a0bf2b2cba2c85a78e3fa90e052b65bd880dff47abf96ceb85c54a5
 Publication: published — accepted by merge of #2
-Status: **Accepted specification; not implemented.** Nothing described here exists yet. Delivery stories are opened as issues referencing this version.
+Status: **Accepted specification.** This line records acceptance, not delivery: what is implemented is tracked in the issues that reference this version, and this document makes no claim about it. Delivery stories are opened as issues referencing this version.
 
 This document is the shared contract for the agent-brain beta. Delivery stories reference it by the version above (a SHA-256 over this document from the first `##` heading to the end) and by part — for example "Behaviour 12–15" or "Decision C5" — rather than restating it. Repository topology is recorded separately in [ADR 0001](../adr/0001-repository-topology.md).
 
@@ -161,7 +161,7 @@ Each decision is numbered (C1…C17, with C5a and C13a) so stories can reference
   - Changing the version or files is a change to this record.
 - One command-line entry point, `brain`, with subcommands `setup`, `validate`, `persist`, `recover`, `rebuild`, `discover`, `read`, `audit`, `ingest`, `grant`. It is invoked as `python3 bin/brain` from the starter repository root (development and tests) and as `python3 .brain/bin/brain` inside a brain; nothing is installed.
 - Every subcommand except `setup` requires `--root <brain>`; the root is never inferred from the working directory. Structured input is a JSON document on stdin or `--input <file>`. Output is exactly one JSON object on stdout carrying `outcome`.
-- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `not_published`, and `invalid` from `validate`); `1` an unhandled error or a `vendored_dependency` failure. The JSON `outcome` is authoritative; exit codes are a convenience.
+- Exit codes: `0` a defined non-refusal outcome (including `no_match`, `partial`, `duplicate`); `2` `refused` or invalid request — nothing changed; `3` an outcome needing attention (`failed_before_apply`, `written_incomplete`, `target_unexpected`, `recovery_incomplete`, `not_published`, and `invalid` from `validate`); `1` an unhandled error or a `vendored_dependency` failure. The JSON `outcome` is authoritative; exit codes are a convenience.
 
 ### C2. Brain layout and folder categories
 
@@ -377,7 +377,39 @@ Request: `{operation: create|update|attach, path, frontmatter?, body?, content_b
 
 Stated limitation: the beta assumes one writer per brain. A write by another process between step 4 and step 5 of an `update` can be overwritten; the backup preserves displaced content only if that write landed before the backup.
 
-`recover`: for each open intent — target matches `expected_prior` → `not_applied` (close intent, remove temp); target matches `intended_sha256` → `applied` (finish missing bookkeeping exactly once, checking for an existing change record and an existing commit carrying the same `op_key`); otherwise → `target_unexpected`. A temp file with no intent → `orphan_temp`. Intents that carry a run's `run_id` belong to that run's manifest: `recover` classifies them and reports `run_pending`, but makes no per-file change record or commit. Only an `ingest` retry of the same run, or `abandon`, completes or closes them. The open-intent refusal (Behaviour 21) does not apply to an `ingest` retry of the run that owns the intents.
+`recover`: for each open intent, the target is tested against `intended_sha256` first — a match → `applied` (finish missing bookkeeping exactly once, checking for an existing change record and an existing commit carrying the same `op_key`); otherwise a match with `expected_prior` → `not_applied` (close intent, remove temp); otherwise → `target_unexpected`. The order is part of the rule and matters when the two hashes are equal, as when an `update` sets a property to the value it already holds: the target then holds the intended bytes whether or not the replace ran, so it is `applied`. `not_applied` there would discard a change record and commit that an applied write is owed. A temp file with no intent → `orphan_temp`. Intents that carry a run's `run_id` belong to that run's manifest: `recover` classifies them and reports `run_pending`, but makes no per-file change record or commit. Only an `ingest` retry of the same run, or `abandon`, completes or closes them. The open-intent refusal (Behaviour 21) does not apply to an `ingest` retry of the run that owns the intents.
+
+**Recover report.** `brain recover --root <brain>` prints exactly one JSON object (C1). It takes no request body. Its `--restore-retained` and `--start-journal` modes are specified in C6 and C8 and have their own results; this report is for the plain command.
+
+```json
+{
+  "outcome": "recovered | run_pending | recovery_incomplete | target_unexpected",
+  "intents": [
+    {"intent_file": "<file name in .brain/journal/intents/>", "path": "documents/x/x.md",
+     "op_key": "…", "run_id": "…", "operation": "create | update | attach",
+     "classification": "not_applied | applied | target_unexpected | run_pending"}
+  ],
+  "orphan_temps": ["documents/x/.brain-persist-tmp-…"]
+}
+```
+
+Each `intents` entry adds fields by classification:
+
+| Classification | Added fields | Effect on the intent |
+| --- | --- | --- |
+| `not_applied` | `temp_removed`: whether a temp file was found and removed | closed |
+| `applied` | `finished`: the steps this recovery performed, from `change_record`, `commit`; `pending`: the steps still owed, `[]` when none. A step already complete before this recovery is in neither. `index` is never named before index bookkeeping exists (C8). | closed when `pending` is empty, otherwise open |
+| `target_unexpected` | `expected_prior`, `intended_sha256`, `observed_sha256` (a hash, or `absent`), `backup_path`, `reason` | **open**; nothing written |
+
+- **Aggregate outcome.** The worst entry wins, mirroring `validate`'s `invalid`: `target_unexpected` (exit `3`), then `recovery_incomplete` (exit `3`, some applied write's bookkeeping could not be finished), then `run_pending` (exit `0`), then `recovered` (exit `0`). A brain with no open intent is `recovered`, exit `0`. While the journal is not present the request is `refused` with reason `journal_missing`, exit `2`, since a missing journal must not read as nothing to recover.
+- **One word, two keys.** C1 lists `target_unexpected` as an outcome and this paragraph uses it as a classification. In this report they are separate: the classification is `intents[].classification`, the outcome is `outcome`, and the outcome is `target_unexpected` exactly when at least one entry's classification is.
+- **`recovery_incomplete` is an aggregate outcome only.** It is never an `intents[].classification` and is absent from the classification enum above. The per-intent signal is an `applied` entry whose `pending` is non-empty, with its classification still `applied`.
+- **`backup_path`** is present on every `target_unexpected` entry, as recorded in the intent (the value `persist` reports), and is `null` where the operation never takes a backup: `create` and `attach` never do, only `update` does. It is never omitted, so a consumer never has to tell an absent field from a null one.
+- **`target_unexpected` is not resolved by recovery.** It classifies "the tool could not establish what happened", so the intent stays open, nothing is overwritten, and no change record or commit is made. Every later recovery reports it again, and Behaviour 21 keeps the path locked against `persist` until a person acts. An intent that cannot be trusted at all — unreadable, missing a field C6 step 2 records, or naming a temp path that is not a persist temp file inside the brain — is reported the same way, with `reason: "invalid_intent"`, `observed_sha256: null` and any field it does not carry as `null`; recovery acts on nothing it names. `reason` is on every `target_unexpected` entry, never omitted: `"invalid_intent"` for such an intent and `null` for an ordinary one, so every entry of this classification carries the same keys.
+- **Exactly once.** For an applied write, recovery writes the change record only if none exists for the `op_key`, and makes the commit only if no commit reachable from `HEAD` carries `Brain-Key: <op_key>` in its final trailer paragraph (C7). In a brain without git there is no commit step. The recovered commit carries no `Brain-Grant`: the grant id was minted by the interrupted process and is not in the intent, so a maintenance grant for such a create needs `brain grant`.
+- **`run_pending`** is defined for an intent whose `run_id` belongs to a run with a manifest in the journal (C2). It is not decided by an intent's `run_id` field, since `persist` mints one when the request has none and every intent carries it. Nothing creates run manifests before ingestion (C13), so no recovery reports `run_pending` until then.
+- **`orphan_temps`** lists, sorted by path in code-point order and relative to the brain root, each file under a data zone or installed module folder that carries the temp-file name `persist` gives its temp files (the hidden prefix `.brain-persist-tmp-`; `persist` and `recover` read that name from one place) and that no open intent names as its temp. An orphan is reported and left in place. It never changes `outcome` or the exit code.
+- `intents` is sorted by `path`, then by `intent_file`.
 
 Fault injection for tests: when `BRAIN_TEST_FAULTS=1`, the environment variable `BRAIN_FAULT=<step>:<kill|fail>` stops the process (SIGKILL) or raises a failure at a named step (`after_intent`, `after_temp`, `before_apply`, `after_apply`, `before_change_record`, `before_index`, `before_commit`, `after_run_commit`, `before_raw_delete`). Without `BRAIN_TEST_FAULTS=1` the variable is ignored.
 

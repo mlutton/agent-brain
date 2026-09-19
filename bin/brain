@@ -105,6 +105,12 @@ def _run_persist(root, options):
     return persist.run_persist(request, root, _BASE_DIR, yaml_module, duplicate_loader)
 
 
+def _run_recover(root, options):
+    from brain_core import recover
+
+    return recover.run_recover(root, options)
+
+
 def main(argv):
     if not argv:
         return _refuse("missing_subcommand")
@@ -119,7 +125,7 @@ def main(argv):
 
     if subcommand == "setup":
         report, code = _guarded(lambda: _run_setup(options))
-    elif subcommand in ("validate", "persist"):
+    elif subcommand in ("validate", "persist", "recover"):
         root = options.get("--root")
         if not isinstance(root, str):
             return _refuse("missing_root")
@@ -127,6 +133,8 @@ def main(argv):
             return _refuse("invalid_root")
         if subcommand == "validate":
             report, code = _guarded(lambda: _run_validate(root))
+        elif subcommand == "recover":
+            report, code = _guarded(lambda: _run_recover(root, options))
         else:
             report, code = _guarded(lambda: _run_persist(root, options))
     else:

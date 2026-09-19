@@ -19,21 +19,56 @@ identical.
 """
 
 import os
+import stat
 
 from . import gitutil, persist, typedefs
 
 
+class _NotARegularFile(Exception):
+    """The target is not a regular file inside the brain."""
+
+
 def _target_hash(root, path):
-    full = os.path.join(root, path)
-    if not os.path.isfile(full):
-        return "absent"
-    with open(full, "rb") as fh:
-        return gitutil.hash_bytes(fh.read())
-
-
-def _remove_temp(intent):
+    """The sha256 of the regular file at `path` under `root`, or `absent`.
+    Nothing else is hashed: a link, a folder, a device or a path that leaves
+    the brain (through `..`, an absolute path or a linked folder) raises
+    `_NotARegularFile`, because reading through one would hash bytes recovery
+    does not own and a commit would then assert that hash as the brain's."""
+    root_real = os.path.realpath(root)
+    full = os.path.normpath(os.path.join(root_real, path))
+    if os.path.commonpath([root_real, full]) != root_real:
+        raise _NotARegularFile(path)
+    folder = os.path.dirname(full)
+    if os.path.realpath(folder) != folder:
+        raise _NotARegularFile(path)
     try:
-        os.remove(intent["temp_path"])
+        mode = os.lstat(full).st_mode
+    except FileNotFoundError:
+        return "absent"
+    if not stat.S_ISREG(mode):
+        raise _NotARegularFile(path)
+    # Opened without following a link and checked again on the descriptor, so
+    # a swap between the check above and this read is still refused.
+    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotARegularFile(path)
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return gitutil.hash_bytes(fh.read())
+    finally:
+        os.close(fd)
+
+
+def _canonical(path):
+    """`path` with every folder on the way resolved and its own name left
+    alone, so a link named by the path is judged as a link and never as
+    whatever it points at. Recovery checks this form and acts on this form."""
+    return os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+
+
+def _remove_temp(temp):
+    try:
+        os.remove(temp)
     except FileNotFoundError:
         return False
     return True
@@ -59,34 +94,65 @@ def _finish_bookkeeping(root, intent, applied_hash, entry):
             return
 
 
-def _owns_its_temp(root, intent):
-    """True when the temp file an intent names is one persist could have made
-    for it: inside this brain and named as persist names its temp files. The
-    intent is a file on disk, so recovery checks before it removes anything a
-    field points at."""
-    temp = os.path.realpath(intent["temp_path"])
+def _own_temp(root, intent):
+    """The path of the temp file an intent names when it is one persist could
+    have made for it, else None: a regular file (or nothing) named as persist
+    names its temp files, inside this brain. The intent is a file on disk, so
+    recovery checks before it removes anything a field points at. The path
+    returned is the one that was checked, and the only one recovery removes."""
+    try:
+        temp = _canonical(intent["temp_path"])
+    except ValueError:
+        return None  # a path no filesystem accepts names nothing
     root_real = os.path.realpath(root)
-    return persist.is_temp_name(os.path.basename(temp)) and os.path.commonpath([root_real, temp]) == root_real
+    if not persist.is_temp_name(os.path.basename(temp)):
+        return None
+    if os.path.commonpath([root_real, os.path.dirname(temp)]) != root_real:
+        return None
+    try:
+        mode = os.lstat(temp).st_mode
+    except FileNotFoundError:
+        return temp
+    return temp if stat.S_ISREG(mode) else None
+
+
+def _unresolved(file_name, intent, reason):
+    """The `target_unexpected` entry for an intent recovery could not act on.
+    Every field the intent does not carry is `null`, and `observed_sha256` is
+    `null` because no hash was established."""
+    fields = intent or {}
+    return {
+        "intent_file": file_name,
+        "path": fields.get("path"),
+        "op_key": fields.get("op_key"),
+        "run_id": fields.get("run_id"),
+        "operation": fields.get("operation"),
+        "classification": "target_unexpected",
+        "reason": reason,
+        "expected_prior": fields.get("expected_prior"),
+        "intended_sha256": fields.get("intended_sha256"),
+        "observed_sha256": None,
+        "backup_path": fields.get("backup_path"),
+    }
+
+
+def _recover_guarded(root, file_name, intent):
+    """`_recover_one` for a single intent, so that whatever goes wrong with it
+    is reported as that intent's and never as the command's. Whatever the
+    intent had already finished stays finished and is not repeated by a later
+    recovery; the intent itself stays open."""
+    try:
+        return _recover_one(root, file_name, intent)
+    except Exception:
+        return _unresolved(file_name, intent, "recovery_failed")
 
 
 def _recover_one(root, file_name, intent):
-    if intent is None or not _owns_its_temp(root, intent):
+    temp = _own_temp(root, intent) if intent is not None else None
+    if temp is None:
         # Nothing here can be trusted enough to act on, and nothing may vanish
         # from the report: the intent stays open as unresolved.
-        fields = intent or {}
-        return {
-            "intent_file": file_name,
-            "path": fields.get("path"),
-            "op_key": fields.get("op_key"),
-            "run_id": fields.get("run_id"),
-            "operation": fields.get("operation"),
-            "classification": "target_unexpected",
-            "reason": "invalid_intent",
-            "expected_prior": fields.get("expected_prior"),
-            "intended_sha256": fields.get("intended_sha256"),
-            "observed_sha256": None,
-            "backup_path": fields.get("backup_path"),
-        }
+        return _unresolved(file_name, intent, "invalid_intent")
     entry = {
         "intent_file": file_name,
         "path": intent["path"],
@@ -94,7 +160,12 @@ def _recover_one(root, file_name, intent):
         "run_id": intent["run_id"],
         "operation": intent["operation"],
     }
-    observed = _target_hash(root, intent["path"])
+    try:
+        observed = _target_hash(root, intent["path"])
+    except _NotARegularFile:
+        # No hash was established, so nothing may be asserted on its behalf:
+        # no record, no commit, and the intent stays open.
+        return _unresolved(file_name, intent, "not_a_regular_file")
     # `intended_sha256` is tested first (C6). An update that changes nothing has
     # the same hash for both, and a target holding the intended bytes is
     # `applied` whether or not the replace ran; `not_applied` would discard the
@@ -106,7 +177,7 @@ def _recover_one(root, file_name, intent):
             persist.close_intent(root, intent["path"])
     elif observed == intent["expected_prior"]:
         entry["classification"] = "not_applied"
-        entry["temp_removed"] = _remove_temp(intent)
+        entry["temp_removed"] = _remove_temp(temp)
         persist.close_intent(root, intent["path"])
     else:
         # The tool cannot say what happened here, so it closes nothing: the
@@ -131,7 +202,7 @@ def _orphan_temps(root, owned):
         for directory, _dirs, files in os.walk(os.path.join(root, folder), followlinks=False):
             for name in files:
                 full = os.path.join(directory, name)
-                if persist.is_temp_name(name) and os.path.realpath(full) not in owned:
+                if persist.is_temp_name(name) and _canonical(full) not in owned:
                     found.append(os.path.relpath(full, root).replace(os.sep, "/"))
     return sorted(found)
 
@@ -144,8 +215,15 @@ def run_recover(root, options):
         return {"outcome": "refused", "reason": "journal_missing"}, 2
 
     intents = persist.open_intents(root)
-    owned = {os.path.realpath(intent["temp_path"]) for _name, intent in intents if intent is not None}
-    entries = [_recover_one(root, name, intent) for name, intent in intents]
+    owned = set()
+    for _name, intent in intents:
+        if intent is None:
+            continue
+        try:
+            owned.add(_canonical(intent["temp_path"]))
+        except ValueError:
+            pass  # an intent whose temp path names nothing owns nothing
+    entries = [_recover_guarded(root, name, intent) for name, intent in intents]
     entries.sort(key=lambda entry: (entry["path"] or "", entry["intent_file"]))
     if any(e["classification"] == "target_unexpected" for e in entries):
         outcome = "target_unexpected"

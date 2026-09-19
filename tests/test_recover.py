@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -596,6 +597,130 @@ class TargetUnexpectedTests(RecoverTestCase):
         self.assertEqual(support.parse_single_json(proc.stdout), {"outcome": "refused", "reason": "open_intent"})
 
 
+class NonRegularTargetTests(RecoverTestCase):
+    """Recovery hashes only a regular file inside the brain. Anything else is
+    reported and never hashed, and no change record or commit asserts a hash
+    for bytes recovery did not read from a regular file it owns."""
+
+    def _applied_create(self, path):
+        """A create killed at `after_apply`: the target holds the intended
+        bytes, and there is an intent, and no record or commit yet."""
+        self.persist_killed(self.create_request(path), "after_apply")
+        intent = self.only_intent()
+        self.assertEqual(_sha256_file(self.full(path)), intent["intended_sha256"])
+        return intent
+
+    def _regular_file_in_place(self, path):
+        """True when `path` is a regular file at exactly that place in the brain,
+        reached through no link."""
+        target = self.full(path)
+        if not os.path.lexists(target):
+            return False
+        return stat.S_ISREG(os.lstat(target).st_mode) and os.path.realpath(target) == os.path.join(os.path.realpath(self.root), path)
+
+    def test_target_that_is_not_a_regular_file_in_the_brain_is_reported_not_hashed(self):
+        outside = tempfile.mkdtemp(prefix="brain-recover-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        cases = ("symlink to the real file", "dangling symlink", "directory", "symlinked folder")
+        for label in cases:
+            with self.subTest(label):
+                self.tearDown_root()
+                for leftover in os.listdir(outside):
+                    shutil.rmtree(os.path.join(outside, leftover), ignore_errors=True)
+                self.fresh_brain(git=True)
+                path = "documents/moved/moved.md"
+                intent = self._applied_create(path)
+                with open(self.full(path), "rb") as fh:
+                    real_bytes = fh.read()
+                elsewhere = os.path.join(outside, "moved")
+                target = self.full(path)
+                if label == "symlink to the real file":
+                    shutil.move(target, os.path.join(outside, "moved.md"))
+                    os.symlink(os.path.join(outside, "moved.md"), target)
+                    kept = os.path.join(outside, "moved.md")
+                elif label == "dangling symlink":
+                    os.remove(target)
+                    os.symlink(os.path.join(outside, "nothing-here"), target)
+                    kept = None
+                elif label == "directory":
+                    os.remove(target)
+                    os.mkdir(target)
+                    kept = None
+                else:
+                    shutil.move(os.path.dirname(target), elsewhere)
+                    os.symlink(elsewhere, os.path.dirname(target))
+                    kept = os.path.join(elsewhere, "moved.md")
+                # The injection landed: what is at the target is not a regular
+                # file inside the brain, and (for the linked cases) the bytes
+                # the intent expects are still reachable through it.
+                self.assertFalse(self._regular_file_in_place(path))
+                head = self.head()
+
+                proc, doc = self.recover()
+                self.assertEqual(proc.returncode, 3, doc)
+                self.assertEqual(doc["outcome"], "target_unexpected")
+                (entry,) = doc["intents"]
+                self.assertEqual(entry["classification"], "target_unexpected")
+                # A symlinked folder is caught one check earlier: the temp
+                # file persist names beside the target now resolves outside
+                # the brain, so the intent itself is not one recovery trusts.
+                expected_reason = "invalid_intent" if label == "symlinked folder" else "not_a_regular_file"
+                self.assertEqual(entry["reason"], expected_reason)
+                self.assertIsNone(entry["observed_sha256"])
+
+                # What the brain's own record says: no hash was asserted for it.
+                self.assertEqual(self.change_records_for(intent["op_key"]), [])
+                self.assertEqual(self.commits_for(intent["op_key"]), [])
+                self.assertEqual(self.head(), head)
+                self.assertEqual(len(self.intent_files()), 1)
+                if kept is not None:
+                    with open(kept, "rb") as fh:
+                        self.assertEqual(fh.read(), real_bytes)
+
+
+    def test_intent_whose_path_leaves_the_brain_hashes_nothing_outside_it(self):
+        """The intent is a file on disk, so its `path` is checked like any other
+        field: a regular file outside the brain that holds exactly the intended
+        bytes must not make the write `applied` or earn a change record."""
+        outside = tempfile.mkdtemp(prefix="brain-recover-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        outside_file = os.path.join(outside, "same-bytes.md")
+        for label in ("absolute path", "path climbing out with ..", "path through a linked folder"):
+            with self.subTest(label):
+                self.tearDown_root()
+                self.fresh_brain(git=True)
+                intent = self._applied_create("documents/leaving/leaving.md")
+                with open(self.full("documents/leaving/leaving.md"), "rb") as fh:
+                    intended_bytes = fh.read()
+                with open(outside_file, "wb") as fh:
+                    fh.write(intended_bytes)  # the injection: the outside bytes are exactly what is expected
+                self.assertEqual(_sha256_file(outside_file), intent["intended_sha256"])
+                if label == "absolute path":
+                    leaving = outside_file
+                elif label == "path climbing out with ..":
+                    leaving = os.path.relpath(outside_file, self.root)
+                else:
+                    # Inside the brain, but reached through a link: the same
+                    # file under another name, which is not the path named.
+                    os.symlink(self.full("documents/leaving"), self.full("documents/hop"))
+                    leaving = "documents/hop/leaving.md"
+                intent_file = os.path.join(self.root, ".brain", "journal", "intents", self.intent_files()[0])
+                with open(intent_file, encoding="utf-8") as fh:
+                    record = json.load(fh)
+                record["path"] = leaving
+                with open(intent_file, "w", encoding="utf-8") as fh:
+                    json.dump(record, fh)
+                head = self.head()
+
+                proc, doc = self.recover()
+                self.assertEqual(proc.returncode, 3, doc)
+                (entry,) = doc["intents"]
+                self.assertEqual((entry["classification"], entry.get("reason")), ("target_unexpected", "not_a_regular_file"))
+                self.assertEqual(self.change_records_for(intent["op_key"]), [])
+                self.assertEqual(self.head(), head)
+                self.assertEqual(len(self.intent_files()), 1)
+
+
 class OrphanTempTests(RecoverTestCase):
     """A temp file with no intent is an `orphan_temp`. The fixture is
     built by the product itself: persist killed at `after_temp` writes a real
@@ -809,6 +934,169 @@ class InvalidIntentTests(RecoverTestCase):
                 self.assertEqual(doc["intents"][0]["reason"], "invalid_intent", doc)
                 self.assertTrue(os.path.isfile(victim))
                 self.assertEqual(len(self.intent_files()), 1)
+
+
+class OneIntentsFailureTests(RecoverTestCase):
+    """One intent's failure is that intent's, not the command's: it is reported
+    in its own entry, every other intent is still classified and finished, and
+    the command still prints one JSON object carrying `outcome`."""
+
+    def _make_unreadable(self, path, mode):
+        """Applies `mode` to `path` and proves it bites, so a test never claims
+        a failure the filesystem did not produce. Registered before the change
+        so the fixture stays deletable whatever happens next."""
+        original = os.stat(path).st_mode & 0o777
+        self.addCleanup(os.chmod, path, original)
+        os.chmod(path, mode)
+        return original
+
+    def test_unreadable_target_is_that_intents_failure_and_the_next_intent_still_recovers(self):
+        self.fresh_brain(git=True)
+        first = "documents/a-locked/a.md"
+        second = "documents/b-fine/b.md"
+        self.persist_killed(self.create_request(first), "after_apply")
+        self.persist_killed(self.create_request(second), "after_apply")
+        keys = {e["path"]: e["op_key"] for e in self._intents()}
+        self._make_unreadable(self.full(first), 0o000)
+        with self.assertRaises(PermissionError):
+            open(self.full(first), "rb").close()  # the injection landed
+
+        proc, doc = self.recover()
+        self.assertEqual(proc.returncode, 3, doc)
+        self.assertEqual(doc["outcome"], "target_unexpected")
+        by_path = {e["path"]: e for e in doc["intents"]}
+        self.assertEqual(sorted(by_path), [first, second])
+        self.assertEqual(by_path[first]["classification"], "target_unexpected")
+        self.assertEqual(by_path[first]["reason"], "recovery_failed")
+        self.assertIsNone(by_path[first]["observed_sha256"])
+        # The other intent was processed, not merely skipped without an error.
+        self.assertEqual(by_path[second]["classification"], "applied")
+        self.assertEqual(by_path[second]["finished"], ["change_record", "commit"])
+        self.assertEqual(len(self.change_records_for(keys[second])), 1)
+        self.assertEqual(len(self.commits_for(keys[second])), 1)
+        # The failed one wrote nothing and stays open for a later recovery.
+        self.assertEqual(self.change_records_for(keys[first]), [])
+        self.assertEqual(self.commits_for(keys[first]), [])
+        self.assertEqual(self.intent_files(), ["documents__a-locked__a.md.json"])
+
+    def test_intent_that_cannot_be_closed_is_reported_and_finishes_once_when_it_can(self):
+        """With the journal's intents folder read-only, the change record and
+        commit are made and the intent then cannot be closed. The report is not
+        lost, and the recovery that follows repeats neither step."""
+        self.fresh_brain(git=True)
+        path = "documents/stuck-open/stuck.md"
+        self.persist_killed(self.create_request(path), "after_apply")
+        op_key = self.only_intent()["op_key"]
+        intents_dir = os.path.join(self.root, ".brain", "journal", "intents")
+        self._make_unreadable(intents_dir, 0o500)
+        probe = os.path.join(intents_dir, "probe")
+        with self.assertRaises(PermissionError):
+            open(probe, "wb").close()  # the folder really refuses changes now
+        with self.assertRaises(PermissionError):
+            os.remove(os.path.join(intents_dir, self.intent_files()[0]))
+
+        proc, doc = self.recover()
+        self.assertEqual(proc.returncode, 3, doc)
+        self.assertEqual(doc["outcome"], "target_unexpected")
+        (entry,) = doc["intents"]
+        self.assertEqual((entry["path"], entry["reason"]), (path, "recovery_failed"))
+        self.assertEqual(len(self.intent_files()), 1)
+
+        os.chmod(intents_dir, 0o700)
+        proc, doc = self.recover()
+        self.assertEqual(proc.returncode, 0, doc)
+        self.assertEqual(doc["outcome"], "recovered")
+        self.assertEqual(doc["intents"][0]["finished"], [])
+        self.assertEqual(len(self.change_records_for(op_key)), 1)
+        self.assertEqual(len(self.commits_for(op_key)), 1)
+        self.assertEqual(self.intent_files(), [])
+
+    def test_intent_with_a_path_no_filesystem_accepts_is_reported_and_the_next_still_recovers(self):
+        """The same isolation without depending on file permissions: a
+        well-formed intent whose `temp_path` holds a NUL byte."""
+        self.fresh_brain(git=True)
+        bad = "documents/a-nul/a.md"
+        good = "documents/b-good/b.md"
+        self.persist_killed(self.create_request(bad), "after_apply")
+        self.persist_killed(self.create_request(good), "after_apply")
+        bad_file = os.path.join(self.root, ".brain", "journal", "intents", "documents__a-nul__a.md.json")
+        with open(bad_file, encoding="utf-8") as fh:
+            record = json.load(fh)
+        folder, name = os.path.split(record["temp_path"])
+        record["temp_path"] = os.path.join(folder + "\u0000", name)
+        with open(bad_file, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        good_key = [i for i in self._intents() if i["path"] == good][0]["op_key"]
+
+        proc, doc = self.recover()
+        self.assertEqual(proc.returncode, 3, doc)
+        by_path = {e["path"]: e for e in doc["intents"]}
+        self.assertEqual(by_path[bad]["classification"], "target_unexpected")
+        self.assertEqual(by_path[good]["classification"], "applied")
+        self.assertEqual(len(self.commits_for(good_key)), 1)
+        self.assertEqual(self.intent_files(), ["documents__a-nul__a.md.json"])
+
+    def _intents(self):
+        directory = os.path.join(self.root, ".brain", "journal", "intents")
+        found = []
+        for name in sorted(os.listdir(directory)):
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                found.append(json.load(fh))
+        return found
+
+
+class TempRemovalTests(RecoverTestCase):
+    """Recovery removes only the file it validated. The path checked and the
+    path removed are one path, so a file the command does not own can neither
+    be destroyed nor hide the real orphan."""
+
+    def _intent_file(self):
+        return os.path.join(self.root, ".brain", "journal", "intents", self.intent_files()[0])
+
+    def _interrupted_create(self, path):
+        """A create killed at `before_apply`: an open intent, and beside the
+        absent target the real temp file persist wrote for it."""
+        self.persist_killed(self.create_request(path), "before_apply")
+        intent = self.only_intent()
+        self.assertFalse(os.path.exists(self.full(path)))
+        temp = intent["temp_path"]
+        self.assertTrue(os.path.isfile(temp) and not os.path.islink(temp))
+        return intent, temp
+
+    def _point_intent_at(self, victim):
+        with open(self._intent_file(), encoding="utf-8") as fh:
+            record = json.load(fh)
+        record["temp_path"] = victim
+        with open(self._intent_file(), "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+
+    def test_intent_naming_a_link_to_a_temp_removes_neither_and_reports_the_real_temp(self):
+        for label, link_name in (
+            ("a link not named like a temp", "IMPORTANT-not-a-temp.md"),
+            ("a link named like a temp", ".brain-persist-tmp-0-linked"),
+        ):
+            with self.subTest(label):
+                self.tearDown_root()
+                self.fresh_brain()
+                path = "documents/linked/linked.md"
+                _, temp = self._interrupted_create(path)
+                link = os.path.join(os.path.dirname(temp), link_name)
+                os.symlink(temp, link)
+                self._point_intent_at(link)
+
+                proc, doc = self.recover()
+                (entry,) = doc["intents"]
+                self.assertEqual((entry["classification"], entry.get("reason")), ("target_unexpected", "invalid_intent"), doc)
+                self.assertNotIn("temp_removed", entry)
+                # Both files are still there: the link the intent named and the
+                # real temp behind it. Nothing was removed on the strength of
+                # a path the check did not look at.
+                self.assertTrue(os.path.islink(link))
+                self.assertTrue(os.path.isfile(temp))
+                self.assertEqual(len(self.intent_files()), 1)
+                # The real temp is nobody's: it is reported, not hidden.
+                self.assertEqual(doc["orphan_temps"], [os.path.relpath(temp, self.root)])
+                self.assertEqual(doc["outcome"], "target_unexpected")
 
 
 class UnimplementedModesTests(RecoverTestCase):

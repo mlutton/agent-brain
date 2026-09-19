@@ -291,6 +291,68 @@ class AppliedTests(RecoverTestCase):
         self.assertEqual(len(self.commits_for(op_key)), 1)
         self.assertEqual(self.intent_files(), [])
 
+    def test_recovered_commit_carries_no_brain_grant(self):
+        """C6/C7: the grant id was minted by the interrupted process and is not in
+        the intent, so recovery cannot honestly name one. The commit declares its
+        op, key and path and nothing about a grant."""
+        self.fresh_brain(git=True)
+        path = "documents/nogrant/nogrant.md"
+        self.persist_killed(self.create_request(path), "after_apply")
+        op_key = self.only_intent()["op_key"]
+
+        self.recover()
+
+        (commit,) = self.commits_for(op_key)
+        trailers = self.git("log", "-1", "--format=%B", commit).splitlines()
+        self.assertIn(f"Brain-Key: {op_key}", trailers)  # the right commit was read
+        self.assertEqual([line for line in trailers if line.startswith("Brain-Grant")], [])
+
+    def test_update_that_leaves_its_bytes_unchanged_and_was_killed_after_apply_is_applied(self):
+        """C6 classification order: a target holding `intended_sha256` is
+        `applied` first. When an update sets a property to the value it already
+        holds, `expected_prior` and `intended_sha256` are the same hash and the
+        target matches both; the write still reached `after_apply`, so its
+        record and commit are owed and `not_applied` would discard them."""
+        path = "documents/samebytes/samebytes.md"
+        created = self.created_in_fresh_brain(path, git=True)
+        prior_hash = created["version"]
+        request = {
+            "operation": "update",
+            "path": path,
+            "expected_version": prior_hash,
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},  # already what it holds
+        }
+        self.persist_killed(request, "after_apply")
+
+        # The injection landed after the apply, and the degenerate state is
+        # really there: prior and intended are one hash and the target holds
+        # it. Only the update's apply step writes a backup and consumes the
+        # temp, so both prove the replace ran rather than being assumed.
+        intent = self.only_intent()
+        self.assertEqual(intent["expected_prior"], prior_hash)
+        self.assertEqual(intent["intended_sha256"], prior_hash)
+        self.assertEqual(_sha256_file(self.full(path)), prior_hash)
+        self.assertTrue(os.path.isfile(intent["backup_path"]))
+        self.assertFalse(os.path.exists(intent["temp_path"]))
+        op_key = intent["op_key"]
+        self.assertEqual(self.change_records_for(op_key), [])
+        self.assertEqual(self.commits_for(op_key), [])
+
+        proc, doc = self.recover()
+        (entry,) = doc["intents"]
+        self.assertEqual(entry["classification"], "applied", entry)
+        self.assertEqual(entry["finished"][:1], ["change_record"])
+        self.assertEqual(len(self.change_records_for(op_key)), 1)
+
+        # Git refuses a commit that changes no bytes, so the commit step may be
+        # `pending` here. What must hold is that the report says what happened:
+        # `recovered` and a closed intent exactly when nothing is pending, and a
+        # commit for the op key exactly when the report says it was made.
+        done = not entry["pending"]
+        self.assertEqual((doc["outcome"], proc.returncode), ("recovered", 0) if done else ("recovery_incomplete", 3))
+        self.assertEqual(self.intent_files() == [], done)
+        self.assertEqual(len(self.commits_for(op_key)), 1 if "commit" in entry["finished"] else 0)
+
     def test_applied_write_in_a_brain_without_git_gets_its_change_record_only(self):
         self.fresh_brain(git=False)
         path = "documents/nogit/nogit.md"
@@ -483,6 +545,38 @@ class TargetUnexpectedTests(RecoverTestCase):
         self.assertEqual(doc["intents"][0]["observed_sha256"], "absent")
         self.assertFalse(os.path.exists(self.full(path)))
 
+    def test_every_target_unexpected_entry_carries_the_same_keys(self):
+        """An ordinary entry and an `invalid_intent` one differ in values, never
+        in which keys exist, so a consumer never has to tell an absent field from
+        a null one. `reason` is `null` where recovery recorded none."""
+        self.fresh_brain(git=True)
+        edited = "documents/a-edited/a.md"
+        broken = "documents/b-broken/b.md"
+        self.persist_killed(self.create_request(edited), "after_apply")
+        self.persist_killed(self.create_request(broken), "after_intent")
+        self._modify(edited)
+        broken_file = "documents__b-broken__b.md.json"
+        with open(os.path.join(self.root, ".brain", "journal", "intents", broken_file), "r+", encoding="utf-8") as fh:
+            text = fh.read()
+            fh.seek(0)
+            fh.truncate()
+            fh.write(text[: len(text) // 2])  # a write cut short
+
+        _, doc = self.recover()
+        by_file = {e["intent_file"]: e for e in doc["intents"]}
+        ordinary = by_file["documents__a-edited__a.md.json"]
+        invalid = by_file[broken_file]
+        self.assertEqual(ordinary["classification"], "target_unexpected")
+        self.assertEqual(invalid["classification"], "target_unexpected")
+        self.assertIsNone(ordinary["reason"])
+        self.assertEqual(invalid["reason"], "invalid_intent")
+        expected_keys = {
+            "intent_file", "path", "op_key", "run_id", "operation", "classification",
+            "expected_prior", "intended_sha256", "observed_sha256", "backup_path", "reason",
+        }  # the C6 table's row for `target_unexpected`, and the envelope's own fields
+        self.assertEqual(set(ordinary), expected_keys)
+        self.assertEqual(set(invalid), expected_keys)
+
     def test_unresolved_state_is_reported_again_and_still_blocks_writes(self):
         """`target_unexpected` classifies "could not establish what
         happened", so nothing resolves it: every later recovery reports it
@@ -619,6 +713,24 @@ class ReportEnvelopeTests(RecoverTestCase):
         self.assertEqual(len(self.change_records_for(op_key)), 1)
         self.assertEqual(len(self.commits_for(op_key)), 1)
         self.assertEqual(self.intent_files(), [])
+
+
+    def test_recovery_incomplete_is_an_aggregate_outcome_never_a_classification(self):
+        """`recovery_incomplete` names the whole report. An intent whose
+        bookkeeping could not finish is still classified `applied`, and its
+        non-empty `pending` is the per-intent signal."""
+        self.fresh_brain(git=True)
+        path = "documents/incomplete/incomplete.md"
+        self.persist_killed(self.create_request(path), "after_apply")
+        with open(self.full(".gitignore"), "a", encoding="utf-8") as fh:
+            fh.write("documents/incomplete/\n")  # git now refuses the commit
+
+        _, doc = self.recover()
+        self.assertEqual(doc["outcome"], "recovery_incomplete")
+        classifications = {entry["classification"] for entry in doc["intents"]}
+        self.assertEqual(classifications, {"applied"})
+        self.assertNotEqual(doc["intents"][0]["pending"], [])
+        self.assertLessEqual(classifications, {"not_applied", "applied", "target_unexpected", "run_pending"})
 
 
 class ModuleFolderOrphanTests(RecoverTestCase):

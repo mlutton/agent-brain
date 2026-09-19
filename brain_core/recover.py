@@ -95,20 +95,25 @@ def _recover_one(root, file_name, intent):
         "operation": intent["operation"],
     }
     observed = _target_hash(root, intent["path"])
-    if observed == intent["expected_prior"]:
-        entry["classification"] = "not_applied"
-        entry["temp_removed"] = _remove_temp(intent)
-        persist.close_intent(root, intent["path"])
-    elif observed == intent["intended_sha256"]:
+    # `intended_sha256` is tested first (C6). An update that changes nothing has
+    # the same hash for both, and a target holding the intended bytes is
+    # `applied` whether or not the replace ran; `not_applied` would discard the
+    # record and commit an applied write is owed.
+    if observed == intent["intended_sha256"]:
         entry["classification"] = "applied"
         _finish_bookkeeping(root, intent, observed, entry)
         if not entry["pending"]:
             persist.close_intent(root, intent["path"])
+    elif observed == intent["expected_prior"]:
+        entry["classification"] = "not_applied"
+        entry["temp_removed"] = _remove_temp(intent)
+        persist.close_intent(root, intent["path"])
     else:
         # The tool cannot say what happened here, so it closes nothing: the
         # intent stays open, and Behaviour 21 keeps the path locked until a
         # person acts.
         entry["classification"] = "target_unexpected"
+        entry["reason"] = None
         entry["expected_prior"] = intent["expected_prior"]
         entry["intended_sha256"] = intent["intended_sha256"]
         entry["observed_sha256"] = observed

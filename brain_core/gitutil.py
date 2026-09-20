@@ -19,6 +19,11 @@ def run_git(args, cwd):
     )
 
 
+def run_git_bytes(args, cwd):
+    """`run_git` for output that is file content, so nothing is decoded."""
+    return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, check=False)
+
+
 def hash_bytes(data):
     return hashlib.sha256(data).hexdigest()
 

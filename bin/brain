@@ -111,6 +111,25 @@ def _run_recover(root, options):
     return recover.run_recover(root, options)
 
 
+def _run_read(root, options):
+    from brain_core import vendor_yaml
+
+    try:
+        yaml_module = vendor_yaml.load(_BASE_DIR)
+    except vendor_yaml.VendoredDependencyError:
+        return {"outcome": "error", "reason": "vendored_dependency"}, 1
+
+    duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+
+    request = _read_request(options)
+    if request is None:
+        return {"outcome": "refused", "reason": "invalid_request"}, 2
+
+    from brain_core import read
+
+    return read.run_read(request, root, _BASE_DIR, yaml_module, duplicate_loader)
+
+
 def main(argv):
     if not argv:
         return _refuse("missing_subcommand")
@@ -125,7 +144,7 @@ def main(argv):
 
     if subcommand == "setup":
         report, code = _guarded(lambda: _run_setup(options))
-    elif subcommand in ("validate", "persist", "recover"):
+    elif subcommand in ("validate", "persist", "recover", "read"):
         root = options.get("--root")
         if not isinstance(root, str):
             return _refuse("missing_root")
@@ -135,6 +154,8 @@ def main(argv):
             report, code = _guarded(lambda: _run_validate(root))
         elif subcommand == "recover":
             report, code = _guarded(lambda: _run_recover(root, options))
+        elif subcommand == "read":
+            report, code = _guarded(lambda: _run_read(root, options))
         else:
             report, code = _guarded(lambda: _run_persist(root, options))
     else:

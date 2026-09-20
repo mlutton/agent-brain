@@ -484,24 +484,31 @@ class JournalMissingTests(ReadTestCase):
 class UnevaluablePublicationTests(ReadTestCase):
     """R18: when the publication rule cannot be evaluated, read is never `ok`."""
 
-    def test_a_git_that_fails_with_empty_output_is_never_read_as_a_clean_tree(self):
-        self.commit_file("documents/kept/kept.md", doc(ID_ONE, "Committed", "Body.\n"))
-        request = {"path": "documents/kept/kept.md", "max_bytes": 4096}
+    PATH = "documents/kept/kept.md"
 
-        # The twin: the same brain under real git.
-        proc, result = self.read(request)
-        self.assertEqual(result["outcome"], "ok", result)
-
-        # A `git` first on PATH that exits non-zero and prints nothing: the
-        # failure mode that reads as an empty `git status`, hence a clean tree.
+    def shim_git(self, script):
+        """Puts a `git` first on PATH and returns the environment that finds it
+        and the log the shim appends to. `script` is the shim's body; it may use
+        `$REAL_GIT` (the real binary, resolved before PATH changes) and `$LOG`."""
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
         shim_dir = tempfile.mkdtemp(prefix="brain-read-shim-")
         self.addCleanup(shutil.rmtree, shim_dir, ignore_errors=True)
-        shim = os.path.join(shim_dir, "git")
-        with open(shim, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\nexit 1\n")
-        os.chmod(shim, 0o755)
+        log = os.path.join(shim_dir, "calls.log")
+        with open(os.path.join(shim_dir, "git"), "w", encoding="utf-8") as fh:
+            fh.write(f'#!/bin/sh\nREAL_GIT="{real_git}"\nLOG="{log}"\n{script}')
+        os.chmod(os.path.join(shim_dir, "git"), 0o755)
         env = dict(os.environ, PATH=shim_dir + os.pathsep + os.environ["PATH"])
-        for by in ({"path": "documents/kept/kept.md"}, {"id": ID_ONE}):
+        return env, log
+
+    def calls(self, log):
+        if not os.path.exists(log):
+            return []
+        with open(log, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+
+    def assert_never_ok(self, env):
+        for by in ({"path": self.PATH}, {"id": ID_ONE}):
             with self.subTest(by=by):
                 proc, result = self.read(dict(by, max_bytes=4096), env=env)
                 self.assertEqual(proc.returncode, 0, proc)
@@ -509,6 +516,50 @@ class UnevaluablePublicationTests(ReadTestCase):
                 self.assertEqual(result["reason"], "git_unavailable")
                 for key in WITHHELD_KEYS:
                     self.assertNotIn(key, result)
+
+    def test_a_status_that_fails_with_empty_output_is_never_read_as_a_clean_tree(self):
+        self.commit_file(self.PATH, doc(ID_ONE, "Committed", "Body.\n"))
+        request = {"path": self.PATH, "max_bytes": 4096}
+
+        # The twin: the same brain under real git.
+        proc, result = self.read(request)
+        self.assertEqual(result["outcome"], "ok", result)
+
+        # A `git` first on PATH that hands every call to the real git except
+        # `status`, which it fails with no output. Repository discovery, the
+        # history walk and every other call therefore succeed, so the only way
+        # to reach the wrong answer is to read a failed `git status`'s empty
+        # output as a clean tree, which is the failure this criterion names. The
+        # subcommand is the first argument that is not an option, because the
+        # product may put options ahead of it.
+        env, log = self.shim_git(
+            'for arg in "$@"; do\n'
+            '  case "$arg" in\n'
+            "    -*) ;;\n"
+            '    status) echo "fail status" >> "$LOG"; exit 1 ;;\n'
+            '    *) echo "pass $arg" >> "$LOG"; break ;;\n'
+            "  esac\n"
+            "done\n"
+            'exec "$REAL_GIT" "$@"\n'
+        )
+        self.assert_never_ok(env)
+        # The injection landed where it was aimed: git was found and used for
+        # other calls, and `status` is the call that failed.
+        calls = self.calls(log)
+        self.assertIn("pass rev-parse", calls)
+        self.assertIn("fail status", calls)
+
+    def test_a_git_that_fails_every_call_is_never_read_as_published(self):
+        self.commit_file(self.PATH, doc(ID_ONE, "Committed", "Body.\n"))
+        proc, result = self.read({"path": self.PATH, "max_bytes": 4096})
+        self.assertEqual(result["outcome"], "ok", result)
+
+        # Git is present but unusable from the first call: the brain is not
+        # even recognised as a repository. This is a different condition from
+        # the one above, not the criterion itself.
+        env, log = self.shim_git('echo "fail $1" >> "$LOG"\nexit 1\n')
+        self.assert_never_ok(env)
+        self.assertIn("fail rev-parse", self.calls(log))
 
 
 class UnpublishedTests(ReadTestCase):
@@ -618,6 +669,47 @@ class DocumentRoleTests(ReadTestCase):
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(result["outcome"], "unverified", result)
         self.assertEqual(result["reason"], "no_ingest_record")
+
+    def edit_and_commit_out_of_band(self):
+        """A recorded document whose bytes were then changed and committed
+        plainly: no `Brain-Op` trailer, so neither a brain write nor an
+        audit-labelled edit. Returns the edited bytes."""
+        self.ingest()
+        edited = processed_document(
+            ID_ONE, "original/paper-source.md", ORIGINAL_TEXT, body="Changed by hand after ingest.\n"
+        )
+        self.commit_file(self.DOC, edited)
+        return edited
+
+    def test_the_out_of_band_edit_fixture_is_committed_and_leaves_the_ingest_record_in_history(self):
+        # The fixture behind the next test, checked apart from it: an expected
+        # failure would hide a fixture that never built what it claims.
+        edited = self.edit_and_commit_out_of_band()
+        with open(self.full(self.DOC), "rb") as fh:
+            self.assertEqual(fh.read(), edited.encode())
+        recorded = processed_document(ID_ONE, "original/paper-source.md", ORIGINAL_TEXT)
+        self.assertNotEqual(sha(edited.encode()), sha(recorded.encode()))
+        self.assertEqual(self.git("status", "--porcelain", "--", self.DOC), "")
+        self.assertIn("Brain-Op: ingest", self.git("log", "--format=%B", "--", self.DOC))
+        self.assertEqual(self.git("log", "--format=%s", "-1"), "Plain edit\n")
+
+    @unittest.expectedFailure
+    def test_a_document_edited_and_committed_out_of_band_after_ingest_is_unverified(self):
+        # C8 rule 5 requires a published document's current bytes to descend from
+        # its ingest or adopt commit, with later changes only through brain
+        # writes or audit-labelled edits; otherwise `unverified` with
+        # `no_ingest_record`. Only the first half (a record exists) is
+        # implemented, so this fails today and is marked as an expected failure.
+        # It is the gate on implementing descent: once read honours the whole
+        # rule this becomes an unexpected success, the suite goes red, and the
+        # marker comes off.
+        self.edit_and_commit_out_of_band()
+        proc, result = self.read({"path": self.DOC, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["reason"], "no_ingest_record")
+        for key in WITHHELD_KEYS:
+            self.assertNotIn(key, result)
 
     def test_include_unverified_gives_the_content_and_its_absence_gives_none(self):
         self.commit_file(

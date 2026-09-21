@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 41e69aa728fbeecb6d6922afb0196758b3d866c453bfb9426ea5eb0614c67345
+Version: bd94cfa9979fb677cb5f17b8da8caf036884846115d0d02d681ad6fdd8601da4
 Publication: published — accepted by merge of #2
 Status: **Accepted specification.** This line records acceptance, not delivery: what is implemented is tracked in the issues that reference this version, and this document makes no claim about it. Delivery stories are opened as issues referencing this version.
 
@@ -474,7 +474,32 @@ Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage:
 
 ### C10. Read
 
-Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id, path, version, role: note|document|original|attachment, owner?, frontmatter, excerpt, truncated, origin, evidence: [{target, exists}], support, labels}`. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
+Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id, path, version, role: note|document|original|attachment, owner?, integrity?, recorded_sha256?, publication_commit?, reason?, hint?, frontmatter, excerpt, truncated, origin, evidence: [{target, exists}], support, labels}`. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
+
+**Flag values in `labels`.** `labels` is an **object**, not an array, because
+C9's label values include freshness enumerations and `superseded_by`
+identifiers, which a list of strings cannot carry. A boolean-style flag is
+encoded as the key with value `true`; a flag that does not apply is **absent**
+rather than `false`.
+
+**`reason` values.** `reason` names why an outcome is not `ok`. Alongside the
+values C8 defines, `git_unavailable` is reported when git cannot be consulted or
+the root is not a git repository — the answer is `unverified`, never `ok`.
+
+**Open questions, recorded rather than resolved.** Each is a point where this
+specification is silent and an implementation has had to choose. A choice made
+here is revisable, and each is pinned by a test, so a later ruling surfaces as a
+changed test rather than as a silent difference.
+
+- **Open:** whether `heading` is delivered at all, and what it selects.
+- **Open:** whether `exists` is reported for a target this section forbids
+  fetching.
+- **Open:** whether `excerpt` and `truncated` are populated for a non-UTF-8
+  retained attachment.
+- **Open:** outcome precedence when two C8 rules and a parse failure apply to
+  the same path.
+- **Open:** which content fields, if any, a `retained_missing` path carries.
+  S-H3 requires the *state* be reported; the content fields are undefined.
 
 ### C11. Source identity, versions and support
 
@@ -531,6 +556,22 @@ A folder name alone never establishes a role. A later reference, for example a n
 | `retained` | the file exists and matches the recorded hash |
 | `retained_changed` | the file exists with different bytes, whether uncommitted or committed out of band |
 | `retained_missing` | the file is gone |
+
+`read` reports this value under the key **`integrity`**, alongside
+**`recorded_sha256`** (the hash the publication record declared) and
+**`publication_commit`** (the commit that declared it). `owner` is a **path** —
+the document a retained original or attachment belongs to — because a
+publication record names paths.
+
+**The word `retained` carries three senses and they are not interchangeable.**
+As a *class of file* it means an original or attachment held beside a document.
+As a **`validate` status** (C5a) it means the path has role identity as such a
+file, whatever its bytes currently are. As an **integrity value** in the table
+above it means the bytes still match the recorded hash. This is why a `validate`
+entry may be `status: retained` while carrying a `retained_changed` error: the
+status reports role identity and the error reports integrity. The two commands
+encode the same two axes differently and must agree on the *state*, not on a
+shared key.
 
 A file whose bytes equal a `retained_missing` path's recorded hash at another, unrecorded path is `unverified` with a `retained_moved` hint (C8 rule 3). It is never an ordinary note.
 

@@ -348,9 +348,16 @@ def _has_unverified_referrer(root, path, repo, module_folders, yaml_module, dupl
     record decides that before its bytes are read. C8's rules are first-match:
     rule 2 takes a retained original or attachment "whatever its current
     bytes", so it is "never a candidate", and C13a says it is never parsed as
-    frontmatter at all; rule 5 leaves a recorded `document` published, so it
-    cannot be the unverified one this rule asks for. Bytes that read as a
-    processed document therefore cannot make a recorded path speak for one."""
+    frontmatter at all — that half of the exclusion is delivered, and holds of
+    the code as it runs today. The recorded-`document` half follows rule 5 as
+    specified: rule 5 leaves such a document published, so it cannot be the
+    unverified one this rule asks for. Rule 5's descent clause is not
+    implemented (#51), so today a recorded document tampered with and
+    committed out of band still reads `ok` where the rule requires
+    `unverified` — a reader who checks that half against current behaviour
+    will not find it. The exclusion encodes the rule, not the shortfall.
+    Bytes that read as a processed document therefore cannot make a recorded
+    path speak for one."""
     records = repo.records()
     entries, _scan_skipped = scan.scan_zones(root, module_folders)
     for candidate, _zone in entries:

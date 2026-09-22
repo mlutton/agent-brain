@@ -342,12 +342,19 @@ def _has_unverified_referrer(root, path, repo, module_folders, yaml_module, dupl
     relative to the referring document's own folder (C5), and that admits
     `../`, so a referrer may sit anywhere in the brain and still resolve to
     this file. What taints is the reference resolving here, never where the
-    referrer sits."""
+    referrer sits.
+
+    A path the publication record names is never such a referrer, and its
+    record decides that before its bytes are read. C8's rules are first-match:
+    rule 2 takes a retained original or attachment "whatever its current
+    bytes", so it is "never a candidate", and C13a says it is never parsed as
+    frontmatter at all; rule 5 leaves a recorded `document` published, so it
+    cannot be the unverified one this rule asks for. Bytes that read as a
+    processed document therefore cannot make a recorded path speak for one."""
     records = repo.records()
     entries, _scan_skipped = scan.scan_zones(root, module_folders)
     for candidate, _zone in entries:
-        record = records.get(candidate)
-        if candidate == path or (record is not None and record["role"] == "document"):
+        if candidate == path or candidate in records:
             continue
         try:
             parsed = _parse(_read_bytes(root, candidate), yaml_module, duplicate_loader)

@@ -1023,5 +1023,63 @@ class BinaryAttachmentTests(BundleTestCase):
         self.assertIs(result["truncated"], True)
 
 
+class ReferrerLocalityTests(ReadTestCase):
+    """C8 rule 6 states no locality condition: whether a referrer taints a file
+    depends on its reference RESOLVING to that file, not on where the referrer
+    sits. C5 makes `original` relative to the document's own folder, which
+    admits `../`, so a referrer outside the target's ancestor folders is an
+    ordinary case and not an exotic one (agent-brain #44)."""
+
+    TARGET = "documents/shared/pic.md"
+    TARGET_TEXT = "Just a picture placeholder.\n"
+
+    def referrer(self, id_, original):
+        """An unrecorded `type: document` — rule 5 makes it unverified — whose
+        `original` names `original` relative to its own folder."""
+        return doc(
+            id_,
+            "Unrecorded bundle",
+            "Body.\n",
+            type_="document",
+            extra=[
+                'source_identity: "https://example.invalid/paper"',
+                f'original: "{original}"',
+                f'original_sha256: "{sha(self.TARGET_TEXT.encode())}"',
+            ],
+        )
+
+    def test_a_referrer_outside_the_targets_ancestor_folders_makes_it_unverified(self):
+        # `wiki/r.md` is in no ancestor folder of `documents/shared/pic.md`; its
+        # `original` resolves to it all the same.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("wiki/r.md", self.referrer(ID_ONE, "../documents/shared/pic.md"))
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["hint"], "suspected_ingestion")
+        self.assertNotIn("role", result)
+
+    def test_the_control_a_co_located_referrer_still_makes_the_same_target_unverified(self):
+        # The same target, reached by a referrer sitting beside it. This is what
+        # makes the pair a locality finding: it must not change.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("documents/shared/s.md", self.referrer(ID_TWO, "pic.md"))
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["hint"], "suspected_ingestion")
+        self.assertNotIn("role", result)
+
+    def test_a_reference_that_resolves_elsewhere_leaves_the_target_a_published_note(self):
+        # The negative twin of the first case: a referrer outside the ancestor
+        # folders whose `original` resolves to some other path taints nothing.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("wiki/r.md", self.referrer(ID_THREE, "../documents/shared/other.md"))
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertEqual(result["role"], "note")
+
+
 if __name__ == "__main__":
     unittest.main()

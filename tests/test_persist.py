@@ -104,6 +104,17 @@ class PersistTestCase(unittest.TestCase):
         )
         return proc, support.parse_single_json(proc.stdout)
 
+    def _create(self, path, root=None):
+        request = {
+            "operation": "create",
+            "path": path,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        _, doc = self.persist(request, root=root)
+        self.assertEqual(doc["outcome"], "written", doc)
+        return doc
+
 
 class CreateTests(PersistTestCase):
     """P1: create of a new valid document returns written with id, path and
@@ -325,6 +336,257 @@ class UpdateTests(PersistTestCase):
         under_12 = next(iter(_yaml_module.load_all(block, Loader=_YAML12_LOADER)))
         self.assertEqual(under_11["reviewed"], datetime.date(2026, 3, 1))
         self.assertEqual(under_12["reviewed"], "2026-03-01")
+
+
+class NoOpUpdateTests(PersistTestCase):
+    """agent-brain #38/#42: a no-op update -- one whose resulting file
+    bytes would equal the target's current bytes -- is refused before
+    anything is written, so it can never leave an open intent with no CLI
+    escape to close it. Precedence is pinned: expected_version is checked
+    before no_change (agent-brain #38/#42)."""
+
+    def test_noop_update_is_refused_no_change_and_writes_nothing(self):
+        created = self._create("documents/noop/noop.md")
+        full = os.path.join(self.root, "documents/noop/noop.md")
+        with open(full, "rb") as fh:
+            before = fh.read()
+        change_records_dir = os.path.join(self.root, ".brain", "journal", "change_records")
+        change_records_before = sorted(os.listdir(change_records_dir))
+
+        request = {
+            "operation": "update",
+            "path": "documents/noop/noop.md",
+            "expected_version": created["version"],
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},  # already what it holds
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "no_change", "observed_sha256": created["version"]},
+        )
+        self.assertEqual(proc.returncode, 2)
+
+        with open(full, "rb") as fh:
+            after = fh.read()
+        self.assertEqual(after, before)
+
+        intents_dir = os.path.join(self.root, ".brain", "journal", "intents")
+        self.assertEqual(os.listdir(intents_dir) if os.path.isdir(intents_dir) else [], [])
+        self.assertEqual(sorted(os.listdir(change_records_dir)), change_records_before)
+        self.assertEqual(os.listdir(os.path.dirname(full)), ["noop.md"])
+
+    def test_noop_update_with_stale_expected_version_is_refused_version_mismatch(self):
+        """Twin: precedence pins expected_version before no_change -- a
+        no-op-by-bytes request whose expected_version is stale is
+        version_mismatch, not no_change. The JSON matches what a stale
+        non-no-op update returns from step 4 today, so a caller cannot tell
+        which check refused it (agent-brain #38/#42)."""
+        created = self._create("documents/noopstale/noopstale.md")
+        full = os.path.join(self.root, "documents/noopstale/noopstale.md")
+        first_update = {
+            "operation": "update",
+            "path": "documents/noopstale/noopstale.md",
+            "expected_version": created["version"],
+            "frontmatter": {"title": "Renamed"},
+        }
+        _, moved = self.persist(first_update)
+        self.assertEqual(moved["outcome"], "written", moved)
+        with open(full, "rb") as fh:
+            before = fh.read()
+
+        # Its own values already equal what the target now holds (a no-op by
+        # bytes), but expected_version still names the original, stale
+        # version.
+        stale_request = {
+            "operation": "update",
+            "path": "documents/noopstale/noopstale.md",
+            "expected_version": created["version"],
+            "frontmatter": {"title": "Renamed"},
+        }
+        proc, doc = self.persist(stale_request)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "version_mismatch", "observed_sha256": moved["version"]},
+        )
+        self.assertEqual(proc.returncode, 2)
+        with open(full, "rb") as fh:
+            after = fh.read()
+        self.assertEqual(after, before)
+
+    def test_stale_non_noop_that_reconstructs_earlier_bytes_stays_version_mismatch(self):
+        """Twin (stale, not a no-op): the target moved from version A to B. A
+        request naming expected_version A, whose values reconstruct A's exact
+        bytes, has intended SHA-256 = A = expected_version but != current (B).
+        It must stay version_mismatch and never become no_change (agent-brain
+        #38/#42)."""
+        created = self._create("documents/stalenonoop/stalenonoop.md")  # version A
+        full = os.path.join(self.root, "documents/stalenonoop/stalenonoop.md")
+
+        moved_request = {
+            "operation": "update",
+            "path": "documents/stalenonoop/stalenonoop.md",
+            "expected_version": created["version"],
+            "frontmatter": {"status": "complete"},
+        }
+        _, moved = self.persist(moved_request)  # version B
+        self.assertEqual(moved["outcome"], "written", moved)
+        self.assertNotEqual(moved["version"], created["version"])
+        with open(full, "rb") as fh:
+            before = fh.read()
+
+        # Reconstructs A's exact bytes (the field goes back to its original
+        # value) while still naming A as expected_version.
+        reconstruct_request = {
+            "operation": "update",
+            "path": "documents/stalenonoop/stalenonoop.md",
+            "expected_version": created["version"],
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
+        }
+        proc, doc = self.persist(reconstruct_request)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "version_mismatch", "observed_sha256": moved["version"]},
+        )
+        self.assertEqual(proc.returncode, 2)
+        with open(full, "rb") as fh:
+            after = fh.read()
+        self.assertEqual(after, before)
+
+        # Proves the twin's premise: the refused request's own values really
+        # do reconstruct A's exact bytes. Applying those same values with the
+        # correct (current) expected_version -- B -- is an ordinary written
+        # update, not a no-op (intended bytes A != current bytes B), and its
+        # resulting version is exactly A's hash.
+        proof_request = {
+            "operation": "update",
+            "path": "documents/stalenonoop/stalenonoop.md",
+            "expected_version": moved["version"],
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
+        }
+        proc, proof = self.persist(proof_request)
+        self.assertEqual(proof["outcome"], "written", proof)
+        self.assertEqual(proof["version"], created["version"])
+
+    def test_path_is_not_locked_after_a_no_change_refusal(self):
+        """A later real update against the same expected_version is written
+        (agent-brain #38/#42)."""
+        created = self._create("documents/notlocked/notlocked.md")
+        noop_request = {
+            "operation": "update",
+            "path": "documents/notlocked/notlocked.md",
+            "expected_version": created["version"],
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
+        }
+        _, doc = self.persist(noop_request)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "no_change", "observed_sha256": created["version"]},
+        )
+
+        real_request = {
+            "operation": "update",
+            "path": "documents/notlocked/notlocked.md",
+            "expected_version": created["version"],
+            "frontmatter": {"status": "complete"},
+        }
+        proc, doc = self.persist(real_request)
+        self.assertEqual(doc["outcome"], "written", doc)
+        self.assertEqual(proc.returncode, 0)
+
+    def test_replace_frontmatter_request_is_unaffected_by_the_noop_check(self):
+        """Scope (agent-brain #38/#42): the no-op check applies only to a
+        targeted-replacement update, the route that produces intended bytes.
+        replace_frontmatter stays review_required as on the base -- it is
+        refused before this function ever computes intended bytes (A4: no
+        request field marks a write reviewed)."""
+        created = self._create("documents/replacenoop/replacenoop.md")
+        request = {
+            "operation": "update",
+            "path": "documents/replacenoop/replacenoop.md",
+            "expected_version": created["version"],
+            "replace_frontmatter": True,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+        }
+        proc, doc = self.persist(request)
+        self.assertEqual(doc, {"outcome": "refused", "reason": "review_required"})
+        self.assertEqual(proc.returncode, 2)
+
+
+class NoOpUpdateFaultSeamTests(PersistTestCase):
+    """agent-brain #38/#42: with BRAIN_TEST_FAULTS=1 and BRAIN_FAULT=after_intent:kill, both
+    no-op requests (current and stale expected_version) exit 2 with their
+    refusal and never die by SIGKILL, because the after_intent checkpoint is
+    never reached -- the refusal returns before `run_persist` ever writes an
+    intent (agent-brain #38/#42)."""
+
+    def _run_with_after_intent_kill(self, request, root):
+        return support.run_brain(
+            ["persist", "--root", root],
+            input_data=json.dumps(request),
+            env=dict(os.environ, BRAIN_TEST_FAULTS="1", BRAIN_FAULT="after_intent:kill"),
+        )
+
+    def _assert_end_state_untouched(self, root, path, expected_bytes, head_before):
+        full = os.path.join(root, path)
+        with open(full, "rb") as fh:
+            self.assertEqual(fh.read(), expected_bytes)
+        intents_dir = os.path.join(root, ".brain", "journal", "intents")
+        self.assertEqual(os.listdir(intents_dir) if os.path.isdir(intents_dir) else [], [])
+        self.assertEqual(os.listdir(os.path.dirname(full)), [os.path.basename(full)])
+        backups_dir = os.path.join(root, ".brain", "state", "backups")
+        self.assertEqual(os.listdir(backups_dir) if os.path.isdir(backups_dir) else [], [])
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        self.assertEqual(head_after, head_before)
+
+    def test_current_and_stale_noop_requests_never_die_by_sigkill_and_leave_no_trace(self):
+        root = self.git_root()
+        created = self._create("documents/faultnoop/faultnoop.md", root=root)
+        full = os.path.join(root, "documents/faultnoop/faultnoop.md")
+        with open(full, "rb") as fh:
+            original_bytes = fh.read()
+        change_records_dir = os.path.join(root, ".brain", "journal", "change_records")
+        change_records_before = sorted(os.listdir(change_records_dir))
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        current_request = {
+            "operation": "update",
+            "path": "documents/faultnoop/faultnoop.md",
+            "expected_version": created["version"],
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
+        }
+        proc = self._run_with_after_intent_kill(current_request, root)
+        self.assertEqual(proc.returncode, 2, proc)  # never killed: a SIGKILL death is negative
+        doc = support.parse_single_json(proc.stdout)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "no_change", "observed_sha256": created["version"]},
+        )
+        self._assert_end_state_untouched(
+            root, "documents/faultnoop/faultnoop.md", original_bytes, head_before
+        )
+        self.assertEqual(sorted(os.listdir(change_records_dir)), change_records_before)
+
+        stale_request = {
+            "operation": "update",
+            "path": "documents/faultnoop/faultnoop.md",
+            "expected_version": "0" * 64,
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
+        }
+        proc = self._run_with_after_intent_kill(stale_request, root)
+        self.assertEqual(proc.returncode, 2, proc)
+        doc = support.parse_single_json(proc.stdout)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "version_mismatch", "observed_sha256": created["version"]},
+        )
+        self._assert_end_state_untouched(
+            root, "documents/faultnoop/faultnoop.md", original_bytes, head_before
+        )
+        self.assertEqual(sorted(os.listdir(change_records_dir)), change_records_before)
 
 
 class AttachTests(PersistTestCase):

@@ -10,7 +10,10 @@ a test shows that the injection landed: the process died by SIGKILL (or
 reported `written_incomplete`) and the on-disk state is what that interrupted
 write leaves. Expected hashes come from `hashlib` over bytes the test read, and
 expected op keys from the intent file the interrupted write left, never from
-recomputing the code's own formula.
+recomputing the code's own formula. One exception:
+`AppliedTests.test_update_that_leaves_its_bytes_unchanged_and_was_killed_after_apply_is_applied`
+builds its interrupted state by hand, since persist can no longer produce an
+equal-hash intent for `recover` to classify (agent-brain #38/#42).
 """
 
 import hashlib
@@ -310,32 +313,64 @@ class AppliedTests(RecoverTestCase):
 
     def test_update_that_leaves_its_bytes_unchanged_and_was_killed_after_apply_is_applied(self):
         """C6 classification order: a target holding `intended_sha256` is
-        `applied` first. When an update sets a property to the value it already
-        holds, `expected_prior` and `intended_sha256` are the same hash and the
-        target matches both; the write still reached `after_apply`, so its
-        record and commit are owed and `not_applied` would discard them."""
+        `applied` first. An update that would leave a target's bytes
+        unchanged -- `expected_prior` and `intended_sha256` the same hash --
+        can no longer be produced through `persist` (agent-brain #38/#42): a
+        no-op update is now refused before any intent exists. This
+        state is therefore built by hand: a real `create` gets the target
+        committed in `HEAD` (as the earlier create used to leave it), then the
+        intent, its backup and its consumed temp are written directly, exactly
+        as the killed persist used to leave them, at the file name
+        `persist._intent_path` gives that path."""
         path = "documents/samebytes/samebytes.md"
         created = self.created_in_fresh_brain(path, git=True)
         prior_hash = created["version"]
-        request = {
+        with open(self.full(path), "rb") as fh:
+            target_bytes = fh.read()
+        self.assertEqual(hashlib.sha256(target_bytes).hexdigest(), prior_hash)
+
+        # The target is already committed in HEAD, exactly as W3 requires --
+        # the earlier `create` left it clean, and nothing has touched it since.
+        self.assertEqual(self.git("status", "--porcelain", "--", path).strip(), "")
+
+        # A hand-built backup, named the way persist's own
+        # `_plan_backup_path` names it (sha256 of the target's full path text,
+        # in the backups folder) -- without importing persist -- and a
+        # hand-built, already-consumed temp path (its recorded name carries
+        # persist's temp prefix and lies in the target's own folder, but the
+        # file itself does not exist -- the replace already consumed it).
+        backup_name = hashlib.sha256(self.full(path).encode("utf-8")).hexdigest() + ".bak"
+        backup_path = os.path.join(self.root, ".brain", "state", "backups", backup_name)
+        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+        with open(backup_path, "wb") as fh:
+            fh.write(target_bytes)
+        temp_path = os.path.join(
+            self.root, "documents", "samebytes", ".brain-persist-tmp-999-handcraftedtemp01"
+        )
+        self.assertFalse(os.path.exists(temp_path))
+
+        op_key = "handcrafted-op-key-0001"
+        intent = {
+            "run_id": "handcrafted-run-0001",
+            "op_key": op_key,
             "operation": "update",
             "path": path,
-            "expected_version": prior_hash,
-            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},  # already what it holds
+            "expected_prior": prior_hash,
+            "intended_sha256": prior_hash,
+            "temp_path": temp_path,
+            "backup_path": backup_path,
         }
-        self.persist_killed(request, "after_apply")
+        intents_dir = os.path.join(self.root, ".brain", "journal", "intents")
+        os.makedirs(intents_dir, exist_ok=True)
+        intent_file = path.replace("/", "__") + ".json"
+        with open(os.path.join(intents_dir, intent_file), "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
 
-        # The injection landed after the apply, and the degenerate state is
-        # really there: prior and intended are one hash and the target holds
-        # it. Only the update's apply step writes a backup and consumes the
-        # temp, so both prove the replace ran rather than being assumed.
-        intent = self.only_intent()
-        self.assertEqual(intent["expected_prior"], prior_hash)
-        self.assertEqual(intent["intended_sha256"], prior_hash)
+        # The hand-built state is really there: prior and intended are one
+        # hash, the target holds it, a backup exists and the temp does not.
         self.assertEqual(_sha256_file(self.full(path)), prior_hash)
-        self.assertTrue(os.path.isfile(intent["backup_path"]))
-        self.assertFalse(os.path.exists(intent["temp_path"]))
-        op_key = intent["op_key"]
+        self.assertTrue(os.path.isfile(backup_path))
+        self.assertFalse(os.path.exists(temp_path))
         self.assertEqual(self.change_records_for(op_key), [])
         self.assertEqual(self.commits_for(op_key), [])
 

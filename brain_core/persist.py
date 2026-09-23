@@ -743,6 +743,18 @@ def _prepare_update(request, path, root, base_dir, zone, current_bytes, yaml_mod
     new_text = "---\n" + new_block_text + "---\n" + fm.body_text
     intended_bytes = new_text.encode("utf-8")
 
+    # agent-brain #38/#42: a no-op update -- intended bytes equal to the
+    # target's current bytes -- is refused here, at the point the intended
+    # bytes are known and before `run_persist` ever writes an intent (C6 step
+    # 2), so it can never leave a permanently locked path. Precedence is
+    # pinned: expected_version is checked before no_change, so a stale no-op
+    # reads the same as a stale non-no-op (both refused from step 4 today).
+    current_sha256 = gitutil.hash_bytes(current_bytes)
+    if gitutil.hash_bytes(intended_bytes) == current_sha256:
+        if expected_version != current_sha256:
+            return {"refused": "version_mismatch", "observed_sha256": current_sha256}
+        return {"refused": "no_change", "observed_sha256": current_sha256}
+
     return {
         "intended_bytes": intended_bytes,
         "expected_prior": expected_version,

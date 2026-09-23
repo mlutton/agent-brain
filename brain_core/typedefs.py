@@ -115,6 +115,11 @@ def load_custom_types(registry, root):
         rel_path = os.path.relpath(os.path.join(custom_dir, name), root).replace(os.sep, "/")
         path = os.path.join(custom_dir, name)
         try:
+            # Opening a FIFO would block until a writer appears, so anything
+            # but a regular file is a definition this command cannot use.
+            if not stat.S_ISREG(os.stat(path).st_mode):
+                registry.add_definition_error(rel_path, "malformed_definition", "not a regular file")
+                continue
             with open(path, "r", encoding="utf-8") as fh:
                 raw_text = fh.read()
             data = json.loads(raw_text)

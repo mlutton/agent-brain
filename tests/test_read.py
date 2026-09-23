@@ -257,13 +257,19 @@ class NotFoundTests(ReadTestCase):
 
     def test_a_missing_id_and_a_missing_path_are_not_found_and_existing_ones_are_ok(self):
         self.commit_file("documents/here/here.md", doc(ID_ONE, "Here", "Body.\n"))
-        for request in ({"id": ID_TWO}, {"path": "documents/gone/gone.md"}):
-            with self.subTest(missing=request):
-                proc, result = self.read(dict(request, max_bytes=4096))
-                self.assertEqual(proc.returncode, 0, proc)
-                self.assertEqual(result["outcome"], "not_found", result)
-                for key in ("excerpt", "frontmatter", "version"):
-                    self.assertNotIn(key, result)
+        # By id: no resolved path exists, so `path` is never named (Q1).
+        proc, result = self.read({"id": ID_TWO, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "not_found", result)
+        for key in ("excerpt", "frontmatter", "version", "path"):
+            self.assertNotIn(key, result)
+        # By path: the request resolved to a zone path, so it is named (A4).
+        proc, result = self.read({"path": "documents/gone/gone.md", "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "not_found", result)
+        self.assertEqual(result["path"], "documents/gone/gone.md")
+        for key in ("excerpt", "frontmatter", "version"):
+            self.assertNotIn(key, result)
         for request in ({"id": ID_ONE}, {"path": "documents/here/here.md"}):
             with self.subTest(existing=request):
                 proc, result = self.read(dict(request, max_bytes=4096))
@@ -290,6 +296,9 @@ class NotFoundTests(ReadTestCase):
                 self.assertEqual(proc.returncode, 0, proc)
                 self.assertEqual(result["outcome"], "not_found", result)
                 self.assertNotIn("excerpt", result)
+                # None of these ever resolved to a zone path, so the caller's
+                # string is never echoed back as `path` (G3-Q2).
+                self.assertNotIn("path", result)
 
 
 class InvalidTests(ReadTestCase):
@@ -311,6 +320,8 @@ class InvalidTests(ReadTestCase):
                 proc, result = self.read({"path": rel, "max_bytes": 4096})
                 self.assertEqual(proc.returncode, 0, proc)
                 self.assertEqual(result["outcome"], "invalid", result)
+                # A4: every withholding outcome names its resolved path.
+                self.assertEqual(result["path"], rel)
         proc, result = self.read({"path": "documents/good/good.md", "max_bytes": 4096})
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(result["outcome"], "ok", result)
@@ -325,7 +336,169 @@ class UnsupportedVersionTests(ReadTestCase):
         proc, result = self.read({"path": "documents/newer/newer.md", "max_bytes": 4096})
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(result["outcome"], "unsupported_version", result)
+        self.assertEqual(result["path"], "documents/newer/newer.md")
         proc, result = self.read({"path": "documents/older/older.md", "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "ok", result)
+
+
+class FieldContractTests(ReadTestCase):
+    """A1/A2: a `kb: 1` document is checked against C5's field contract with
+    `fields.validate_mapping`, on the same type registry `validate` builds. A
+    failure is withheld as `invalid` naming the resolved path (exit 0; C1's
+    exit 3 belongs to `validate`, never to `read`)."""
+
+    WIDGET_DEF = json.dumps(
+        {
+            "type": "widget",
+            "zones": ["projects"],
+            "required": [],
+            "allowed_values": {},
+            "display_fields": [],
+            "search_fields": [],
+        }
+    )
+    MODULE_JSON = json.dumps({"module": "projects", "folder": "projects"})
+
+    def _lines(self, *, omit=(), **overrides):
+        """A literal `kb: 1` frontmatter block, every field independently
+        authored here (never copied from the product's own rendering)."""
+        # No uncertainty values among these defaults (unlike ID_ONE's usual
+        # "unknown"/empty pattern elsewhere), so no `needs_review` entry is
+        # owed and the control fixture is valid with none declared.
+        fields_ = {
+            "kb": "1",
+            "id": f'"{ID_ONE}"',
+            "type": '"note"',
+            "title": '"Sample title"',
+            "summary": '"Fixture summary."',
+            "status": '"draft"',
+            "created": "2026-01-01",
+            "reviewed": "2026-01-01",
+            "origin": '"authored"',
+            "evidence": "[]",
+            "kind": '"decision"',
+            "authored_by": '"human"',
+            "retention": '"durable"',
+        }
+        fields_.update(overrides)
+        for key in omit:
+            fields_.pop(key, None)
+        lines = ["---"]
+        for key, value in fields_.items():
+            lines.append(f"{key}:" if value == "" else f"{key}: {value}")
+        lines.append("---")
+        return "\n".join(lines) + "\nBody.\n"
+
+    def build_fixture(self):
+        """One brain with a valid control and one fixture per C5 failure this
+        story is scoped to, plus a custom type confined to a module zone.
+        Returns {path: True-if-C5-should-withhold-it}."""
+        cases = {
+            "documents/valid/valid.md": (self._lines(), False),
+            "documents/origin_absent/origin_absent.md": (self._lines(omit=("origin",)), True),
+            "documents/origin_empty/origin_empty.md": (self._lines(origin=""), True),
+            "documents/origin_ambiguous/origin_ambiguous.md": (self._lines(origin="yes"), True),
+            "documents/unknown_type/unknown_type.md": (self._lines(type='"bogus"'), True),
+            "documents/title_missing/title_missing.md": (self._lines(omit=("title",)), True),
+        }
+        for path, (text, _expect) in cases.items():
+            self.commit_file(path, text)
+        self.write(".brain/types/custom/widget.json", self.WIDGET_DEF)
+        self.write(".brain/modules/projects/module.json", self.MODULE_JSON)
+        widget_ok = self._lines(type='"widget"')
+        widget_wrong_zone = self._lines(type='"widget"')
+        self.commit_file("projects/widget_ok/widget_ok.md", widget_ok)
+        self.commit_file("documents/widget_wrong_zone/widget_wrong_zone.md", widget_wrong_zone)
+        cases["projects/widget_ok/widget_ok.md"] = (widget_ok, False)
+        cases["documents/widget_wrong_zone/widget_wrong_zone.md"] = (widget_wrong_zone, True)
+        return {path: expect for path, (_text, expect) in cases.items()}
+
+    def test_c5_invalid_documents_are_withheld_with_their_path_and_valid_ones_stay_ok(self):
+        expectations = self.build_fixture()
+        for path, expect_invalid in expectations.items():
+            with self.subTest(path=path):
+                proc, result = self.read({"path": path, "max_bytes": 4096})
+                self.assertEqual(proc.returncode, 0, proc)
+                if expect_invalid:
+                    self.assertEqual(result["outcome"], "invalid", result)
+                    self.assertEqual(result["path"], path)
+                else:
+                    self.assertEqual(result["outcome"], "ok", result)
+
+    def test_agreement_with_validate_on_the_same_brain(self):
+        # A2: `read` says `invalid` exactly when `validate` lists that path as
+        # `invalid`. Both commands run against the very same brain, so this
+        # is the one place a sibling command's own output stands in as the
+        # independent expected value.
+        expectations = self.build_fixture()
+        proc = support.run_brain(["validate", "--root", self.root], timeout=_TIMEOUT)
+        report = support.parse_single_json(proc.stdout)
+        validate_status = {d["path"]: d["status"] for d in report["documents"]}
+        for path in expectations:
+            with self.subTest(path=path):
+                self.assertIn(path, validate_status)
+                _proc, result = self.read({"path": path, "max_bytes": 4096})
+                self.assertEqual(result["outcome"] == "invalid", validate_status[path] == "invalid")
+
+
+class PrecedenceOverInvalidTests(ReadTestCase):
+    """A5: the C8 verdict is decided first. A file the journal names stays
+    `unpublished` even though its content also fails C5 -- the check that
+    fires only after a published verdict never gets a chance to overrule it."""
+
+    PATH = "documents/pending/pending.md"
+
+    def intent_for(self, path):
+        intent = {
+            "run_id": "fixture-run", "op_key": "fixture-op", "operation": "create",
+            "path": path, "expected_prior": "absent", "intended_sha256": "0" * 64,
+            "temp_path": "fixture-temp", "backup_path": None,
+        }
+        self.write(".brain/journal/intents/fixture.json", json.dumps(intent))
+
+    def test_an_open_intent_wins_over_a_c5_invalid_document(self):
+        # Missing summary, status, created, reviewed, origin, evidence, kind,
+        # authored_by and retention: unambiguously C5-invalid on its own.
+        invalid_text = f'---\nkb: 1\nid: "{ID_ONE}"\ntype: "note"\ntitle: "x"\n---\nBody.\n'
+        self.write(self.PATH, invalid_text)
+        self.intent_for(self.PATH)
+        proc, result = self.read({"path": self.PATH, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, result), (0, {"outcome": "unpublished", "path": self.PATH}))
+
+
+class NoteAbsentFieldsTests(ReadTestCase):
+    """A10: a note (no `kb`) that carries neither `origin` nor `id` renders
+    neither key -- never `origin: "unknown"`, never `id: null` (G3-Q1)."""
+
+    def test_a_plain_note_missing_origin_and_id_has_neither_key(self):
+        text = "---\ntitle: Just a title\n---\nBody.\n"
+        self.commit_file("documents/plain2/plain2.md", text)
+        proc, result = self.read({"path": "documents/plain2/plain2.md", "max_bytes": 4096})
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertNotIn("origin", result)
+        self.assertNotIn("id", result)
+        self.assertEqual(result["frontmatter"], {"title": "Just a title"})
+
+
+class CustomTypeFifoTests(ReadTestCase):
+    """A11/G3-Q4: `read` now loads custom type definitions too (for its C5
+    check), so a FIFO definition file must not hang it either, mirroring the
+    guard `typedefs.detect_installed_modules` already has (agent-brain #35
+    path 2)."""
+
+    def test_a_fifo_custom_definition_does_not_hang_read(self):
+        self.commit_file("documents/plain/plain.md", doc(ID_ONE, "Plain", "Body.\n"))
+        os.mkfifo(self.full(".brain/types/custom/recipe.json"))
+        try:
+            proc = support.run_brain(
+                ["read", "--root", self.root],
+                input_data=json.dumps({"path": "documents/plain/plain.md", "max_bytes": 4096}),
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("read did not exit within 20 seconds of meeting a FIFO custom type definition")
+        result = support.parse_single_json(proc.stdout)
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(result["outcome"], "ok", result)
 
@@ -393,7 +566,10 @@ class OriginTests(ReadTestCase):
             ]
         )
         review = ["needs_review:", '  - "origin"']
-        self.commit_file("documents/refs/refs.md", doc(ID_ONE, "Sourced", "Body.\n", origin=references))
+        # One entry's `retrieved` is empty, which is itself an uncertainty
+        # value (C5): declaring it in `needs_review` keeps this C5-valid, so
+        # the fixture stays `ok` under G3's read-time field check.
+        self.commit_file("documents/refs/refs.md", doc(ID_ONE, "Sourced", "Body.\n", origin=references, extra=review))
         self.commit_file("documents/mine/mine.md", doc(ID_TWO, "Written here", "Body.\n", origin='"authored"'))
         self.commit_file(
             "documents/dunno/dunno.md", doc(ID_THREE, "Unknown source", "Body.\n", origin='"unknown"', extra=review)
@@ -406,13 +582,17 @@ class OriginTests(ReadTestCase):
             ],
             "documents/mine/mine.md": "authored",
             "documents/dunno/dunno.md": "unknown",
-            "documents/loose/loose.md": "unknown",  # an unmanaged note records no origin at all
         }
         for path, origin in expected.items():
             with self.subTest(path=path):
                 proc, result = self.read({"path": path, "max_bytes": 4096})
                 self.assertEqual(result["outcome"], "ok", result)
                 self.assertEqual(result["origin"], origin)
+        # An unmanaged note (no `kb`) that records no origin at all gets no
+        # manufactured value: the key is absent, never "unknown" (G3-Q1).
+        proc, result = self.read({"path": "documents/loose/loose.md", "max_bytes": 4096})
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertNotIn("origin", result)
 
 
 class SupportTests(ReadTestCase):
@@ -501,7 +681,7 @@ class UnevaluablePublicationTests(ReadTestCase):
         shutil.rmtree(self.full(".git"))
         proc, result = self.read({"path": "documents/gone.md", "max_bytes": 4096})
         self.assertEqual((proc.returncode, result),
-                         (0, {"outcome": "unverified", "reason": "git_unavailable"}))
+                         (0, {"outcome": "unverified", "reason": "git_unavailable", "path": "documents/gone.md"}))
 
     def shim_git(self, script):
         """Puts a `git` first on PATH and returns the environment that finds it
@@ -531,6 +711,9 @@ class UnevaluablePublicationTests(ReadTestCase):
                 self.assertEqual(proc.returncode, 0, proc)
                 self.assertEqual(result["outcome"], "unverified", result)
                 self.assertEqual(result["reason"], "git_unavailable")
+                # The id resolves locally (no git needed to scan for it), so
+                # both requests resolve to the same path, which is named (A4).
+                self.assertEqual(result["path"], self.PATH)
                 for key in WITHHELD_KEYS:
                     self.assertNotIn(key, result)
 
@@ -749,11 +932,21 @@ class DocumentRoleTests(ReadTestCase):
             self.assertIn(key, result)
 
 
+# `type: document` requires source_identity, original and original_sha256
+# (C5); a fixed, C5-valid triple for every DescentTests/MergeDescentTests
+# fixture, whose actual concern is publication descent, not field validity.
+DOCUMENT_EXTRA = [
+    'source_identity: "https://example.invalid/lineage"',
+    'original: "original/source.md"',
+    f'original_sha256: "{"0" * 64}"',
+]
+
+
 class DescentTests(ReadTestCase):
     PATH = "documents/lineage/doc.md"
 
     def recorded(self):
-        original = doc(ID_ONE, "Recorded", "First body.\n", type_="document")
+        original = doc(ID_ONE, "Recorded", "First body.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.publication_commit("ingest", {self.PATH: original},
                                 [(self.PATH, sha(original.encode()), "absent", "document")])
         return original
@@ -773,7 +966,7 @@ class DescentTests(ReadTestCase):
     def test_untouched_and_consistent_update_descend(self):
         original = self.recorded()
         self.assertEqual((self.outcome()["outcome"], self.outcome()["role"]), ("ok", "document"))
-        changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document")
+        changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.publication_commit("update", {self.PATH: changed},
                                 [(self.PATH, sha(changed.encode()), sha(original.encode()), None)])
         self.assertEqual(self.outcome()["outcome"], "ok")
@@ -783,7 +976,7 @@ class DescentTests(ReadTestCase):
             with self.subTest(operation=operation):
                 base = self.git("rev-parse", "HEAD").strip()
                 original = self.recorded()
-                changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document")
+                changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document", extra=DOCUMENT_EXTRA)
                 self.publication_commit(operation, {self.PATH: changed},
                                         [(self.PATH, declared_hash or sha(changed.encode()),
                                           sha(original.encode()), None)])
@@ -797,7 +990,7 @@ class DescentTests(ReadTestCase):
 
     def test_update_prior_need_not_chain_to_previous_blob(self):
         self.recorded()
-        changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document")
+        changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.publication_commit("update", {self.PATH: changed},
                                 [(self.PATH, sha(changed.encode()), "f" * 64, None)])
         self.assertEqual(self.outcome()["outcome"], "ok")
@@ -819,9 +1012,9 @@ class DescentTests(ReadTestCase):
             with self.subTest(change_again=change_again):
                 base = self.git("rev-parse", "HEAD").strip()
                 self.recorded()
-                hand_edit = doc(ID_ONE, "Recorded", "Hand edit.\n", type_="document")
+                hand_edit = doc(ID_ONE, "Recorded", "Hand edit.\n", type_="document", extra=DOCUMENT_EXTRA)
                 self.commit_file(self.PATH, hand_edit)
-                current = doc(ID_ONE, "Recorded", "New ingest.\n", type_="document") if change_again else hand_edit
+                current = doc(ID_ONE, "Recorded", "New ingest.\n", type_="document", extra=DOCUMENT_EXTRA) if change_again else hand_edit
                 if change_again:
                     self.publication_commit("ingest", {self.PATH: current},
                                             [(self.PATH, sha(current.encode()), sha(hand_edit.encode()), "document")])
@@ -837,7 +1030,7 @@ class DescentTests(ReadTestCase):
 
     def test_uncommitted_edit_keeps_document_published_with_label(self):
         self.recorded()
-        self.write(self.PATH, doc(ID_ONE, "Recorded", "Hand edit.\n", type_="document"))
+        self.write(self.PATH, doc(ID_ONE, "Recorded", "Hand edit.\n", type_="document", extra=DOCUMENT_EXTRA))
         result = self.outcome()
         self.assertEqual((result["outcome"], result.get("role"), result.get("labels")),
                          ("ok", "document", {"changed_out_of_band": True}))
@@ -858,16 +1051,16 @@ class MergeDescentTests(ReadTestCase):
 
     def test_side_plain_edit_kept_by_merge_breaks_descent(self):
         primary = self.branch()
-        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document"))
+        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document", extra=DOCUMENT_EXTRA))
         self.git("checkout", "-q", primary)
         self.merge()
         self.assertEqual(self.outcome()["outcome"], "unverified")
 
     def test_side_plain_edit_discarded_by_merge_is_not_judged(self):
         primary = self.branch()
-        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document"))
+        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document", extra=DOCUMENT_EXTRA))
         self.git("checkout", "-q", primary)
-        main = doc(ID_ONE, "Recorded", "Main edit.\n", type_="document")
+        main = doc(ID_ONE, "Recorded", "Main edit.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.publication_commit("update", {self.PATH: main},
                                 [(self.PATH, sha(main.encode()), "f" * 64, None)])
         self.git("merge", "-q", "-s", "ours", "--no-ff", "-m", "Discard side edit", "fixture-side")
@@ -875,22 +1068,22 @@ class MergeDescentTests(ReadTestCase):
 
     def test_merge_introducing_new_blob_breaks_descent(self):
         primary = self.branch()
-        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document"))
+        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document", extra=DOCUMENT_EXTRA))
         self.git("checkout", "-q", primary)
-        main = doc(ID_ONE, "Recorded", "Main edit.\n", type_="document")
+        main = doc(ID_ONE, "Recorded", "Main edit.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.publication_commit("update", {self.PATH: main},
                                 [(self.PATH, sha(main.encode()), "f" * 64, None)])
         proc = subprocess.run(["git", "merge", "--no-ff", "--no-commit", "fixture-side"],
                               cwd=self.root, capture_output=True, text=True, env=dict(os.environ, **_GIT_ENV))
         self.assertNotEqual(proc.returncode, 0)
-        self.write(self.PATH, doc(ID_ONE, "Recorded", "Merge edit.\n", type_="document"))
+        self.write(self.PATH, doc(ID_ONE, "Recorded", "Merge edit.\n", type_="document", extra=DOCUMENT_EXTRA))
         self.git("add", "--", self.PATH)
         self.git("commit", "-q", "-m", "Resolve with new bytes")
         self.assertEqual(self.outcome()["outcome"], "unverified")
 
     def test_side_brain_write_kept_by_merge_descends(self):
         primary = self.branch()
-        changed = doc(ID_ONE, "Recorded", "Side edit.\n", type_="document")
+        changed = doc(ID_ONE, "Recorded", "Side edit.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.publication_commit("update", {self.PATH: changed},
                                 [(self.PATH, sha(changed.encode()), "f" * 64, None)])
         self.git("checkout", "-q", primary)
@@ -899,7 +1092,7 @@ class MergeDescentTests(ReadTestCase):
 
     def test_equal_parent_blobs_require_both_lineages_to_descend(self):
         primary = self.branch()
-        changed = doc(ID_ONE, "Recorded", "Same bytes.\n", type_="document")
+        changed = doc(ID_ONE, "Recorded", "Same bytes.\n", type_="document", extra=DOCUMENT_EXTRA)
         self.commit_file(self.PATH, changed)
         self.git("checkout", "-q", primary)
         self.publication_commit("update", {self.PATH: changed},
@@ -1403,7 +1596,8 @@ class AbsentPathTests(BundleTestCase):
         self.assertEqual((proc.returncode, unpublished),
                          (0, {"outcome": "unpublished", "path": target}))
         proc, missing = self.read({"path": "documents/absent/other.md", "max_bytes": 4096})
-        self.assertEqual((proc.returncode, missing), (0, {"outcome": "not_found"}))
+        self.assertEqual((proc.returncode, missing),
+                         (0, {"outcome": "not_found", "path": "documents/absent/other.md"}))
 
 
 if __name__ == "__main__":

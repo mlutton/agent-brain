@@ -11,7 +11,7 @@ content, and resolving the evidence references. No caller sequences any of it.
 import datetime
 import os
 
-from . import publication, typedefs
+from . import fields, publication, typedefs
 from .publication import _GitUnavailable, _parse, _sha256, _read_bytes
 
 
@@ -61,6 +61,19 @@ def _readable_path(root, path):
         if os.path.islink(current):
             return None
     return path if os.path.isfile(current) else None
+
+
+def _names_a_zone_file(root, path):
+    """Whether `path` names a location a file could sit at: no symbolic link
+    along the way, and nothing already there is some other kind of entry (a
+    folder). A merely absent file still names one; a link or a folder never
+    resolved to a zone path at all (G3-Q2), same as `..` or a hidden name."""
+    current = root
+    for part in path.split("/"):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return False
+    return not os.path.isdir(current)
 
 
 def _id_index(root, module_folders, yaml_module, duplicate_loader, pub):
@@ -138,17 +151,30 @@ def _retained(request, root, path, record):
 
 def _content_fields(request, raw_bytes, parsed, index):
     """The fields that are the file's content, which an unpublished or
-    unverified file withholds."""
+    unverified file withholds. A read never supplies a value the file does
+    not contain (the spec sentence, C10): `id` and `origin` are each present
+    only when the file's own frontmatter carries them."""
     excerpt, truncated = _bounded(parsed.body.encode("utf-8"), request["max_bytes"])
-    return {
-        "id": parsed.mapping.get("id"),
+    result = {
         "version": _sha256(raw_bytes),
         "frontmatter": _jsonable(parsed.mapping),
         "evidence": _evidence_of(parsed.mapping, index),
-        "origin": _jsonable(parsed.mapping.get("origin", "unknown")),
         "excerpt": excerpt,
         "truncated": truncated,
     }
+    if "id" in parsed.mapping:
+        result["id"] = parsed.mapping["id"]
+    if "origin" in parsed.mapping:
+        result["origin"] = _jsonable(parsed.mapping["origin"])
+    return result
+
+
+def _type_registry(root, base_dir):
+    """The same type registry `validate` builds: base types beside the
+    running code, then the brain's own custom definitions."""
+    registry = typedefs.load_base_types(base_dir)
+    typedefs.load_custom_types(registry, root)
+    return registry
 
 
 def _unverified(request, path, raw_bytes, parsed, index, **why):
@@ -160,7 +186,7 @@ def _unverified(request, path, raw_bytes, parsed, index, **why):
     return result, 0
 
 
-def _read_located(request, root, path, verdict, index, yaml_module, duplicate_loader):
+def _read_located(request, root, base_dir, path, verdict, index, yaml_module, duplicate_loader):
     """Shape a publication verdict and any permitted content as a read report."""
     if verdict["status"] in ("retained", "retained_missing"):
         record = {"role": verdict["role"], "owner": verdict["owner"],
@@ -169,10 +195,12 @@ def _read_located(request, root, path, verdict, index, yaml_module, duplicate_lo
     if verdict["status"] == "unpublished":
         return {"outcome": "unpublished", "path": path}, 0
     if verdict["status"] == "absent":
+        if _names_a_zone_file(root, path):
+            return {"outcome": "not_found", "path": path}, 0
         return {"outcome": "not_found"}, 0
     if verdict["status"] == "unverified" and verdict["reason"] == "git_unavailable":
         result = {"outcome": "unverified", "reason": "git_unavailable"}
-        if _readable_path(root, path) is not None:
+        if _names_a_zone_file(root, path):
             result["path"] = path
         return result, 0
     raw_bytes = _read_bytes(root, path)
@@ -181,9 +209,13 @@ def _read_located(request, root, path, verdict, index, yaml_module, duplicate_lo
         why = {key: verdict[key] for key in ("reason", "hint") if verdict[key] is not None}
         return _unverified(request, path, raw_bytes, parsed, index, **why)
     if parsed.kind == "malformed":
-        return {"outcome": "invalid"}, 0
+        return {"outcome": "invalid", "path": path}, 0
     if parsed.kind == "unsupported_version":
-        return {"outcome": "unsupported_version"}, 0
+        return {"outcome": "unsupported_version", "path": path}, 0
+    if parsed.kind == "managed":
+        zone = path.split("/", 1)[0]
+        if fields.validate_mapping(parsed.mapping, _type_registry(root, base_dir), zone):
+            return {"outcome": "invalid", "path": path}, 0
     labels = {"changed_out_of_band": True} if verdict["changed_out_of_band"] else {}
     result = {"outcome": "ok", "path": path, "role": verdict["role"], "labels": labels}
     result.update(_content_fields(request, raw_bytes, parsed, index))
@@ -209,8 +241,11 @@ def run_read(request, root, base_dir, yaml_module, duplicate_loader):
                 if pub.repo is None else {"outcome": "not_found"}), 0
     try:
         verdict = pub.status(path)
-        return _read_located(request, root, path, verdict, index, yaml_module, duplicate_loader)
+        return _read_located(request, root, base_dir, path, verdict, index, yaml_module, duplicate_loader)
     except _GitUnavailable:
         # The rule cannot be evaluated, and no default may stand in for its
         # answer: publication is unknown, so the file is unverified.
-        return {"outcome": "unverified", "reason": "git_unavailable", "path": path}, 0
+        result = {"outcome": "unverified", "reason": "git_unavailable"}
+        if _names_a_zone_file(root, path):
+            result["path"] = path
+        return result, 0

@@ -257,13 +257,13 @@ class NotFoundTests(ReadTestCase):
 
     def test_a_missing_id_and_a_missing_path_are_not_found_and_existing_ones_are_ok(self):
         self.commit_file("documents/here/here.md", doc(ID_ONE, "Here", "Body.\n"))
-        # By id: no resolved path exists, so `path` is never named (Q1).
+        # By id: no resolved path exists, so `path` is never named.
         proc, result = self.read({"id": ID_TWO, "max_bytes": 4096})
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(result["outcome"], "not_found", result)
         for key in ("excerpt", "frontmatter", "version", "path"):
             self.assertNotIn(key, result)
-        # By path: the request resolved to a zone path, so it is named (A4).
+        # By path: the request resolved to a zone path, so it is named.
         proc, result = self.read({"path": "documents/gone/gone.md", "max_bytes": 4096})
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(result["outcome"], "not_found", result)
@@ -276,19 +276,15 @@ class NotFoundTests(ReadTestCase):
                 self.assertEqual(proc.returncode, 0, proc)
                 self.assertEqual(result["outcome"], "ok", result)
 
-    def test_paths_outside_the_data_zones_are_not_found_even_when_a_file_is_there(self):
-        self.commit_file("documents/here/here.md", doc(ID_ONE, "Here", "Body.\n"))
+    def test_paths_that_never_resolve_to_a_zone_path_are_not_found_with_no_path_key(self):
         outside = os.path.join(os.path.dirname(self.root), os.path.basename(self.root) + "-outside.md")
         self.addCleanup(lambda: os.path.exists(outside) and os.remove(outside))
         with open(outside, "w", encoding="utf-8") as fh:
             fh.write("outside the brain\n")
-        os.symlink(outside, self.full("documents/here/link.md"))
         requests = [
             "../" + os.path.basename(outside),  # a file beside the brain
             outside,  # the same, as an absolute path
             ".brain/journal/epoch.json",  # generated state, present on disk
-            "documents/here/link.md",  # a link to a file outside the brain
-            "documents/here",  # a folder
         ]
         for path in requests:
             with self.subTest(path=path):
@@ -297,8 +293,32 @@ class NotFoundTests(ReadTestCase):
                 self.assertEqual(result["outcome"], "not_found", result)
                 self.assertNotIn("excerpt", result)
                 # None of these ever resolved to a zone path, so the caller's
-                # string is never echoed back as `path` (G3-Q2).
+                # string is never echoed back as `path`.
                 self.assertNotIn("path", result)
+
+    def test_a_directory_and_a_symlink_at_a_resolved_zone_path_are_not_found_with_path(self):
+        # `documents/here` and `documents/here/link.md` both resolve to a zone
+        # path syntactically: the first segment is a scanned zone, and no
+        # segment is `.`, `..` or hidden. What sits there -- a folder, or a
+        # link to a file outside the brain -- does not un-resolve it, so
+        # `not_found` still names it.
+        self.commit_file("documents/here/here.md", doc(ID_ONE, "Here", "Body.\n"))
+        outside = os.path.join(os.path.dirname(self.root), os.path.basename(self.root) + "-outside.md")
+        self.addCleanup(lambda: os.path.exists(outside) and os.remove(outside))
+        with open(outside, "w", encoding="utf-8") as fh:
+            fh.write("outside the brain\n")
+        os.symlink(outside, self.full("documents/here/link.md"))
+        requests = [
+            "documents/here/link.md",  # a link to a file outside the brain
+            "documents/here",  # a folder
+        ]
+        for path in requests:
+            with self.subTest(path=path):
+                proc, result = self.read({"path": path, "max_bytes": 4096})
+                self.assertEqual(proc.returncode, 0, proc)
+                self.assertEqual(result["outcome"], "not_found", result)
+                self.assertEqual(result["path"], path)
+                self.assertNotIn("excerpt", result)
 
 
 class InvalidTests(ReadTestCase):
@@ -320,7 +340,7 @@ class InvalidTests(ReadTestCase):
                 proc, result = self.read({"path": rel, "max_bytes": 4096})
                 self.assertEqual(proc.returncode, 0, proc)
                 self.assertEqual(result["outcome"], "invalid", result)
-                # A4: every withholding outcome names its resolved path.
+                # Every withholding outcome names its resolved path.
                 self.assertEqual(result["path"], rel)
         proc, result = self.read({"path": "documents/good/good.md", "max_bytes": 4096})
         self.assertEqual(proc.returncode, 0, proc)
@@ -343,7 +363,7 @@ class UnsupportedVersionTests(ReadTestCase):
 
 
 class FieldContractTests(ReadTestCase):
-    """A1/A2: a `kb: 1` document is checked against C5's field contract with
+    """A `kb: 1` document is checked against C5's field contract with
     `fields.validate_mapping`, on the same type registry `validate` builds. A
     failure is withheld as `invalid` naming the resolved path (exit 0; C1's
     exit 3 belongs to `validate`, never to `read`)."""
@@ -359,6 +379,21 @@ class FieldContractTests(ReadTestCase):
         }
     )
     MODULE_JSON = json.dumps({"module": "projects", "folder": "projects"})
+    BROKEN_DEF = "{not valid json"
+    GOODTYPE_DEF = json.dumps(
+        {
+            "type": "goodtype",
+            "zones": ["documents"],
+            "required": [],
+            "allowed_values": {},
+            "display_fields": [],
+            "search_fields": [],
+        }
+    )
+    OK_KEYS = {
+        "outcome", "path", "role", "labels", "version",
+        "frontmatter", "evidence", "excerpt", "truncated", "id", "origin",
+    }
 
     def _lines(self, *, omit=(), **overrides):
         """A literal `kb: 1` frontmatter block, every field independently
@@ -412,6 +447,18 @@ class FieldContractTests(ReadTestCase):
         self.commit_file("documents/widget_wrong_zone/widget_wrong_zone.md", widget_wrong_zone)
         cases["projects/widget_ok/widget_ok.md"] = (widget_ok, False)
         cases["documents/widget_wrong_zone/widget_wrong_zone.md"] = (widget_wrong_zone, True)
+        # A custom definition that cannot even be parsed as JSON leaves its
+        # type undefined, so a document naming it is `unknown_type` exactly
+        # like `documents/unknown_type` above; its valid twin, under a
+        # working custom definition, is `ok`.
+        self.write(".brain/types/custom/broken.json", self.BROKEN_DEF)
+        self.write(".brain/types/custom/goodtype.json", self.GOODTYPE_DEF)
+        broken_type_doc = self._lines(type='"broken"')
+        goodtype_doc = self._lines(type='"goodtype"')
+        self.commit_file("documents/broken_type/broken_type.md", broken_type_doc)
+        self.commit_file("documents/goodtype/goodtype.md", goodtype_doc)
+        cases["documents/broken_type/broken_type.md"] = (broken_type_doc, True)
+        cases["documents/goodtype/goodtype.md"] = (goodtype_doc, False)
         return {path: expect for path, (_text, expect) in cases.items()}
 
     def test_c5_invalid_documents_are_withheld_with_their_path_and_valid_ones_stay_ok(self):
@@ -421,31 +468,37 @@ class FieldContractTests(ReadTestCase):
                 proc, result = self.read({"path": path, "max_bytes": 4096})
                 self.assertEqual(proc.returncode, 0, proc)
                 if expect_invalid:
-                    self.assertEqual(result["outcome"], "invalid", result)
-                    self.assertEqual(result["path"], path)
+                    # The complete report: no extra keys leak alongside the
+                    # withholding outcome and its resolved path.
+                    self.assertEqual(result, {"outcome": "invalid", "path": path})
                 else:
                     self.assertEqual(result["outcome"], "ok", result)
+                    self.assertEqual(result["path"], path)
+                    self.assertEqual(set(result), self.OK_KEYS)
 
     def test_agreement_with_validate_on_the_same_brain(self):
-        # A2: `read` says `invalid` exactly when `validate` lists that path as
+        # `read` says `invalid` exactly when `validate` lists that path as
         # `invalid`. Both commands run against the very same brain, so this
         # is the one place a sibling command's own output stands in as the
         # independent expected value.
         expectations = self.build_fixture()
         proc = support.run_brain(["validate", "--root", self.root], timeout=_TIMEOUT)
+        self.assertEqual(proc.returncode, 3 if any(expectations.values()) else 0, proc)
         report = support.parse_single_json(proc.stdout)
         validate_status = {d["path"]: d["status"] for d in report["documents"]}
-        for path in expectations:
+        for path, expect_invalid in expectations.items():
             with self.subTest(path=path):
-                self.assertIn(path, validate_status)
-                _proc, result = self.read({"path": path, "max_bytes": 4096})
-                self.assertEqual(result["outcome"] == "invalid", validate_status[path] == "invalid")
+                self.assertEqual(validate_status.get(path), "invalid" if expect_invalid else "valid")
+                read_proc, result = self.read({"path": path, "max_bytes": 4096})
+                self.assertEqual(read_proc.returncode, 0, read_proc)
+                self.assertEqual(result["outcome"], "invalid" if expect_invalid else "ok")
 
 
 class PrecedenceOverInvalidTests(ReadTestCase):
-    """A5: the C8 verdict is decided first. A file the journal names stays
+    """The C8 verdict is decided first. A file the journal names stays
     `unpublished` even though its content also fails C5 -- the check that
-    fires only after a published verdict never gets a chance to overrule it."""
+    fires only after a published verdict never gets a chance to overrule it.
+    An unverified file wins the same way: C5 never runs on it either."""
 
     PATH = "documents/pending/pending.md"
 
@@ -466,10 +519,48 @@ class PrecedenceOverInvalidTests(ReadTestCase):
         proc, result = self.read({"path": self.PATH, "max_bytes": 4096})
         self.assertEqual((proc.returncode, result), (0, {"outcome": "unpublished", "path": self.PATH}))
 
+    UNRECORDED_DOC_PATH = "documents/unrecorded/unrecorded.md"
+
+    def unrecorded_c5_invalid_document(self):
+        """A `type: document`, `kb: 1` file missing `origin` -- C5-invalid on
+        its own -- committed plainly with no publication record, so C8 rule 5
+        makes it `unverified`/`no_ingest_record` before C5 ever runs."""
+        text = (
+            f'---\nkb: 1\nid: "{ID_TWO}"\ntype: "document"\ntitle: "x"\n'
+            'summary: "s"\nstatus: "draft"\ncreated: 2026-01-01\nreviewed: 2026-01-01\n'
+            'evidence: []\nkind: "decision"\nauthored_by: "human"\nretention: "durable"\n'
+            'source_identity: "https://example.invalid/paper"\n'
+            'original: "original/source.md"\n'
+            f'original_sha256: "{"0" * 64}"\n---\nBody.\n'
+        )
+        self.commit_file(self.UNRECORDED_DOC_PATH, text)
+        return text
+
+    def test_an_unverified_document_wins_over_a_c5_invalid_document(self):
+        self.unrecorded_c5_invalid_document()
+        proc, result = self.read({"path": self.UNRECORDED_DOC_PATH, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(
+            result, {"outcome": "unverified", "path": self.UNRECORDED_DOC_PATH, "reason": "no_ingest_record"}
+        )
+        proc, result = self.read(
+            {"path": self.UNRECORDED_DOC_PATH, "max_bytes": 4096, "include_unverified": True}
+        )
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["reason"], "no_ingest_record")
+        self.assertEqual(result["excerpt"], "Body.\n")
+        self.assertEqual(result["frontmatter"]["title"], "x")
+        self.assertEqual(result["id"], ID_TWO)
+        # C5 never ran on an unverified file: the missing `origin` is
+        # reported honestly as an absent key, never a manufactured value.
+        self.assertNotIn("origin", result)
+        self.assertNotIn("origin", result["frontmatter"])
+
 
 class NoteAbsentFieldsTests(ReadTestCase):
-    """A10: a note (no `kb`) that carries neither `origin` nor `id` renders
-    neither key -- never `origin: "unknown"`, never `id: null` (G3-Q1)."""
+    """A note (no `kb`) that carries neither `origin` nor `id` renders
+    neither key -- never `origin: "unknown"`, never `id: null` (agent-brain #47)."""
 
     def test_a_plain_note_missing_origin_and_id_has_neither_key(self):
         text = "---\ntitle: Just a title\n---\nBody.\n"
@@ -482,7 +573,7 @@ class NoteAbsentFieldsTests(ReadTestCase):
 
 
 class CustomTypeFifoTests(ReadTestCase):
-    """A11/G3-Q4: `read` now loads custom type definitions too (for its C5
+    """`read` now loads custom type definitions too (for its C5
     check), so a FIFO definition file must not hang it either, mirroring the
     guard `typedefs.detect_installed_modules` already has (agent-brain #35
     path 2)."""
@@ -568,7 +659,7 @@ class OriginTests(ReadTestCase):
         review = ["needs_review:", '  - "origin"']
         # One entry's `retrieved` is empty, which is itself an uncertainty
         # value (C5): declaring it in `needs_review` keeps this C5-valid, so
-        # the fixture stays `ok` under G3's read-time field check.
+        # the fixture stays `ok` under this read-time field check.
         self.commit_file("documents/refs/refs.md", doc(ID_ONE, "Sourced", "Body.\n", origin=references, extra=review))
         self.commit_file("documents/mine/mine.md", doc(ID_TWO, "Written here", "Body.\n", origin='"authored"'))
         self.commit_file(
@@ -589,7 +680,7 @@ class OriginTests(ReadTestCase):
                 self.assertEqual(result["outcome"], "ok", result)
                 self.assertEqual(result["origin"], origin)
         # An unmanaged note (no `kb`) that records no origin at all gets no
-        # manufactured value: the key is absent, never "unknown" (G3-Q1).
+        # manufactured value: the key is absent, never "unknown".
         proc, result = self.read({"path": "documents/loose/loose.md", "max_bytes": 4096})
         self.assertEqual(result["outcome"], "ok", result)
         self.assertNotIn("origin", result)
@@ -712,7 +803,7 @@ class UnevaluablePublicationTests(ReadTestCase):
                 self.assertEqual(result["outcome"], "unverified", result)
                 self.assertEqual(result["reason"], "git_unavailable")
                 # The id resolves locally (no git needed to scan for it), so
-                # both requests resolve to the same path, which is named (A4).
+                # both requests resolve to the same path, which is named.
                 self.assertEqual(result["path"], self.PATH)
                 for key in WITHHELD_KEYS:
                     self.assertNotIn(key, result)

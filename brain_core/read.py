@@ -63,19 +63,6 @@ def _readable_path(root, path):
     return path if os.path.isfile(current) else None
 
 
-def _names_a_zone_file(root, path):
-    """Whether `path` names a location a file could sit at: no symbolic link
-    along the way, and nothing already there is some other kind of entry (a
-    folder). A merely absent file still names one; a link or a folder never
-    resolved to a zone path at all (G3-Q2), same as `..` or a hidden name."""
-    current = root
-    for part in path.split("/"):
-        current = os.path.join(current, part)
-        if os.path.islink(current):
-            return False
-    return not os.path.isdir(current)
-
-
 def _id_index(root, module_folders, yaml_module, duplicate_loader, pub):
     """{id: path} for every Markdown file in a scanned zone that carries a
     frontmatter `id`, except a retained original or attachment, which is never
@@ -195,14 +182,9 @@ def _read_located(request, root, base_dir, path, verdict, index, yaml_module, du
     if verdict["status"] == "unpublished":
         return {"outcome": "unpublished", "path": path}, 0
     if verdict["status"] == "absent":
-        if _names_a_zone_file(root, path):
-            return {"outcome": "not_found", "path": path}, 0
-        return {"outcome": "not_found"}, 0
+        return {"outcome": "not_found", "path": path}, 0
     if verdict["status"] == "unverified" and verdict["reason"] == "git_unavailable":
-        result = {"outcome": "unverified", "reason": "git_unavailable"}
-        if _names_a_zone_file(root, path):
-            result["path"] = path
-        return result, 0
+        return {"outcome": "unverified", "reason": "git_unavailable", "path": path}, 0
     raw_bytes = _read_bytes(root, path)
     parsed = _parse(raw_bytes, yaml_module, duplicate_loader)
     if verdict["status"] == "unverified":
@@ -245,7 +227,4 @@ def run_read(request, root, base_dir, yaml_module, duplicate_loader):
     except _GitUnavailable:
         # The rule cannot be evaluated, and no default may stand in for its
         # answer: publication is unknown, so the file is unverified.
-        result = {"outcome": "unverified", "reason": "git_unavailable"}
-        if _names_a_zone_file(root, path):
-            result["path"] = path
-        return result, 0
+        return {"outcome": "unverified", "reason": "git_unavailable", "path": path}, 0

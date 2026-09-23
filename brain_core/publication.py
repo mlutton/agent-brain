@@ -313,7 +313,11 @@ def _parse(raw_bytes, yaml_module, duplicate_loader):
 
 
 class Publication:
-    """One command's journal, publication records and path verdicts."""
+    """One command's publication records and path verdicts.
+
+    ``journal`` is accepted for interface stability. Journal presence and
+    open intents are determined from ``root`` by persist's helpers.
+    """
 
     def __init__(self, root, journal, module_folders, yaml_module, duplicate_loader):
         self.root = root

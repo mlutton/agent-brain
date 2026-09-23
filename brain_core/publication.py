@@ -27,6 +27,9 @@ class _Repo:
         self._yaml_module = yaml_module
         self._duplicate_loader = duplicate_loader
         self._records = None
+        self._blobs = {}
+        self._parents = None
+        self._descent = {}
         top = self._run(["rev-parse", "--show-toplevel"]).stdout.strip()
         if not top or os.path.realpath(top) != os.path.realpath(root):
             raise _GitUnavailable(root)
@@ -48,12 +51,18 @@ class _Repo:
 
     def _blob(self, commit, path):
         """The bytes of `path` as committed in `commit`, or None if it is not in it."""
+        key = (commit, path)
+        if key in self._blobs:
+            return self._blobs[key]
         proc = gitutil.run_git_bytes(["cat-file", "blob", f"{commit}:{path}"], self.root)
         if proc.returncode == 0:
-            return proc.stdout
-        if proc.returncode == 128:
-            return None
-        raise _GitUnavailable("cat-file")
+            blob = proc.stdout
+        elif proc.returncode == 128:
+            blob = None
+        else:
+            raise _GitUnavailable("cat-file")
+        self._blobs[key] = blob
+        return blob
 
     def _changed_paths(self, commit):
         out = self._run(["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", commit]).stdout
@@ -130,34 +139,47 @@ class _Repo:
     def descends(self, path, record):
         """Follow every lineage that carries the path's blob back to its record."""
         head = self._run(["rev-parse", "HEAD"]).stdout.strip()
+        key = (path, record["commit"], head)
+        if key in self._descent:
+            return self._descent[key]
+        if self._parents is None:
+            lines = self._run(["rev-list", "--parents", head]).stdout.splitlines()
+            self._parents = {parts[0]: parts[1:] for line in lines if (parts := line.split())}
         seen = {}
-
-        def walk(commit):
-            if commit == record["commit"]:
-                return True
+        stack = [(head, False)]
+        while stack:
+            commit, ready = stack.pop()
             if commit in seen:
-                return seen[commit]
-            parents = self._run(["rev-list", "--parents", "-n", "1", commit]).stdout.split()[1:]
+                continue
+            if commit == record["commit"]:
+                seen[commit] = True
+                continue
+            parents = self._parents.get(commit, [])
             if not parents:
                 seen[commit] = False
-                return False
+                continue
             blob = self._blob(commit, path)
             if len(parents) > 1:
-                matching = [parent for parent in parents if self._blob(parent, path) == blob]
-                result = bool(matching) and all(walk(parent) for parent in matching)
+                following = [parent for parent in parents if self._blob(parent, path) == blob]
+                valid = bool(following)
             else:
                 parent = parents[0]
-                if self._blob(parent, path) == blob:
-                    result = walk(parent)
-                else:
+                following = [parent]
+                valid = True
+                if self._blob(parent, path) != blob:
                     message = self._run(["show", "-s", "--format=%B", commit]).stdout
                     entries = _operation_entries(message, "update")
-                    result = (any(entry["path"] == path for entry in entries)
-                              and self._consistent(commit, entries) and walk(parent))
-            seen[commit] = result
-            return result
-
-        return walk(head)
+                    valid = (any(entry["path"] == path for entry in entries)
+                             and self._consistent(commit, entries))
+            if not valid:
+                seen[commit] = False
+            elif ready:
+                seen[commit] = all(seen[parent] for parent in following)
+            else:
+                stack.append((commit, True))
+                stack.extend((parent, False) for parent in following if parent not in seen)
+        self._descent[key] = seen[head]
+        return seen[head]
 
 
 _TRAILER_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*): (.*)$")
@@ -380,7 +402,7 @@ class Publication:
             verdict.update(status="unverified", hint="suspected_ingestion")
             return verdict
         if self.repo.has_uncommitted_change(path):
-            if not os.path.isdir(self.journal):
+            if not persist.journal_present(self.root):
                 verdict.update(status="unverified", reason="journal_missing")
                 return verdict
             verdict["changed_out_of_band"] = True

@@ -480,11 +480,28 @@ class JournalMissingTests(ReadTestCase):
         proc, result = self.read({"path": "documents/kept/kept.md", "max_bytes": 4096})
         self.assertEqual(result["outcome"], "ok", result)
 
+    def test_journal_directory_without_epoch_does_not_verify_an_uncommitted_note(self):
+        path = "documents/new/note.md"
+        self.write(path, doc(ID_ONE, "Uncommitted", "Body.\n"))
+        proc, present = self.read({"path": path, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, present["outcome"]), (0, "ok"))
+        os.remove(self.full(".brain/journal/epoch.json"))
+        self.assertTrue(os.path.isdir(self.full(".brain/journal")))
+        proc, missing = self.read({"path": path, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, missing),
+                         (0, {"outcome": "unverified", "path": path, "reason": "journal_missing"}))
+
 
 class UnevaluablePublicationTests(ReadTestCase):
     """R18: when the publication rule cannot be evaluated, read is never `ok`."""
 
     PATH = "documents/kept/kept.md"
+
+    def test_missing_path_in_non_git_brain_has_the_base_response_shape(self):
+        shutil.rmtree(self.full(".git"))
+        proc, result = self.read({"path": "documents/gone.md", "max_bytes": 4096})
+        self.assertEqual((proc.returncode, result),
+                         (0, {"outcome": "unverified", "reason": "git_unavailable"}))
 
     def shim_git(self, script):
         """Puts a `git` first on PATH and returns the environment that finds it
@@ -713,7 +730,6 @@ class DocumentRoleTests(ReadTestCase):
         for key in WITHHELD_KEYS:
             self.assertNotIn(key, result)
 
-
     def test_include_unverified_gives_the_content_and_its_absence_gives_none(self):
         self.commit_file(
             "documents/bare/bare.md",
@@ -741,6 +757,13 @@ class DescentTests(ReadTestCase):
         self.publication_commit("ingest", {self.PATH: original},
                                 [(self.PATH, sha(original.encode()), "absent", "document")])
         return original
+
+    def test_record_survives_long_unrelated_history(self):
+        self.recorded()
+        for _ in range(1100):
+            self.git("commit", "--allow-empty", "-q", "-m", "Unrelated checkpoint")
+        result = self.outcome()
+        self.assertEqual((result["outcome"], result["role"]), ("ok", "document"))
 
     def outcome(self):
         proc, result = self.read({"path": self.PATH, "max_bytes": 4096})
@@ -1356,6 +1379,17 @@ class AbsentPathTests(BundleTestCase):
             "temp_path": "fixture-temp", "backup_path": None,
         }
         self.write(".brain/journal/intents/fixture.json", json.dumps(intent))
+
+    def test_retained_attachment_named_by_intent_is_never_indexed_by_id(self):
+        attachment = doc(ID_TWO, "Retained bytes", "Attachment body.\n")
+        made = self.bundle("indexed", ID_ONE, attachments={"ref.md": attachment})
+        target = made["attachments"][0]
+        self.intent_for(target)
+        proc, by_path = self.read({"path": target, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, by_path),
+                         (0, {"outcome": "unpublished", "path": target}))
+        proc, by_id = self.read({"id": ID_TWO, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, by_id), (0, {"outcome": "not_found"}))
 
     def test_missing_retained_path_yields_to_open_intent_and_plain_missing_path_is_not_found(self):
         made = self.bundle("absent", ID_ONE, attachments={"notes.md": "Attachment bytes.\n"})

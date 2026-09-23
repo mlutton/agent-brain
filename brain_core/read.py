@@ -11,7 +11,7 @@ content, and resolving the evidence references. No caller sequences any of it.
 import datetime
 import os
 
-from . import publication, scan, typedefs
+from . import publication, typedefs
 from .publication import _GitUnavailable, _parse, _sha256, _read_bytes
 
 
@@ -69,13 +69,11 @@ def _id_index(root, module_folders, yaml_module, duplicate_loader, pub):
     indexed (C13a); where two files carry one id, the first path in code-point
     order wins."""
     index = {}
-    entries, _scan_skipped = scan.scan_zones(root, module_folders)
+    entries, _scan_skipped = pub.paths()
     for rel_path, _zone in entries:
-        try:
-            if pub.status(rel_path)["role"] in ("original", "attachment"):
-                continue
-        except _GitUnavailable:
-            pass
+        record = pub.records.get(rel_path)
+        if record is not None and record["role"] in ("original", "attachment"):
+            continue
         try:
             parsed = _parse(_read_bytes(root, rel_path), yaml_module, duplicate_loader)
         except OSError:
@@ -173,7 +171,10 @@ def _read_located(request, root, path, verdict, index, yaml_module, duplicate_lo
     if verdict["status"] == "absent":
         return {"outcome": "not_found"}, 0
     if verdict["status"] == "unverified" and verdict["reason"] == "git_unavailable":
-        return {"outcome": "unverified", "path": path, "reason": "git_unavailable"}, 0
+        result = {"outcome": "unverified", "reason": "git_unavailable"}
+        if _readable_path(root, path) is not None:
+            result["path"] = path
+        return result, 0
     raw_bytes = _read_bytes(root, path)
     parsed = _parse(raw_bytes, yaml_module, duplicate_loader)
     if verdict["status"] == "unverified":

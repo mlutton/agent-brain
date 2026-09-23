@@ -329,11 +329,18 @@ class AppliedTests(RecoverTestCase):
             target_bytes = fh.read()
         self.assertEqual(hashlib.sha256(target_bytes).hexdigest(), prior_hash)
 
-        # A hand-built backup (the update's apply step always writes one) and
-        # a hand-built, already-consumed temp path (its recorded name carries
+        # The target is already committed in HEAD, exactly as W3 requires --
+        # the earlier `create` left it clean, and nothing has touched it since.
+        self.assertEqual(self.git("status", "--porcelain", "--", path).strip(), "")
+
+        # A hand-built backup, named the way persist's own
+        # `_plan_backup_path` names it (sha256 of the target's full path text,
+        # in the backups folder) -- without importing persist -- and a
+        # hand-built, already-consumed temp path (its recorded name carries
         # persist's temp prefix and lies in the target's own folder, but the
         # file itself does not exist -- the replace already consumed it).
-        backup_path = os.path.join(self.root, ".brain", "state", "backups", "handcrafted.bak")
+        backup_name = hashlib.sha256(self.full(path).encode("utf-8")).hexdigest() + ".bak"
+        backup_path = os.path.join(self.root, ".brain", "state", "backups", backup_name)
         os.makedirs(os.path.dirname(backup_path), exist_ok=True)
         with open(backup_path, "wb") as fh:
             fh.write(target_bytes)

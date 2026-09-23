@@ -104,6 +104,17 @@ class PersistTestCase(unittest.TestCase):
         )
         return proc, support.parse_single_json(proc.stdout)
 
+    def _create(self, path, root=None):
+        request = {
+            "operation": "create",
+            "path": path,
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        _, doc = self.persist(request, root=root)
+        self.assertEqual(doc["outcome"], "written", doc)
+        return doc
+
 
 class CreateTests(PersistTestCase):
     """P1: create of a new valid document returns written with id, path and
@@ -334,17 +345,6 @@ class NoOpUpdateTests(PersistTestCase):
     escape to close it. Precedence is pinned: expected_version is checked
     before no_change (agent-brain #38/#42)."""
 
-    def _create(self, path, root=None):
-        request = {
-            "operation": "create",
-            "path": path,
-            "frontmatter": dict(NOTE_FRONTMATTER),
-            "body": "Body.\n",
-        }
-        _, doc = self.persist(request, root=root)
-        self.assertEqual(doc["outcome"], "written", doc)
-        return doc
-
     def test_noop_update_is_refused_no_change_and_writes_nothing(self):
         created = self._create("documents/noop/noop.md")
         full = os.path.join(self.root, "documents/noop/noop.md")
@@ -452,6 +452,21 @@ class NoOpUpdateTests(PersistTestCase):
             after = fh.read()
         self.assertEqual(after, before)
 
+        # Proves the twin's premise: the refused request's own values really
+        # do reconstruct A's exact bytes. Applying those same values with the
+        # correct (current) expected_version -- B -- is an ordinary written
+        # update, not a no-op (intended bytes A != current bytes B), and its
+        # resulting version is exactly A's hash.
+        proof_request = {
+            "operation": "update",
+            "path": "documents/stalenonoop/stalenonoop.md",
+            "expected_version": moved["version"],
+            "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
+        }
+        proc, proof = self.persist(proof_request)
+        self.assertEqual(proof["outcome"], "written", proof)
+        self.assertEqual(proof["version"], created["version"])
+
     def test_path_is_not_locked_after_a_no_change_refusal(self):
         """A later real update against the same expected_version is written
         (agent-brain #38/#42)."""
@@ -463,7 +478,10 @@ class NoOpUpdateTests(PersistTestCase):
             "frontmatter": {"status": NOTE_FRONTMATTER["status"]},
         }
         _, doc = self.persist(noop_request)
-        self.assertEqual(doc["reason"], "no_change", doc)
+        self.assertEqual(
+            doc,
+            {"outcome": "refused", "reason": "no_change", "observed_sha256": created["version"]},
+        )
 
         real_request = {
             "operation": "update",
@@ -501,17 +519,6 @@ class NoOpUpdateFaultSeamTests(PersistTestCase):
     never reached -- the refusal returns before `run_persist` ever writes an
     intent (agent-brain #38/#42)."""
 
-    def _create(self, path, root=None):
-        request = {
-            "operation": "create",
-            "path": path,
-            "frontmatter": dict(NOTE_FRONTMATTER),
-            "body": "Body.\n",
-        }
-        _, doc = self.persist(request, root=root)
-        self.assertEqual(doc["outcome"], "written", doc)
-        return doc
-
     def _run_with_after_intent_kill(self, request, root):
         return support.run_brain(
             ["persist", "--root", root],
@@ -527,7 +534,7 @@ class NoOpUpdateFaultSeamTests(PersistTestCase):
         self.assertEqual(os.listdir(intents_dir) if os.path.isdir(intents_dir) else [], [])
         self.assertEqual(os.listdir(os.path.dirname(full)), [os.path.basename(full)])
         backups_dir = os.path.join(root, ".brain", "state", "backups")
-        self.assertFalse(os.path.isdir(backups_dir) and os.listdir(backups_dir))
+        self.assertEqual(os.listdir(backups_dir) if os.path.isdir(backups_dir) else [], [])
         head_after = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
         ).stdout.strip()

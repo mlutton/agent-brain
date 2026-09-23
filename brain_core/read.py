@@ -335,31 +335,42 @@ def _named_by_open_intent(root, path):
     return any(intent is not None and intent["path"] == path for _name, intent in persist.open_intents(root))
 
 
-def _has_unverified_referrer(root, path, repo, yaml_module, duplicate_loader):
+def _has_unverified_referrer(root, path, repo, module_folders, yaml_module, duplicate_loader):
     """C8 rule 6: a `document` that rule 5 makes unverified names this file
-    through `original` or `attachments`. `original` is relative to the
-    document's folder, so only the folders above the file are searched."""
+    through `original` or `attachments`. The rule states no locality condition,
+    so every document in the scanned zones is considered: `original` is
+    relative to the referring document's own folder (C5), and that admits
+    `../`, so a referrer may sit anywhere in the brain and still resolve to
+    this file. What taints is the reference resolving here, never where the
+    referrer sits.
+
+    A path the publication record names is never such a referrer, and its
+    record decides that before its bytes are read. C8's rules are first-match:
+    rule 2 takes a retained original or attachment "whatever its current
+    bytes", so it is "never a candidate", and C13a says it is never parsed as
+    frontmatter at all — that half of the exclusion is delivered, and holds of
+    the code as it runs today. The recorded-`document` half follows rule 5 as
+    specified: rule 5 leaves such a document published, so it cannot be the
+    unverified one this rule asks for. Rule 5's descent clause is not
+    implemented (#51), so today a recorded document tampered with and
+    committed out of band still reads `ok` where the rule requires
+    `unverified` — a reader who checks that half against current behaviour
+    will not find it. The exclusion encodes the rule, not the shortfall.
+    Bytes that read as a processed document therefore cannot make a recorded
+    path speak for one."""
     records = repo.records()
-    folder = posixpath.dirname(path)
-    while folder:
+    entries, _scan_skipped = scan.scan_zones(root, module_folders)
+    for candidate, _zone in entries:
+        if candidate == path or candidate in records:
+            continue
         try:
-            names = sorted(os.listdir(os.path.join(root, folder)))
+            parsed = _parse(_read_bytes(root, candidate), yaml_module, duplicate_loader)
         except OSError:
-            names = []
-        for name in names:
-            candidate = f"{folder}/{name}"
-            full = os.path.join(root, candidate)
-            if candidate == path or not name.endswith(".md") or os.path.islink(full) or not os.path.isfile(full):
-                continue
-            try:
-                parsed = _parse(_read_bytes(root, candidate), yaml_module, duplicate_loader)
-            except OSError:
-                continue
-            is_document = parsed.kind == "managed" and parsed.mapping.get("type") == "document"
-            recorded = candidate in records and records[candidate]["role"] == "document"
-            if is_document and not recorded and path in _references_of(parsed, candidate):
-                return True
-        folder = posixpath.dirname(folder)
+            continue
+        if parsed.kind != "managed" or parsed.mapping.get("type") != "document":
+            continue
+        if path in _references_of(parsed, candidate):
+            return True
     return False
 
 
@@ -434,7 +445,7 @@ def _open_repo(root, module_folders, yaml_module, duplicate_loader):
     return repo, retained
 
 
-def _read_located(request, root, path, repo, index, yaml_module, duplicate_loader):
+def _read_located(request, root, path, repo, index, module_folders, yaml_module, duplicate_loader):
     """Everything after the file is found and rule 1 has passed: the rest of
     the publication rule, then the content. Raises _GitUnavailable when the
     rule cannot be evaluated."""
@@ -443,7 +454,7 @@ def _read_located(request, root, path, repo, index, yaml_module, duplicate_loade
         return _retained(request, root, path, record)
     raw_bytes = _read_bytes(root, path)
     parsed = _parse(raw_bytes, yaml_module, duplicate_loader)
-    if _has_unverified_referrer(root, path, repo, yaml_module, duplicate_loader):
+    if _has_unverified_referrer(root, path, repo, module_folders, yaml_module, duplicate_loader):
         return _unverified(request, path, raw_bytes, parsed, index, hint="suspected_ingestion")
     role = "note"
     if record is not None and record["role"] == "document":
@@ -496,7 +507,7 @@ def run_read(request, root, base_dir, yaml_module, duplicate_loader):
     try:
         if repo is None:
             raise _GitUnavailable(path)
-        return _read_located(request, root, path, repo, index, yaml_module, duplicate_loader)
+        return _read_located(request, root, path, repo, index, module_folders, yaml_module, duplicate_loader)
     except _GitUnavailable:
         # The rule cannot be evaluated, and no default may stand in for its
         # answer: publication is unknown, so the file is unverified.

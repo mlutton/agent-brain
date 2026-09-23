@@ -1023,5 +1023,150 @@ class BinaryAttachmentTests(BundleTestCase):
         self.assertIs(result["truncated"], True)
 
 
+class ReferrerLocalityTests(ReadTestCase):
+    """C8 rule 6 states no locality condition: whether a referrer taints a file
+    depends on its reference RESOLVING to that file, not on where the referrer
+    sits. C5 makes `original` relative to the document's own folder, which
+    admits `../`, so a referrer outside the target's ancestor folders is an
+    ordinary case and not an exotic one (agent-brain #44)."""
+
+    TARGET = "documents/shared/pic.md"
+    TARGET_TEXT = "Just a picture placeholder.\n"
+
+    def referrer(self, id_, original):
+        """An unrecorded `type: document` — rule 5 makes it unverified — whose
+        `original` names `original` relative to its own folder."""
+        return doc(
+            id_,
+            "Unrecorded bundle",
+            "Body.\n",
+            type_="document",
+            extra=[
+                'source_identity: "https://example.invalid/paper"',
+                f'original: "{original}"',
+                f'original_sha256: "{sha(self.TARGET_TEXT.encode())}"',
+            ],
+        )
+
+    def test_a_referrer_outside_the_targets_ancestor_folders_makes_it_unverified(self):
+        # `wiki/r.md` is in no ancestor folder of `documents/shared/pic.md`; its
+        # `original` resolves to it all the same.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("wiki/r.md", self.referrer(ID_ONE, "../documents/shared/pic.md"))
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["hint"], "suspected_ingestion")
+        self.assertNotIn("role", result)
+
+    def test_the_control_a_co_located_referrer_still_makes_the_same_target_unverified(self):
+        # The same target, reached by a referrer sitting beside it. This is what
+        # makes the pair a locality finding: it must not change.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("documents/shared/s.md", self.referrer(ID_TWO, "pic.md"))
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["hint"], "suspected_ingestion")
+        self.assertNotIn("role", result)
+
+    def test_a_reference_that_resolves_elsewhere_leaves_the_target_a_published_note(self):
+        # The negative twin of the first case: a referrer outside the ancestor
+        # folders whose `original` resolves to some other path taints nothing.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("wiki/r.md", self.referrer(ID_THREE, "../documents/shared/other.md"))
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertEqual(result["role"], "note")
+
+    def test_a_hidden_referrer_is_not_scanned_and_leaves_the_target_a_published_note(self):
+        # A committed `documents/shared/.ref.md` naming `pic.md`. C5a's scan
+        # skips every name beginning with a dot, so read never considers it a
+        # rule 6 referrer at all. Pinned here because this diff CHANGED it: the
+        # folder listing the search used before scanned hidden names, and the
+        # scan does not (agent-brain #55).
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("documents/shared/.ref.md", self.referrer(ID_FOUR, "pic.md"))
+        # The referrer really is committed, so nothing else could be deciding this.
+        self.assertEqual(self.git("status", "--porcelain", "--", "documents/shared/.ref.md"), "")
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertEqual(result["role"], "note")
+
+
+class RetainedEvidenceIsNeverAReferrerTests(BundleTestCase):
+    """C8 rule 2 precedes rule 5 in the first-match order: a retained original
+    or attachment is "decided by its recorded role, whatever its current
+    bytes", and is "never a candidate and never a note"; C13a says it is
+    "never parsed as frontmatter". So retained evidence can never be the
+    unverified `document` rule 6 looks for, however its bytes happen to read
+    (agent-brain #44, from the review of PR #56)."""
+
+    TARGET = "documents/shared/pic.md"
+    TARGET_TEXT = "Just a picture placeholder.\n"
+
+    def impersonator(self):
+        """Bytes that parse as an unrecorded `type: document` whose `original`
+        resolves to TARGET from a bundle's `original/` or `attachments/`
+        folder. The record says this file is evidence; only its bytes claim to
+        be a document."""
+        return doc(
+            ID_TWO,
+            "Impersonating bytes",
+            "Body.\n",
+            type_="document",
+            extra=[
+                'source_identity: "https://example.invalid/paper"',
+                'original: "../../shared/pic.md"',
+                f'original_sha256: "{sha(self.TARGET_TEXT.encode())}"',
+            ],
+        )
+
+    def assert_target_is_an_untainted_note(self):
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertEqual(result["role"], "note")
+        return result
+
+    def test_a_retained_original_whose_bytes_read_as_a_document_taints_nothing(self):
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        made = self.bundle("paper", ID_ONE, original_text=self.impersonator())
+        # The record answers for the source itself, so the fixture is the one
+        # the finding describes: evidence by record, document by bytes.
+        proc, source = self.read({"path": made["original"], "max_bytes": 4096})
+        self.assertEqual(source["outcome"], "ok", source)
+        self.assertEqual(source["role"], "original")
+        self.assertEqual(source["integrity"], "retained")
+        self.assertEqual(source["excerpt"], self.impersonator())
+        self.assert_target_is_an_untainted_note()
+
+    def test_a_retained_attachment_whose_bytes_read_as_a_document_taints_nothing(self):
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        made = self.bundle("paper", ID_ONE, attachments={"ref.md": self.impersonator()})
+        attachment = made["attachments"][0]
+        self.assertEqual(attachment, "documents/paper/attachments/ref.md")
+        proc, source = self.read({"path": attachment, "max_bytes": 4096})
+        self.assertEqual(source["outcome"], "ok", source)
+        self.assertEqual(source["role"], "attachment")
+        self.assertEqual(source["integrity"], "retained")
+        self.assert_target_is_an_untainted_note()
+
+    def test_the_control_the_same_bytes_at_an_unrecorded_path_still_taint(self):
+        # The same impersonating text, with no record naming it, sitting where
+        # round 1's widened search is what finds it: a cross-tree referrer that
+        # IS an unrecorded document must still make the target unverified. This
+        # is what separates the fix from a retreat toward the ancestor folders.
+        self.commit_file(self.TARGET, self.TARGET_TEXT)
+        self.commit_file("documents/paper/attachments/ref.md", self.impersonator())
+        proc, result = self.read({"path": self.TARGET, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(result["outcome"], "unverified", result)
+        self.assertEqual(result["hint"], "suspected_ingestion")
+        self.assertNotIn("role", result)
+
+
 if __name__ == "__main__":
     unittest.main()

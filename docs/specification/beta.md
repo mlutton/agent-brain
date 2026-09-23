@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: 6a1d584ffd8665a05c4fbd3ffdfd6d6bb929653fe02836f0c235c3b17c30bee6
+Version: 09b7bbd05d6a867f412fb2b8ad042baf215971f831c0e2447486d514796af581
 Publication: published — accepted by merge of #2
 Status: **Accepted specification.** This line records acceptance, not delivery: what is implemented is tracked in the issues that reference this version, and this document makes no claim about it. Delivery stories are opened as issues referencing this version.
 
@@ -474,7 +474,7 @@ Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage:
 
 ### C10. Read
 
-Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id, path, version, role: note|document|original|attachment, owner?, integrity?, recorded_sha256?, publication_commit?, reason?, hint?, frontmatter, excerpt, truncated, origin, evidence: [{target, exists}], support, labels}`. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
+Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id?, path, version, role: note|document|original|attachment, owner?, integrity?, recorded_sha256?, publication_commit?, reason?, hint?, frontmatter, excerpt, truncated, origin?, evidence: [{target, exists}], support, labels}`. `id` and `origin` are each present only when the file's own frontmatter carries them. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
 
 **The read guarantee.** A read reports what the file says and what the record
 proves. It never supplies a value the file does not contain, and it never

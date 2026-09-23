@@ -1,6 +1,6 @@
 # agent-brain beta specification
 
-Version: bd94cfa9979fb677cb5f17b8da8caf036884846115d0d02d681ad6fdd8601da4
+Version: 09b7bbd05d6a867f412fb2b8ad042baf215971f831c0e2447486d514796af581
 Publication: published — accepted by merge of #2
 Status: **Accepted specification.** This line records acceptance, not delivery: what is implemented is tracked in the issues that reference this version, and this document makes no claim about it. Delivery stories are opened as issues referencing this version.
 
@@ -474,7 +474,17 @@ Output: `{outcome: matches|no_match|partial, candidates, body_matches, coverage:
 
 ### C10. Read
 
-Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id, path, version, role: note|document|original|attachment, owner?, integrity?, recorded_sha256?, publication_commit?, reason?, hint?, frontmatter, excerpt, truncated, origin, evidence: [{target, exists}], support, labels}`. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
+Request: `{id | path, max_bytes, heading?, include_unverified?}`. Output: `{outcome: ok|not_found|invalid|unsupported_version|unpublished|unverified, id?, path, version, role: note|document|original|attachment, owner?, integrity?, recorded_sha256?, publication_commit?, reason?, hint?, frontmatter, excerpt, truncated, origin?, evidence: [{target, exists}], support, labels}`. `id` and `origin` are each present only when the file's own frontmatter carries them. A retained original is readable as evidence (`role: original`, `owner` naming its document, its hash and whether it still matches); it has no frontmatter interpretation. External URLs are returned, never fetched.
+
+**The read guarantee.** A read reports what the file says and what the record
+proves. It never supplies a value the file does not contain, and it never
+withholds without naming what it withheld. Two properties follow: `invalid`
+covers both C4's malformed class and a failure of C5's field contract on a
+published `kb: 1` document, reported with exit `0` — C1's exit `3` for
+`invalid` stays scoped to `validate`. Every withholding outcome names the
+request's resolved path, except `not_found` by id (no id resolved to a path)
+and `not_found` for a request path that never resolved to a zone path (the
+caller's own string is never echoed back as `path`).
 
 **Flag values in `labels`.** `labels` is an **object**, not an array, because
 C9's label values include freshness enumerations and `superseded_by`

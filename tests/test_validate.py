@@ -1566,6 +1566,29 @@ class TestCustomTypesBothWays(TempBrainTestCase):
             collections.Counter([(".brain/types/custom/broken.json", "malformed_definition")]),
         )
 
+    def test_fifo_custom_definition_is_malformed_and_does_not_hang(self):
+        """A FIFO blocks `open()` until a writer appears, so reading it would
+        leave validate printing nothing and never exiting. The `S_ISREG`
+        guard (mirroring the one already used for module manifests) makes
+        this report like any other definition file validate cannot use
+        (agent-brain #35 path 2). The run is timed so a regression fails
+        this test instead of hanging the suite."""
+        self.write("documents/base_note.md", note_doc())
+        os.makedirs(os.path.join(self.tmpdir, ".brain", "types", "custom"), exist_ok=True)
+        os.mkfifo(os.path.join(self.tmpdir, ".brain", "types", "custom", "recipe.json"))
+        try:
+            proc = support.run_brain(["validate", "--root", self.tmpdir], timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("validate did not exit within 20 seconds of meeting a FIFO custom type definition")
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(report["outcome"], "invalid")
+        self.assertEqual(
+            collections.Counter((d["path"], d["code"]) for d in report["definitions"]),
+            collections.Counter([(".brain/types/custom/recipe.json", "malformed_definition")]),
+        )
+        self.assertEqual(support.doc_by_path(report, "documents/base_note.md")["status"], "valid")
+
 
 class TestBaseTypesReadBesideCode(TempBrainTestCase):
     def test_tampered_brain_side_base_type_ignored(self):

@@ -620,6 +620,14 @@ class UnpublishedTests(ReadTestCase):
         self.assertEqual(result["excerpt"], self.BODY)  # the literal sent in the request
         self.assertEqual(result["frontmatter"]["title"], "Interrupted note")
 
+    def test_deleted_intent_named_path_is_still_unpublished(self):
+        proc = self.persist_with_fault("after_apply:kill")
+        self.assertEqual(proc.returncode, -signal.SIGKILL, proc)
+        os.remove(self.full(self.PATH))
+        proc, result = self.read({"path": self.PATH, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, result),
+                         (0, {"outcome": "unpublished", "path": self.PATH}))
+
 
 ORIGINAL_TEXT = "# Source article\n\nThe kept original, byte for byte.\n"
 
@@ -693,16 +701,10 @@ class DocumentRoleTests(ReadTestCase):
         self.assertIn("Brain-Op: ingest", self.git("log", "--format=%B", "--", self.DOC))
         self.assertEqual(self.git("log", "--format=%s", "-1"), "Plain edit\n")
 
-    @unittest.expectedFailure
     def test_a_document_edited_and_committed_out_of_band_after_ingest_is_unverified(self):
         # C8 rule 5 requires a published document's current bytes to descend from
         # its ingest or adopt commit, with later changes only through brain
-        # writes or audit-labelled edits; otherwise `unverified` with
-        # `no_ingest_record`. Only the first half (a record exists) is
-        # implemented, so this fails today and is marked as an expected failure.
-        # It is the gate on implementing descent: once read honours the whole
-        # rule this becomes an unexpected success, the suite goes red, and the
-        # marker comes off.
+        # writes; otherwise `unverified` with `no_ingest_record`.
         self.edit_and_commit_out_of_band()
         proc, result = self.read({"path": self.DOC, "max_bytes": 4096})
         self.assertEqual(proc.returncode, 0, proc)
@@ -710,6 +712,7 @@ class DocumentRoleTests(ReadTestCase):
         self.assertEqual(result["reason"], "no_ingest_record")
         for key in WITHHELD_KEYS:
             self.assertNotIn(key, result)
+
 
     def test_include_unverified_gives_the_content_and_its_absence_gives_none(self):
         self.commit_file(
@@ -728,6 +731,183 @@ class DocumentRoleTests(ReadTestCase):
         self.assertEqual(result["frontmatter"]["title"], "Unrecorded paper")
         for key in ("version", "evidence", "origin"):
             self.assertIn(key, result)
+
+
+class DescentTests(ReadTestCase):
+    PATH = "documents/lineage/doc.md"
+
+    def recorded(self):
+        original = doc(ID_ONE, "Recorded", "First body.\n", type_="document")
+        self.publication_commit("ingest", {self.PATH: original},
+                                [(self.PATH, sha(original.encode()), "absent", "document")])
+        return original
+
+    def outcome(self):
+        proc, result = self.read({"path": self.PATH, "max_bytes": 4096})
+        self.assertEqual(proc.returncode, 0, proc)
+        return result
+
+    def test_untouched_and_consistent_update_descend(self):
+        original = self.recorded()
+        self.assertEqual((self.outcome()["outcome"], self.outcome()["role"]), ("ok", "document"))
+        changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document")
+        self.publication_commit("update", {self.PATH: changed},
+                                [(self.PATH, sha(changed.encode()), sha(original.encode()), None)])
+        self.assertEqual(self.outcome()["outcome"], "ok")
+
+    def test_inconsistent_update_and_audit_do_not_extend_descent(self):
+        for operation, declared_hash in (("update", "0" * 64), ("audit", None)):
+            with self.subTest(operation=operation):
+                base = self.git("rev-parse", "HEAD").strip()
+                original = self.recorded()
+                changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document")
+                self.publication_commit(operation, {self.PATH: changed},
+                                        [(self.PATH, declared_hash or sha(changed.encode()),
+                                          sha(original.encode()), None)])
+                try:
+                    result = self.outcome()
+                    self.assertEqual((result["outcome"], result.get("reason")), ("unverified", "no_ingest_record"))
+                    for key in WITHHELD_KEYS:
+                        self.assertNotIn(key, result)
+                finally:
+                    self.git("reset", "--hard", base)
+
+    def test_update_prior_need_not_chain_to_previous_blob(self):
+        self.recorded()
+        changed = doc(ID_ONE, "Recorded", "Second body.\n", type_="document")
+        self.publication_commit("update", {self.PATH: changed},
+                                [(self.PATH, sha(changed.encode()), "f" * 64, None)])
+        self.assertEqual(self.outcome()["outcome"], "ok")
+
+    def test_record_role_survives_type_change_and_malformed_bytes_fail_before_parse(self):
+        for content in (doc(ID_ONE, "Recorded", "Second body.\n"), "---\nkb: [broken\n---\n"):
+            with self.subTest(content=content[:20]):
+                base = self.git("rev-parse", "HEAD").strip()
+                self.recorded()
+                self.commit_file(self.PATH, content)
+                try:
+                    result = self.outcome()
+                    self.assertEqual((result["outcome"], result.get("reason")), ("unverified", "no_ingest_record"))
+                finally:
+                    self.git("reset", "--hard", base)
+
+    def test_latest_retry_or_new_ingest_starts_descent_afresh(self):
+        for change_again in (False, True):
+            with self.subTest(change_again=change_again):
+                base = self.git("rev-parse", "HEAD").strip()
+                self.recorded()
+                hand_edit = doc(ID_ONE, "Recorded", "Hand edit.\n", type_="document")
+                self.commit_file(self.PATH, hand_edit)
+                current = doc(ID_ONE, "Recorded", "New ingest.\n", type_="document") if change_again else hand_edit
+                if change_again:
+                    self.publication_commit("ingest", {self.PATH: current},
+                                            [(self.PATH, sha(current.encode()), sha(hand_edit.encode()), "document")])
+                else:
+                    message = ("Retry\n\nBrain-Op: ingest\nBrain-Run: fixture-run\n"
+                               f"Brain-Path: {self.PATH} sha256={sha(current.encode())} "
+                               f"prior={sha(current.encode())} role=document\n")
+                    self.git("commit", "-q", "--allow-empty", "-m", message)
+                try:
+                    self.assertEqual(self.outcome()["outcome"], "ok")
+                finally:
+                    self.git("reset", "--hard", base)
+
+    def test_uncommitted_edit_keeps_document_published_with_label(self):
+        self.recorded()
+        self.write(self.PATH, doc(ID_ONE, "Recorded", "Hand edit.\n", type_="document"))
+        result = self.outcome()
+        self.assertEqual((result["outcome"], result.get("role"), result.get("labels")),
+                         ("ok", "document", {"changed_out_of_band": True}))
+
+
+class MergeDescentTests(ReadTestCase):
+    PATH = DescentTests.PATH
+    recorded = DescentTests.recorded
+    outcome = DescentTests.outcome
+    def branch(self):
+        self.recorded()
+        primary = self.git("branch", "--show-current").strip()
+        self.git("checkout", "-q", "-b", "fixture-side")
+        return primary
+
+    def merge(self):
+        self.git("merge", "-q", "--no-ff", "-m", "Join histories", "fixture-side")
+
+    def test_side_plain_edit_kept_by_merge_breaks_descent(self):
+        primary = self.branch()
+        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document"))
+        self.git("checkout", "-q", primary)
+        self.merge()
+        self.assertEqual(self.outcome()["outcome"], "unverified")
+
+    def test_side_plain_edit_discarded_by_merge_is_not_judged(self):
+        primary = self.branch()
+        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document"))
+        self.git("checkout", "-q", primary)
+        main = doc(ID_ONE, "Recorded", "Main edit.\n", type_="document")
+        self.publication_commit("update", {self.PATH: main},
+                                [(self.PATH, sha(main.encode()), "f" * 64, None)])
+        self.git("merge", "-q", "-s", "ours", "--no-ff", "-m", "Discard side edit", "fixture-side")
+        self.assertEqual(self.outcome()["outcome"], "ok")
+
+    def test_merge_introducing_new_blob_breaks_descent(self):
+        primary = self.branch()
+        self.commit_file(self.PATH, doc(ID_ONE, "Recorded", "Side edit.\n", type_="document"))
+        self.git("checkout", "-q", primary)
+        main = doc(ID_ONE, "Recorded", "Main edit.\n", type_="document")
+        self.publication_commit("update", {self.PATH: main},
+                                [(self.PATH, sha(main.encode()), "f" * 64, None)])
+        proc = subprocess.run(["git", "merge", "--no-ff", "--no-commit", "fixture-side"],
+                              cwd=self.root, capture_output=True, text=True, env=dict(os.environ, **_GIT_ENV))
+        self.assertNotEqual(proc.returncode, 0)
+        self.write(self.PATH, doc(ID_ONE, "Recorded", "Merge edit.\n", type_="document"))
+        self.git("add", "--", self.PATH)
+        self.git("commit", "-q", "-m", "Resolve with new bytes")
+        self.assertEqual(self.outcome()["outcome"], "unverified")
+
+    def test_side_brain_write_kept_by_merge_descends(self):
+        primary = self.branch()
+        changed = doc(ID_ONE, "Recorded", "Side edit.\n", type_="document")
+        self.publication_commit("update", {self.PATH: changed},
+                                [(self.PATH, sha(changed.encode()), "f" * 64, None)])
+        self.git("checkout", "-q", primary)
+        self.merge()
+        self.assertEqual(self.outcome()["outcome"], "ok")
+
+    def test_equal_parent_blobs_require_both_lineages_to_descend(self):
+        primary = self.branch()
+        changed = doc(ID_ONE, "Recorded", "Same bytes.\n", type_="document")
+        self.commit_file(self.PATH, changed)
+        self.git("checkout", "-q", primary)
+        self.publication_commit("update", {self.PATH: changed},
+                                [(self.PATH, sha(changed.encode()), "f" * 64, None)])
+        self.merge()
+        self.assertEqual(self.outcome()["outcome"], "unverified")
+
+
+class DescendingReferrerTests(ReadTestCase):
+    DOC = "documents/referred/doc.md"
+
+    def test_out_of_band_document_taints_original_and_attachment_but_descending_twin_does_not(self):
+        for field in ("original", "attachments"):
+            with self.subTest(field=field):
+                base = self.git("rev-parse", "HEAD").strip()
+                target = "documents/referred/source.md"
+                self.commit_file(target, "Source bytes.\n")
+                extra = ['original: "source.md"'] if field == "original" else ['attachments: ["source.md"]']
+                first = doc(ID_ONE, "Referrer", "First body.\n", type_="document", extra=extra)
+                self.publication_commit("ingest", {self.DOC: first},
+                                        [(self.DOC, sha(first.encode()), "absent", "document")])
+                proc, control = self.read({"path": target, "max_bytes": 4096})
+                self.assertEqual((proc.returncode, control["outcome"]), (0, "ok"))
+                second = doc(ID_ONE, "Referrer", "Hand edit.\n", type_="document", extra=extra)
+                self.commit_file(self.DOC, second)
+                try:
+                    proc, result = self.read({"path": target, "max_bytes": 4096})
+                    self.assertEqual((proc.returncode, result["outcome"], result.get("hint")),
+                                     (0, "unverified", "suspected_ingestion"))
+                finally:
+                    self.git("reset", "--hard", base)
 
 
 ORIGINAL_KB2 = '---\nkb: 2\ntitle: "Foreign format original"\n---\nOriginal body.\n'
@@ -1166,6 +1346,30 @@ class RetainedEvidenceIsNeverAReferrerTests(BundleTestCase):
         self.assertEqual(result["outcome"], "unverified", result)
         self.assertEqual(result["hint"], "suspected_ingestion")
         self.assertNotIn("role", result)
+
+
+class AbsentPathTests(BundleTestCase):
+    def intent_for(self, path):
+        intent = {
+            "run_id": "fixture-run", "op_key": "fixture-op", "operation": "attach",
+            "path": path, "expected_prior": "absent", "intended_sha256": "0" * 64,
+            "temp_path": "fixture-temp", "backup_path": None,
+        }
+        self.write(".brain/journal/intents/fixture.json", json.dumps(intent))
+
+    def test_missing_retained_path_yields_to_open_intent_and_plain_missing_path_is_not_found(self):
+        made = self.bundle("absent", ID_ONE, attachments={"notes.md": "Attachment bytes.\n"})
+        target = made["attachments"][0]
+        os.remove(self.full(target))
+        proc, retained = self.read({"path": target, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, retained["outcome"], retained["integrity"]),
+                         (0, "ok", "retained_missing"))
+        self.intent_for(target)
+        proc, unpublished = self.read({"path": target, "max_bytes": 4096})
+        self.assertEqual((proc.returncode, unpublished),
+                         (0, {"outcome": "unpublished", "path": target}))
+        proc, missing = self.read({"path": "documents/absent/other.md", "max_bytes": 4096})
+        self.assertEqual((proc.returncode, missing), (0, {"outcome": "not_found"}))
 
 
 if __name__ == "__main__":

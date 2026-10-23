@@ -217,7 +217,18 @@ def close_intent(root, path):
     _remove_intent(root, path)
 
 
+def valid_op_key(op_key):
+    """A plain, safe change-record name; persist itself generates a SHA-256."""
+    return (
+        isinstance(op_key, str)
+        and bool(op_key)
+        and all(c.isascii() and (c.isalnum() or c in "_-") for c in op_key)
+    )
+
+
 def _write_change_record(root, op_key, record):
+    if not valid_op_key(op_key):
+        raise ValueError("invalid op_key")
     directory = _change_records_dir(root)
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, op_key + ".json")
@@ -227,6 +238,8 @@ def _write_change_record(root, op_key, record):
 
 
 def change_record_exists(root, op_key):
+    if not valid_op_key(op_key):
+        raise ValueError("invalid op_key")
     return os.path.isfile(os.path.join(_change_records_dir(root), op_key + ".json"))
 
 
@@ -345,12 +358,18 @@ def commit_exists(root, op_key):
 def commit_write(root, intent, applied_hash, grant=None):
     """C6 step 7's commit for the write `intent` describes: exactly its own
     path, with the C7 trailers. Callers decide whether one is due."""
-    path_entry = f"{intent['path']} sha256={applied_hash} prior={intent['expected_prior']}"
+    # Restoring an uncommitted edit can make the target equal HEAD. C7 permits
+    # a declared unchanged path when its prior equals its committed hash.
+    head = gitutil.run_git_bytes(["show", f"HEAD:{intent['path']}"], root)
+    unchanged_in_commit = head.returncode == 0 and gitutil.hash_bytes(head.stdout) == applied_hash
+    prior = applied_hash if unchanged_in_commit else intent["expected_prior"]
+    path_entry = f"{intent['path']} sha256={applied_hash} prior={prior}"
     trailer_paths = {"keys": [intent["op_key"]], "paths": [path_entry]}
     gitutil.commit_paths(
         root,
         [intent["path"]],
         _commit_trailers(intent["operation"], intent["run_id"], trailer_paths, grant=grant),
+        allow_empty=unchanged_in_commit,
     )
 
 

@@ -148,7 +148,7 @@ def _recover_guarded(root, file_name, intent):
 
 
 def _recover_one(root, file_name, intent):
-    temp = _own_temp(root, intent) if intent is not None else None
+    temp = _own_temp(root, intent) if intent is not None and persist.valid_op_key(intent["op_key"]) else None
     if temp is None:
         # Nothing here can be trusted enough to act on, and nothing may vanish
         # from the report: the intent stays open as unresolved.

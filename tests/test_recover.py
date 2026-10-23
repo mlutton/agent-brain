@@ -910,6 +910,34 @@ class ModuleFolderOrphanTests(RecoverTestCase):
         self.assertEqual(doc["outcome"], "recovered")
 
 
+class RestoreCommittedBytesTests(RecoverTestCase):
+    def test_pending_empty_commit_is_finished_and_intent_closed(self):
+        path = "documents/restored/restored.md"
+        created = self.created_in_fresh_brain(path, git=True)
+        full = self.full(path)
+        with open(full, encoding="utf-8") as fh:
+            committed = fh.read()
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(committed.replace('status: "draft"', 'status: "complete"'))
+        edited_version = _sha256_file(full)
+        proc = self.persist({"operation": "update", "path": path,
+                             "expected_version": edited_version,
+                             "frontmatter": {"status": "draft"}}, fault="before_commit:fail")
+        incomplete = support.parse_single_json(proc.stdout)
+        self.assertEqual((proc.returncode, incomplete["outcome"], incomplete["pending"]),
+                         (3, "written_incomplete", ["commit"]))
+        intent = self.only_intent()
+        self.assertEqual(_sha256_file(full), created["version"])
+        self.assertEqual(self.commits_for(intent["op_key"]), [])
+
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+        self.assertEqual(report["intents"][0]["finished"], ["commit"])
+        self.assertEqual(report["intents"][0]["pending"], [])
+        self.assertEqual(self.intent_files(), [])
+        self.assertEqual(len(self.commits_for(intent["op_key"])), 1)
+
+
 class InvalidIntentTests(RecoverTestCase):
     """An intent recovery cannot trust is never acted on and never dropped: it
     is reported `target_unexpected` (the tool cannot establish what happened),
@@ -917,6 +945,28 @@ class InvalidIntentTests(RecoverTestCase):
 
     def _intent_file(self):
         return os.path.join(self.root, ".brain", "journal", "intents", self.intent_files()[0])
+
+    def test_op_key_traversal_is_invalid_and_writes_no_record_outside_brain(self):
+        self.fresh_brain(git=True)
+        path = "documents/probe/probe.md"
+        self.persist_killed(self.create_request(path), "after_apply")
+        intent_path = self._intent_file()
+        with open(intent_path, encoding="utf-8") as fh:
+            intent = json.load(fh)
+        outside = os.path.join(os.path.dirname(self.root), "escape-oprec-" + os.path.basename(self.root) + ".json")
+        self.addCleanup(lambda: os.path.exists(outside) and os.remove(outside))
+        intent["op_key"] = "../../../../" + os.path.basename(outside)[:-5]
+        with open(intent_path, "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
+
+        proc, report = self.recover()
+        self.assertEqual(proc.returncode, 3, report)
+        self.assertEqual(report["outcome"], "target_unexpected")
+        self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+        self.assertFalse(os.path.exists(outside))
+        self.assertEqual(self.intent_files(), [os.path.basename(intent_path)])
+        records = os.path.join(self.root, ".brain", "journal", "change_records")
+        self.assertEqual(os.listdir(records) if os.path.isdir(records) else [], [])
 
     def test_unreadable_intent_is_reported_and_kept_and_the_others_still_recover(self):
         self.fresh_brain(git=True)

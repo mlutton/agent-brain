@@ -43,7 +43,7 @@ def write_json(path, data):
         fh.write("\n")
 
 
-def commit_paths(root, paths, trailer_text):
+def commit_paths(root, paths, trailer_text, allow_empty=False):
     """Stages exactly `paths` (relative to root) and commits exactly those
     paths, via a pathspec-limited `git commit`, so any other uncommitted or
     staged working-tree change is never swept into the commit (C7, P12)."""
@@ -59,7 +59,8 @@ def commit_paths(root, paths, trailer_text):
     )
     message = "Brain write\n\n" + trailer_text + "\n"
     subprocess.run(
-        ["git", "commit", "-q", "-m", message, "--"] + list(paths),
+        ["git", "commit", "-q", "-m", message]
+        + (["--allow-empty"] if allow_empty else []) + ["--"] + list(paths),
         cwd=root,
         check=True,
         capture_output=True,

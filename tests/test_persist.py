@@ -1241,5 +1241,38 @@ class MintedIdIsUlidTests(PersistTestCase):
         self.assertLess(first, second)
 
 
+class RestoreCommittedBytesTests(PersistTestCase):
+    def test_update_restoring_head_bytes_finishes_and_unlocks_path(self):
+        self.git_root()
+        path = "documents/restored/restored.md"
+        created = self._create(path)
+        full = os.path.join(self.root, path)
+        with open(full, encoding="utf-8") as fh:
+            committed = fh.read()
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(committed.replace('status: "draft"', 'status: "complete"'))
+        with open(full, "rb") as fh:
+            import hashlib
+            edited_version = hashlib.sha256(fh.read()).hexdigest()
+
+        proc, result = self.persist({"operation": "update", "path": path,
+                                     "expected_version": edited_version,
+                                     "frontmatter": {"status": "draft"}})
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(result["outcome"], "written")
+        self.assertEqual(result["version"], created["version"])
+        with open(full, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), committed)
+        message = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=self.root,
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertIn(f"Brain-Path: {path} sha256={created['version']} prior={created['version']}", message)
+        intents = os.path.join(self.root, ".brain", "journal", "intents")
+        self.assertEqual(os.listdir(intents), [])
+        proc, later = self.persist({"operation": "update", "path": path,
+                                    "expected_version": created["version"],
+                                    "frontmatter": {"status": "complete"}})
+        self.assertEqual((proc.returncode, later["outcome"]), (0, "written"))
+
+
 if __name__ == "__main__":
     unittest.main()

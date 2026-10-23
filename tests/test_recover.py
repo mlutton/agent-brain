@@ -946,6 +946,60 @@ class InvalidIntentTests(RecoverTestCase):
     def _intent_file(self):
         return os.path.join(self.root, ".brain", "journal", "intents", self.intent_files()[0])
 
+    def _applied_intent(self):
+        self.fresh_brain(git=True)
+        self.persist_killed(self.create_request("documents/probe/probe.md"), "after_apply")
+        return self.only_intent()
+
+    def _assert_invalid_intent_stays_open(self):
+        before = self.intent_files()
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report["outcome"]), (3, "target_unexpected"), report)
+        self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+        self.assertEqual(self.intent_files(), before)
+
+    def test_linked_change_record_directory_is_invalid_and_writes_nothing_outside(self):
+        self._applied_intent()
+        outside = tempfile.mkdtemp(prefix="brain-records-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        records = self.full(".brain/journal/change_records")
+        os.symlink(outside, records)
+
+        self._assert_invalid_intent_stays_open()
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_linked_change_record_file_is_invalid_even_when_dangling(self):
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling):
+                self.tearDown_root()
+                intent = self._applied_intent()
+                outside = tempfile.mkdtemp(prefix="brain-record-outside-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                target = os.path.join(outside, "record.json")
+                if not dangling:
+                    with open(target, "w", encoding="utf-8") as fh:
+                        fh.write("sentinel\n")
+                records = self.full(".brain/journal/change_records")
+                os.makedirs(records)
+                os.symlink(target, os.path.join(records, intent["op_key"] + ".json"))
+
+                self._assert_invalid_intent_stays_open()
+                if dangling:
+                    self.assertFalse(os.path.lexists(target))
+                else:
+                    with open(target, encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), "sentinel\n")
+
+    def test_255_character_op_key_is_invalid_and_writes_no_record(self):
+        intent = self._applied_intent()
+        intent["op_key"] = "a" * 255
+        with open(self._intent_file(), "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
+
+        self._assert_invalid_intent_stays_open()
+        records = self.full(".brain/journal/change_records")
+        self.assertEqual(os.listdir(records) if os.path.isdir(records) else [], [])
+
     def test_op_key_traversal_is_invalid_and_writes_no_record_outside_brain(self):
         self.fresh_brain(git=True)
         path = "documents/probe/probe.md"

@@ -222,25 +222,34 @@ def valid_op_key(op_key):
     return (
         isinstance(op_key, str)
         and bool(op_key)
+        and len(op_key) <= 128
         and all(c.isascii() and (c.isalnum() or c in "_-") for c in op_key)
     )
 
 
-def _write_change_record(root, op_key, record):
+def _change_record_path(root, op_key):
+    """A record path whose directory and final name do not follow links."""
     if not valid_op_key(op_key):
         raise ValueError("invalid op_key")
-    directory = _change_records_dir(root)
-    os.makedirs(directory, exist_ok=True)
+    directory = _change_records_dir(os.path.realpath(root))
     path = os.path.join(directory, op_key + ".json")
+    if os.path.realpath(directory) != directory or os.path.islink(path):
+        raise ValueError("unsafe change record location")
+    return path
+
+
+def _write_change_record(root, op_key, record):
+    path = _change_record_path(root, op_key)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    _change_record_path(root, op_key)
     if os.path.isfile(path):
         return  # at most one change record per op_key (C6)
     gitutil.write_json(path, record)
 
 
 def change_record_exists(root, op_key):
-    if not valid_op_key(op_key):
-        raise ValueError("invalid op_key")
-    return os.path.isfile(os.path.join(_change_records_dir(root), op_key + ".json"))
+    return os.path.isfile(_change_record_path(root, op_key))
 
 
 def record_change(root, intent, applied_hash):

@@ -1000,6 +1000,52 @@ class InvalidIntentTests(RecoverTestCase):
         records = self.full(".brain/journal/change_records")
         self.assertEqual(os.listdir(records) if os.path.isdir(records) else [], [])
 
+    def test_invalid_key_forms_and_128_character_boundary(self):
+        for key in ("", "\x00", "..", "-dash", "a" * 129):
+            with self.subTest(key=repr(key)):
+                self.tearDown_root()
+                intent = self._applied_intent()
+                intent["op_key"] = key
+                with open(self._intent_file(), "w", encoding="utf-8") as fh:
+                    json.dump(intent, fh)
+                self._assert_invalid_intent_stays_open()
+        self.tearDown_root()
+        intent = self._applied_intent()
+        intent["op_key"] = "a" * 128
+        with open(self._intent_file(), "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+
+    def test_linked_intent_file_is_unreadable_and_kept(self):
+        intent = self._applied_intent()
+        path = self._intent_file()
+        outside = os.path.join(tempfile.mkdtemp(prefix="brain-outside-"), "intent.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(outside), ignore_errors=True)
+        os.replace(path, outside)
+        os.symlink(outside, path)
+        self._assert_invalid_intent_stays_open()
+        self.assertEqual(intent["op_key"], self.only_intent()["op_key"])
+
+    def test_linked_journal_ancestor_is_not_read(self):
+        self._applied_intent()
+        journal = self.full(".brain/journal")
+        outside = tempfile.mkdtemp(prefix="brain-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        os.replace(journal, os.path.join(outside, "journal"))
+        os.symlink(os.path.join(outside, "journal"), journal)
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report), (2, {"outcome": "refused", "reason": "journal_missing"}))
+
+    def test_symlinked_brain_root_recovers_applied_intent(self):
+        self._applied_intent()
+        linked_root = os.path.join(tempfile.mkdtemp(prefix="brain-root-link-"), "root")
+        self.addCleanup(shutil.rmtree, os.path.dirname(linked_root), ignore_errors=True)
+        os.symlink(self.root, linked_root)
+        proc = support.run_brain(["recover", "--root", linked_root], env=_clean_env(), timeout=_TIMEOUT)
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+
     def test_op_key_traversal_is_invalid_and_writes_no_record_outside_brain(self):
         self.fresh_brain(git=True)
         path = "documents/probe/probe.md"

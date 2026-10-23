@@ -1242,6 +1242,27 @@ class MintedIdIsUlidTests(PersistTestCase):
 
 
 class RestoreCommittedBytesTests(PersistTestCase):
+    def test_crlf_restore_that_stages_head_bytes_closes_intent(self):
+        self.git_root()
+        with open(os.path.join(self.root, ".gitattributes"), "w", encoding="utf-8") as fh:
+            fh.write("*.md text eol=crlf\n")
+        _run_git(["add", ".gitattributes"], self.root)
+        _run_git(["commit", "-q", "-m", "attributes"], self.root)
+        path = "documents/restored/restored.md"
+        self._create(path)
+        full = os.path.join(self.root, path)
+        with open(full, "rb") as fh:
+            committed = fh.read()
+        edited = committed.replace(b'status: "draft"', b'status: "complete"').replace(b"\n", b"\r\n")
+        with open(full, "wb") as fh:
+            fh.write(edited)
+        import hashlib
+        proc, doc = self.persist({"operation": "update", "path": path,
+                                  "expected_version": hashlib.sha256(edited).hexdigest(),
+                                  "frontmatter": {"status": "draft"}})
+        self.assertEqual((proc.returncode, doc["outcome"]), (0, "written"), doc)
+        self.assertEqual(os.listdir(os.path.join(self.root, ".brain", "journal", "intents")), [])
+
     def test_update_restoring_head_bytes_finishes_and_unlocks_path(self):
         self.git_root()
         path = "documents/restored/restored.md"
@@ -1272,6 +1293,96 @@ class RestoreCommittedBytesTests(PersistTestCase):
                                     "expected_version": created["version"],
                                     "frontmatter": {"status": "complete"}})
         self.assertEqual((proc.returncode, later["outcome"]), (0, "written"))
+
+
+class JournalLinkTests(PersistTestCase):
+    def test_dangling_intent_link_refuses_without_writing_outside(self):
+        path = "documents/linked/linked.md"
+        intents = os.path.join(self.root, ".brain", "journal", "intents")
+        os.makedirs(intents)
+        outside = os.path.join(tempfile.mkdtemp(prefix="brain-outside-"), "intent.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(outside), ignore_errors=True)
+        os.symlink(outside, os.path.join(intents, "documents__linked__linked.md.json"))
+        proc, doc = self.persist({"operation": "create", "path": path,
+                                  "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"})
+        self.assertEqual((proc.returncode, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+        self.assertFalse(os.path.lexists(outside))
+        self.assertFalse(os.path.exists(os.path.join(self.root, path)))
+
+    def test_linked_intents_or_journal_directory_refuses(self):
+        for component in ("intents", "journal"):
+            with self.subTest(component=component):
+                outside = tempfile.mkdtemp(prefix="brain-outside-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                linked = os.path.join(self.root, ".brain", "journal")
+                if component == "intents":
+                    linked = os.path.join(linked, "intents")
+                else:
+                    shutil.rmtree(linked)
+                os.symlink(outside, linked)
+                proc, doc = self.persist({"operation": "create", "path": "documents/linked/linked.md",
+                                          "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"})
+                self.assertEqual(proc.returncode, 2, doc)
+                self.assertEqual(doc["outcome"], "refused")
+                self.assertEqual(os.listdir(outside), [])
+                os.unlink(linked)
+                if component == "journal":
+                    build_brain(self.root)
+
+    def test_linked_backup_file_or_directory_refuses_update_before_intent(self):
+        path = "documents/linked/linked.md"
+        created = self._create(path)
+        backup_dir = os.path.join(self.root, ".brain", "state", "backups")
+        for linked_dir in (False, True):
+            with self.subTest(linked_dir=linked_dir):
+                outside = tempfile.mkdtemp(prefix="brain-outside-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                os.makedirs(os.path.dirname(backup_dir), exist_ok=True)
+                if os.path.islink(backup_dir):
+                    os.unlink(backup_dir)
+                elif os.path.isdir(backup_dir):
+                    shutil.rmtree(backup_dir)
+                if linked_dir:
+                    os.symlink(outside, backup_dir)
+                    link = backup_dir
+                else:
+                    os.makedirs(backup_dir, exist_ok=True)
+                    import hashlib
+                    name = hashlib.sha256(os.path.join(self.root, path).encode()).hexdigest() + ".bak"
+                    link = os.path.join(backup_dir, name)
+                    os.symlink(os.path.join(outside, "backup.bak"), link)
+                proc, doc = self.persist({"operation": "update", "path": path,
+                                          "expected_version": created["version"],
+                                          "frontmatter": {"status": "complete"}})
+                self.assertEqual((proc.returncode, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+                self.assertEqual(os.listdir(outside), [])
+                os.unlink(link)
+                if not linked_dir:
+                    os.rmdir(backup_dir)
+                elif os.path.isdir(backup_dir):
+                    os.rmdir(backup_dir)
+
+    def test_linked_change_records_refuses_before_target_or_intent(self):
+        outside = tempfile.mkdtemp(prefix="brain-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        os.symlink(outside, os.path.join(self.root, ".brain", "journal", "change_records"))
+        path = "documents/linked/linked.md"
+        proc, doc = self.persist({"operation": "create", "path": path,
+                                  "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"})
+        self.assertEqual((proc.returncode, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+        self.assertFalse(os.path.exists(os.path.join(self.root, path)))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".brain", "journal", "intents")))
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_symlinked_brain_root_still_accepts_create(self):
+        linked_root = os.path.join(tempfile.mkdtemp(prefix="brain-root-link-"), "root")
+        self.addCleanup(shutil.rmtree, os.path.dirname(linked_root), ignore_errors=True)
+        os.symlink(self.root, linked_root)
+        path = "documents/linked/linked.md"
+        proc, doc = self.persist({"operation": "create", "path": path,
+                                  "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"}, root=linked_root)
+        self.assertEqual((proc.returncode, doc["outcome"]), (0, "written"), doc)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, path)))
 
 
 if __name__ == "__main__":

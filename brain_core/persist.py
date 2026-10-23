@@ -32,8 +32,10 @@ scheme or the trailer format. Those names are: `journal_present`,
 """
 
 import datetime
+import json
 import os
 import signal
+import stat
 
 from . import fields as fields_mod
 from . import frontmatter, gitutil, typedefs
@@ -126,7 +128,10 @@ def _zone_of(path):
 
 
 def journal_present(root):
-    epoch_path = os.path.join(root, ".brain", "journal", "epoch.json")
+    try:
+        epoch_path = _safe_brain_path(root, (".brain", "journal"), "epoch.json")
+    except ValueError:
+        return False
     if not os.path.isfile(epoch_path):
         return False
     try:
@@ -144,21 +149,35 @@ def _change_records_dir(root):
     return os.path.join(root, ".brain", "journal", "change_records")
 
 
+def _safe_brain_path(root, folders, name):
+    """Resolve the brain root, then reject any linked internal folder or name."""
+    directory = os.path.join(os.path.realpath(root), *folders)
+    path = os.path.join(directory, name)
+    if os.path.realpath(directory) != directory or os.path.islink(path):
+        raise ValueError("unsafe brain location")
+    return path
+
+
 def _intent_path(root, path):
     """One intent file per data-zone path (not per op_key): a path with any
     open intent refuses further writes (Behaviour 21), regardless of which
     operation opened it."""
     safe = path.replace("/", "__")
-    return os.path.join(_intents_dir(root), safe + ".json")
+    return _safe_brain_path(root, (".brain", "journal", "intents"), safe + ".json")
 
 
 def _has_open_intent(root, path):
-    return os.path.isfile(_intent_path(root, path))
+    return os.path.lexists(_intent_path(root, path))
 
 
 def _write_intent(root, path, record):
-    os.makedirs(_intents_dir(root), exist_ok=True)
-    gitutil.write_json(_intent_path(root, path), record)
+    intent_path = _intent_path(root, path)
+    os.makedirs(os.path.dirname(intent_path), exist_ok=True)
+    intent_path = _intent_path(root, path)
+    fd = os.open(intent_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+        fh.write("\n")
 
 
 def _remove_intent(root, path):
@@ -195,7 +214,9 @@ def open_intents(root):
     file name. `record` is the intent as persist wrote it, or None when the
     file cannot be read as JSON or lacks a field C6 step 2 records -- an intent
     the caller must not act on but must not lose sight of either."""
-    directory = _intents_dir(root)
+    directory = _intents_dir(os.path.realpath(root))
+    if os.path.realpath(directory) != directory:
+        return [("intents", None)]
     try:
         names = sorted(os.listdir(directory))
     except FileNotFoundError:
@@ -205,7 +226,12 @@ def open_intents(root):
         if not name.endswith(".json"):
             continue
         try:
-            record = gitutil.read_json(os.path.join(directory, name))
+            path = _safe_brain_path(root, (".brain", "journal", "intents"), name)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    raise ValueError("not a regular intent")
+                record = json.load(fh)
         except (OSError, ValueError):
             record = None
         found.append((name, record if _well_formed_intent(record) else None))
@@ -222,6 +248,7 @@ def valid_op_key(op_key):
     return (
         isinstance(op_key, str)
         and bool(op_key)
+        and not op_key.startswith("-")
         and len(op_key) <= 128
         and all(c.isascii() and (c.isalnum() or c in "_-") for c in op_key)
     )
@@ -231,11 +258,7 @@ def _change_record_path(root, op_key):
     """A record path whose directory and final name do not follow links."""
     if not valid_op_key(op_key):
         raise ValueError("invalid op_key")
-    directory = _change_records_dir(os.path.realpath(root))
-    path = os.path.join(directory, op_key + ".json")
-    if os.path.realpath(directory) != directory or os.path.islink(path):
-        raise ValueError("unsafe change record location")
-    return path
+    return _safe_brain_path(root, (".brain", "journal", "change_records"), op_key + ".json")
 
 
 def _write_change_record(root, op_key, record):
@@ -245,7 +268,14 @@ def _write_change_record(root, op_key, record):
     _change_record_path(root, op_key)
     if os.path.isfile(path):
         return  # at most one change record per op_key (C6)
-    gitutil.write_json(path, record)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except FileExistsError:
+        _change_record_path(root, op_key)
+        return
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+        fh.write("\n")
 
 
 def change_record_exists(root, op_key):
@@ -369,8 +399,14 @@ def commit_write(root, intent, applied_hash, grant=None):
     path, with the C7 trailers. Callers decide whether one is due."""
     # Restoring an uncommitted edit can make the target equal HEAD. C7 permits
     # a declared unchanged path when its prior equals its committed hash.
+    staged = gitutil.run_git(["add", "--", intent["path"]], root)
+    if staged.returncode != 0:
+        raise RuntimeError("git add failed")
+    index = gitutil.run_git_bytes(["show", f":{intent['path']}"], root)
+    if index.returncode != 0:
+        raise RuntimeError("git index read failed")
     head = gitutil.run_git_bytes(["show", f"HEAD:{intent['path']}"], root)
-    unchanged_in_commit = head.returncode == 0 and gitutil.hash_bytes(head.stdout) == applied_hash
+    unchanged_in_commit = head.returncode == 0 and head.stdout == index.stdout
     prior = applied_hash if unchanged_in_commit else intent["expected_prior"]
     path_entry = f"{intent['path']} sha256={applied_hash} prior={prior}"
     trailer_paths = {"keys": [intent["op_key"]], "paths": [path_entry]}
@@ -388,11 +424,14 @@ def _apply_create_or_attach(temp_path, target_path):
     os.link(temp_path, target_path)
 
 
-def _apply_update(temp_path, target_path, backup_path):
+def _apply_update(root, temp_path, target_path, backup_path):
     os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+    if _plan_backup_path(root, target_path) != backup_path:
+        raise ValueError("unsafe backup location")
     with open(target_path, "rb") as fh:
         current_bytes = fh.read()
-    with open(backup_path, "wb") as fh:
+    fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as fh:
         fh.write(current_bytes)
     os.replace(temp_path, target_path)
 
@@ -412,8 +451,8 @@ def _plan_temp_path(directory):
 def _plan_backup_path(root, target_path):
     """Decides update's backup path before it exists, same reasoning as
     `_plan_temp_path`; create/attach have no backup (C6 step 5)."""
-    backup_dir = os.path.join(root, ".brain", "state", "backups")
-    return os.path.join(backup_dir, gitutil.hash_text(target_path) + ".bak")
+    return _safe_brain_path(root, (".brain", "state", "backups"),
+                            gitutil.hash_text(target_path) + ".bak")
 
 
 def _write_temp(temp_path, content_bytes):
@@ -492,8 +531,11 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
     if not journal_present(root):
         return _refused("journal_missing")
 
-    if _has_open_intent(root, path):
-        return _refused("open_intent")
+    try:
+        if _has_open_intent(root, path):
+            return _refused("open_intent")
+    except ValueError:
+        return _refused("unsafe_journal")
 
     run_id = request.get("run_id") or _mint_id()
     zone = _zone_of(path)
@@ -522,7 +564,12 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
     # 2's intent record can name them -- `recover` needs them to close an
     # intent and remove its temp without reconstructing either.
     temp_path = _plan_temp_path(target_dir)
-    backup_path = _plan_backup_path(root, target_full) if operation == "update" else None
+    try:
+        backup_path = _plan_backup_path(root, target_full) if operation == "update" else None
+        _change_record_path(root, op_key)
+        _intent_path(root, path)
+    except ValueError:
+        return _refused("unsafe_journal")
 
     intent_record = {
         "run_id": run_id,
@@ -534,7 +581,10 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
         "temp_path": temp_path,
         "backup_path": backup_path,
     }
-    _write_intent(root, path, intent_record)
+    try:
+        _write_intent(root, path, intent_record)
+    except (OSError, ValueError):
+        return _refused("unsafe_journal")
     _check_fault("after_intent")
 
     try:
@@ -578,8 +628,8 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
             # temp via `os.replace`.
             _remove_if_exists(temp_path)
         else:
-            _apply_update(temp_path, target_full, backup_path)
-    except OSError:
+            _apply_update(root, temp_path, target_full, backup_path)
+    except (OSError, ValueError):
         _remove_if_exists(temp_path)
         _remove_intent(root, path)
         return _failed_before_apply(temp_path)
@@ -617,7 +667,7 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
         if is_git_brain(root):
             commit_write(root, intent_record, applied_hash, grant=grant_id)
         commit_done = True
-    except _Fault:
+    except Exception:
         if not change_record_done:
             pending = ["change_record", "commit"]
         elif not commit_done:

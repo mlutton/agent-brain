@@ -266,20 +266,61 @@ def _write_change_record(root, op_key, record):
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     _change_record_path(root, op_key)
-    if os.path.isfile(path):
-        return  # at most one change record per op_key (C6)
+    if _matching_change_record(path, record):
+        return  # at most one valid change record per op_key (C6)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     except FileExistsError:
-        _change_record_path(root, op_key)
+        path = _change_record_path(root, op_key)
+        if not _matching_change_record(path, record):
+            raise ValueError("change record disappeared during creation")
         return
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(record, fh)
         fh.write("\n")
 
 
-def change_record_exists(root, op_key):
-    return os.path.isfile(_change_record_path(root, op_key))
+def _matching_change_record(path, expected):
+    """Return whether a matching record exists; reject occupied invalid names.
+
+    Check both the name and descriptor before reading. O_NONBLOCK prevents a
+    swapped-in FIFO from blocking, and O_NOFOLLOW prevents a swapped-in link
+    from redirecting the read.
+    """
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(mode):
+        raise ValueError("change record is not a regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise ValueError("change record is not a regular file")
+        try:
+            actual = json.load(fh)
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("invalid change record JSON") from exc
+    if actual != expected:
+        raise ValueError("change record does not match operation")
+    return True
+
+
+def change_record_exists(root, op_key, intent, applied_hash):
+    return _matching_change_record(
+        _change_record_path(root, op_key), _change_record_for(intent, applied_hash)
+    )
+
+
+def _change_record_for(intent, applied_hash):
+    return {
+        "op_key": intent["op_key"],
+        "operation": intent["operation"],
+        "run_id": intent["run_id"],
+        "path": intent["path"],
+        "sha256": applied_hash,
+        "prior": intent["expected_prior"],
+    }
 
 
 def record_change(root, intent, applied_hash):
@@ -288,14 +329,7 @@ def record_change(root, intent, applied_hash):
     _write_change_record(
         root,
         intent["op_key"],
-        {
-            "op_key": intent["op_key"],
-            "operation": intent["operation"],
-            "run_id": intent["run_id"],
-            "path": intent["path"],
-            "sha256": applied_hash,
-            "prior": intent["expected_prior"],
-        },
+        _change_record_for(intent, applied_hash),
     )
 
 

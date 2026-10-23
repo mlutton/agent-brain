@@ -990,6 +990,37 @@ class InvalidIntentTests(RecoverTestCase):
                     with open(target, encoding="utf-8") as fh:
                         self.assertEqual(fh.read(), "sentinel\n")
 
+    def test_existing_change_record_name_must_hold_the_matching_regular_record(self):
+        for existing in ("fifo", "directory", "wrong_record", "valid"):
+            with self.subTest(existing=existing):
+                self.tearDown_root()
+                intent = self._applied_intent()
+                records = self.full(".brain/journal/change_records")
+                os.makedirs(records)
+                record_path = os.path.join(records, intent["op_key"] + ".json")
+                expected = {
+                    "op_key": intent["op_key"], "operation": intent["operation"],
+                    "run_id": intent["run_id"], "path": intent["path"],
+                    "sha256": intent["intended_sha256"], "prior": intent["expected_prior"],
+                }
+                if existing == "fifo":
+                    os.mkfifo(record_path)
+                elif existing == "directory":
+                    os.mkdir(record_path)
+                else:
+                    with open(record_path, "w", encoding="utf-8") as fh:
+                        json.dump(expected if existing == "valid" else {**expected, "sha256": "wrong"}, fh)
+
+                proc, report = self.recover()
+                if existing == "valid":
+                    self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+                    self.assertEqual(report["intents"][0]["finished"], ["commit"])
+                    self.assertEqual(self.intent_files(), [])
+                else:
+                    self.assertEqual((proc.returncode, report["outcome"]), (3, "target_unexpected"), report)
+                    self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+                    self.assertEqual(len(self.intent_files()), 1)
+
     def test_255_character_op_key_is_invalid_and_writes_no_record(self):
         intent = self._applied_intent()
         intent["op_key"] = "a" * 255

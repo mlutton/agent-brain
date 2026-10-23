@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests import support
 from tests.yaml12 import make_yaml12_loader
@@ -894,6 +895,62 @@ class FaultInjectionTests(PersistTestCase):
             input_data=json.dumps(request),
             env=dict(os.environ, BRAIN_TEST_FAULTS="1", BRAIN_FAULT=fault),
         )
+
+    def test_replayed_create_requires_its_existing_change_record_to_be_valid(self):
+        from brain_core import persist, vendor_yaml
+
+        yaml_module = vendor_yaml.load(support.REPO_ROOT)
+        duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+        request = {
+            "operation": "create",
+            "path": "documents/replay/replay.md",
+            "run_id": "replayed-create",
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        for existing in ("fifo", "directory", "valid", "wrong_record"):
+            with self.subTest(existing=existing):
+                root = tempfile.mkdtemp(prefix="brain-record-replay-")
+                self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+                build_brain(root)
+
+                def interrupt_after_intent(step):
+                    if step == "after_intent":
+                        raise RuntimeError("interrupted after intent")
+
+                with mock.patch.object(persist, "_mint_id", return_value="01arz3ndektsv4rrffq69g5fav"):
+                    with mock.patch.object(persist, "_check_fault", side_effect=interrupt_after_intent):
+                        with self.assertRaisesRegex(RuntimeError, "interrupted after intent"):
+                            persist.run_persist(request, root, support.REPO_ROOT, yaml_module, duplicate_loader)
+                    intents_dir = os.path.join(root, ".brain", "journal", "intents")
+                    (intent_name,) = os.listdir(intents_dir)
+                    with open(os.path.join(intents_dir, intent_name), encoding="utf-8") as fh:
+                        intent = json.load(fh)
+                    os.unlink(os.path.join(intents_dir, intent_name))
+                    records_dir = os.path.join(root, ".brain", "journal", "change_records")
+                    os.makedirs(records_dir)
+                    record_path = os.path.join(records_dir, intent["op_key"] + ".json")
+                    expected = {
+                        "op_key": intent["op_key"], "operation": intent["operation"],
+                        "run_id": intent["run_id"], "path": intent["path"],
+                        "sha256": intent["intended_sha256"], "prior": intent["expected_prior"],
+                    }
+                    if existing == "fifo":
+                        os.mkfifo(record_path)
+                    elif existing == "directory":
+                        os.mkdir(record_path)
+                    else:
+                        with open(record_path, "w", encoding="utf-8") as fh:
+                            json.dump(expected if existing == "valid" else {**expected, "run_id": "other"}, fh)
+
+                    doc, code = persist.run_persist(request, root, support.REPO_ROOT, yaml_module, duplicate_loader)
+                if existing == "valid":
+                    self.assertEqual((code, doc["outcome"]), (0, "written"), doc)
+                    self.assertEqual(os.listdir(intents_dir), [])
+                else:
+                    self.assertEqual((code, doc["outcome"]), (3, "written_incomplete"), doc)
+                    self.assertEqual(doc["pending"], ["change_record", "commit"])
+                    self.assertEqual(os.listdir(intents_dir), [intent_name])
 
     def test_kill_after_temp_leaves_no_target_or_prior_bytes_only(self):
         path = "documents/killtemp/killtemp.md"

@@ -171,6 +171,33 @@ class RouteTests(RecoverTestCase):
         self.assertEqual(proc.returncode, 2, proc)
         self.assertEqual(doc, {"outcome": "refused", "reason": "journal_missing"})
 
+    def test_non_directory_intents_is_reported_without_changing_it(self):
+        for kind in ("file", "fifo"):
+            with self.subTest(kind=kind):
+                self.tearDown_root()
+                self.fresh_brain()
+                intents = self.full(".brain/journal/intents")
+                if kind == "file":
+                    with open(intents, "wb") as fh:
+                        fh.write(b"sentinel intent bytes\n")
+                else:
+                    os.mkfifo(intents)
+                before = os.lstat(intents)
+
+                proc = support.run_brain(
+                    ["recover", "--root", self.root], env=_clean_env(), timeout=5
+                )
+                report = support.parse_single_json(proc.stdout)
+
+                self.assertEqual((proc.returncode, report["outcome"]), (3, "target_unexpected"), report)
+                self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+                self.assertEqual(os.lstat(intents).st_ino, before.st_ino)
+                self.assertEqual(os.lstat(intents).st_mode, before.st_mode)
+                if kind == "file":
+                    with open(intents, "rb") as fh:
+                        self.assertEqual(fh.read(), b"sentinel intent bytes\n")
+                self.assertFalse(os.path.exists(self.full("documents/non-directory.md")))
+
 
 class NotAppliedTests(RecoverTestCase):
     """`kill` at `after_intent` and at `before_apply` is `not_applied` --

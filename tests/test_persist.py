@@ -1,6 +1,7 @@
 """Tests for `brain persist` (ST-02), against docs/specification/beta.md C4/C6/C7."""
 
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -948,9 +949,9 @@ class FaultInjectionTests(PersistTestCase):
                     self.assertEqual((code, doc["outcome"]), (0, "written"), doc)
                     self.assertEqual(os.listdir(intents_dir), [])
                 else:
-                    self.assertEqual((code, doc["outcome"]), (3, "written_incomplete"), doc)
-                    self.assertEqual(doc["pending"], ["change_record", "commit"])
-                    self.assertEqual(os.listdir(intents_dir), [intent_name])
+                    self.assertEqual((code, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+                    self.assertEqual(os.listdir(intents_dir), [])
+                    self.assertFalse(os.path.exists(os.path.join(root, request["path"])))
 
     def test_kill_after_temp_leaves_no_target_or_prior_bytes_only(self):
         path = "documents/killtemp/killtemp.md"
@@ -1353,6 +1354,60 @@ class RestoreCommittedBytesTests(PersistTestCase):
 
 
 class JournalLinkTests(PersistTestCase):
+    def test_hard_linked_backup_name_does_not_modify_outside_file(self):
+        path = "documents/backup-link/backup-link.md"
+        created = self._create(path)
+        target = os.path.join(self.root, path)
+        with open(target, "rb") as fh:
+            prior = fh.read()
+        outside_dir = tempfile.mkdtemp(prefix="brain-backup-outside-")
+        self.addCleanup(shutil.rmtree, outside_dir, ignore_errors=True)
+        outside = os.path.join(outside_dir, "sentinel.txt")
+        with open(outside, "wb") as fh:
+            fh.write(b"outside sentinel\n")
+        backups = os.path.join(self.root, ".brain", "state", "backups")
+        os.makedirs(backups)
+        backup = os.path.join(backups, hashlib.sha256(target.encode()).hexdigest() + ".bak")
+        os.link(outside, backup)
+
+        proc, report = self.persist({"operation": "update", "path": path,
+                                     "expected_version": created["version"],
+                                     "frontmatter": {"status": "complete"}})
+
+        self.assertEqual((proc.returncode, report["outcome"]), (3, "failed_before_apply"), report)
+        with open(outside, "rb") as fh:
+            self.assertEqual(fh.read(), b"outside sentinel\n")
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), prior)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".brain", "journal", "intents",
+                                                     path.replace("/", "__") + ".json")))
+
+    def test_fifo_backup_name_fails_before_apply_without_hanging(self):
+        path = "documents/backup-fifo/backup-fifo.md"
+        created = self._create(path)
+        target = os.path.join(self.root, path)
+        with open(target, "rb") as fh:
+            prior = fh.read()
+        backups = os.path.join(self.root, ".brain", "state", "backups")
+        os.makedirs(backups)
+        backup = os.path.join(backups, hashlib.sha256(target.encode()).hexdigest() + ".bak")
+        os.mkfifo(backup)
+
+        proc = support.run_brain(
+            ["persist", "--root", self.root],
+            input_data=json.dumps({"operation": "update", "path": path,
+                                   "expected_version": created["version"],
+                                   "frontmatter": {"status": "complete"}}),
+            timeout=5,
+        )
+        report = support.parse_single_json(proc.stdout)
+
+        self.assertEqual((proc.returncode, report["outcome"]), (3, "failed_before_apply"), report)
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), prior)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".brain", "journal", "intents",
+                                                     path.replace("/", "__") + ".json")))
+
     def test_dangling_intent_link_refuses_without_writing_outside(self):
         path = "documents/linked/linked.md"
         intents = os.path.join(self.root, ".brain", "journal", "intents")

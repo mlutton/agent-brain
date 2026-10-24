@@ -219,6 +219,8 @@ def open_intents(root):
         return [("intents", None)]
     try:
         names = sorted(os.listdir(directory))
+    except NotADirectoryError:
+        return [("intents", None)]
     except FileNotFoundError:
         return []
     found = []
@@ -464,8 +466,12 @@ def _apply_update(root, temp_path, target_path, backup_path):
         raise ValueError("unsafe backup location")
     with open(target_path, "rb") as fh:
         current_bytes = fh.read()
-    fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
     with os.fdopen(fd, "wb") as fh:
+        backup_stat = os.fstat(fh.fileno())
+        if not stat.S_ISREG(backup_stat.st_mode) or backup_stat.st_nlink != 1:
+            raise ValueError("unsafe backup file")
+        os.ftruncate(fh.fileno(), 0)
         fh.write(current_bytes)
     os.replace(temp_path, target_path)
 
@@ -615,6 +621,12 @@ def run_persist(request, root, base_dir, yaml_module, duplicate_loader):
         "temp_path": temp_path,
         "backup_path": backup_path,
     }
+    try:
+        _matching_change_record(
+            _change_record_path(root, op_key), _change_record_for(intent_record, intended_sha256)
+        )
+    except (OSError, ValueError):
+        return _refused("unsafe_journal")
     try:
         _write_intent(root, path, intent_record)
     except (OSError, ValueError):

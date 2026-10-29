@@ -86,7 +86,11 @@ def _finish_bookkeeping(root, intent, applied_hash, entry):
         steps.append(("commit", persist.commit_exists, persist.commit_write))
     for index, (name, exists, make) in enumerate(steps):
         try:
-            if not exists(root, intent["op_key"]):
+            already_done = (
+                exists(root, intent["op_key"], intent, applied_hash)
+                if name == "change_record" else exists(root, intent["op_key"])
+            )
+            if not already_done:
                 make(root, intent, applied_hash)
                 entry["finished"].append(name)
         except Exception:
@@ -148,7 +152,13 @@ def _recover_guarded(root, file_name, intent):
 
 
 def _recover_one(root, file_name, intent):
-    temp = _own_temp(root, intent) if intent is not None else None
+    if intent is None or not persist.valid_op_key(intent["op_key"]):
+        return _unresolved(file_name, intent, "invalid_intent")
+    try:
+        persist.change_record_exists(root, intent["op_key"], intent, intent["intended_sha256"])
+    except ValueError:
+        return _unresolved(file_name, intent, "invalid_intent")
+    temp = _own_temp(root, intent)
     if temp is None:
         # Nothing here can be trusted enough to act on, and nothing may vanish
         # from the report: the intent stays open as unresolved.

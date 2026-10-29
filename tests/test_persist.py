@@ -1,6 +1,7 @@
 """Tests for `brain persist` (ST-02), against docs/specification/beta.md C4/C6/C7."""
 
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests import support
 from tests.yaml12 import make_yaml12_loader
@@ -895,6 +897,62 @@ class FaultInjectionTests(PersistTestCase):
             env=dict(os.environ, BRAIN_TEST_FAULTS="1", BRAIN_FAULT=fault),
         )
 
+    def test_replayed_create_requires_its_existing_change_record_to_be_valid(self):
+        from brain_core import persist, vendor_yaml
+
+        yaml_module = vendor_yaml.load(support.REPO_ROOT)
+        duplicate_loader = vendor_yaml.make_duplicate_safe_loader(yaml_module)
+        request = {
+            "operation": "create",
+            "path": "documents/replay/replay.md",
+            "run_id": "replayed-create",
+            "frontmatter": dict(NOTE_FRONTMATTER),
+            "body": "Body.\n",
+        }
+        for existing in ("fifo", "directory", "valid", "wrong_record"):
+            with self.subTest(existing=existing):
+                root = tempfile.mkdtemp(prefix="brain-record-replay-")
+                self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+                build_brain(root)
+
+                def interrupt_after_intent(step):
+                    if step == "after_intent":
+                        raise RuntimeError("interrupted after intent")
+
+                with mock.patch.object(persist, "_mint_id", return_value="01arz3ndektsv4rrffq69g5fav"):
+                    with mock.patch.object(persist, "_check_fault", side_effect=interrupt_after_intent):
+                        with self.assertRaisesRegex(RuntimeError, "interrupted after intent"):
+                            persist.run_persist(request, root, support.REPO_ROOT, yaml_module, duplicate_loader)
+                    intents_dir = os.path.join(root, ".brain", "journal", "intents")
+                    (intent_name,) = os.listdir(intents_dir)
+                    with open(os.path.join(intents_dir, intent_name), encoding="utf-8") as fh:
+                        intent = json.load(fh)
+                    os.unlink(os.path.join(intents_dir, intent_name))
+                    records_dir = os.path.join(root, ".brain", "journal", "change_records")
+                    os.makedirs(records_dir)
+                    record_path = os.path.join(records_dir, intent["op_key"] + ".json")
+                    expected = {
+                        "op_key": intent["op_key"], "operation": intent["operation"],
+                        "run_id": intent["run_id"], "path": intent["path"],
+                        "sha256": intent["intended_sha256"], "prior": intent["expected_prior"],
+                    }
+                    if existing == "fifo":
+                        os.mkfifo(record_path)
+                    elif existing == "directory":
+                        os.mkdir(record_path)
+                    else:
+                        with open(record_path, "w", encoding="utf-8") as fh:
+                            json.dump(expected if existing == "valid" else {**expected, "run_id": "other"}, fh)
+
+                    doc, code = persist.run_persist(request, root, support.REPO_ROOT, yaml_module, duplicate_loader)
+                if existing == "valid":
+                    self.assertEqual((code, doc["outcome"]), (0, "written"), doc)
+                    self.assertEqual(os.listdir(intents_dir), [])
+                else:
+                    self.assertEqual((code, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+                    self.assertEqual(os.listdir(intents_dir), [])
+                    self.assertFalse(os.path.exists(os.path.join(root, request["path"])))
+
     def test_kill_after_temp_leaves_no_target_or_prior_bytes_only(self):
         path = "documents/killtemp/killtemp.md"
         request = {
@@ -1239,6 +1297,204 @@ class MintedIdIsUlidTests(PersistTestCase):
         time.sleep(0.005)
         second = self._create("documents/ulidseq/second.md")
         self.assertLess(first, second)
+
+
+class RestoreCommittedBytesTests(PersistTestCase):
+    def test_crlf_restore_that_stages_head_bytes_closes_intent(self):
+        self.git_root()
+        with open(os.path.join(self.root, ".gitattributes"), "w", encoding="utf-8") as fh:
+            fh.write("*.md text eol=crlf\n")
+        _run_git(["add", ".gitattributes"], self.root)
+        _run_git(["commit", "-q", "-m", "attributes"], self.root)
+        path = "documents/restored/restored.md"
+        self._create(path)
+        full = os.path.join(self.root, path)
+        with open(full, "rb") as fh:
+            committed = fh.read()
+        edited = committed.replace(b'status: "draft"', b'status: "complete"').replace(b"\n", b"\r\n")
+        with open(full, "wb") as fh:
+            fh.write(edited)
+        import hashlib
+        proc, doc = self.persist({"operation": "update", "path": path,
+                                  "expected_version": hashlib.sha256(edited).hexdigest(),
+                                  "frontmatter": {"status": "draft"}})
+        self.assertEqual((proc.returncode, doc["outcome"]), (0, "written"), doc)
+        self.assertEqual(os.listdir(os.path.join(self.root, ".brain", "journal", "intents")), [])
+
+    def test_update_restoring_head_bytes_finishes_and_unlocks_path(self):
+        self.git_root()
+        path = "documents/restored/restored.md"
+        created = self._create(path)
+        full = os.path.join(self.root, path)
+        with open(full, encoding="utf-8") as fh:
+            committed = fh.read()
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(committed.replace('status: "draft"', 'status: "complete"'))
+        with open(full, "rb") as fh:
+            import hashlib
+            edited_version = hashlib.sha256(fh.read()).hexdigest()
+
+        proc, result = self.persist({"operation": "update", "path": path,
+                                     "expected_version": edited_version,
+                                     "frontmatter": {"status": "draft"}})
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(result["outcome"], "written")
+        self.assertEqual(result["version"], created["version"])
+        with open(full, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), committed)
+        message = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=self.root,
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertIn(f"Brain-Path: {path} sha256={created['version']} prior={created['version']}", message)
+        intents = os.path.join(self.root, ".brain", "journal", "intents")
+        self.assertEqual(os.listdir(intents), [])
+        proc, later = self.persist({"operation": "update", "path": path,
+                                    "expected_version": created["version"],
+                                    "frontmatter": {"status": "complete"}})
+        self.assertEqual((proc.returncode, later["outcome"]), (0, "written"))
+
+
+class JournalLinkTests(PersistTestCase):
+    def test_hard_linked_backup_name_does_not_modify_outside_file(self):
+        path = "documents/backup-link/backup-link.md"
+        created = self._create(path)
+        target = os.path.join(self.root, path)
+        with open(target, "rb") as fh:
+            prior = fh.read()
+        outside_dir = tempfile.mkdtemp(prefix="brain-backup-outside-")
+        self.addCleanup(shutil.rmtree, outside_dir, ignore_errors=True)
+        outside = os.path.join(outside_dir, "sentinel.txt")
+        with open(outside, "wb") as fh:
+            fh.write(b"outside sentinel\n")
+        backups = os.path.join(self.root, ".brain", "state", "backups")
+        os.makedirs(backups)
+        backup = os.path.join(backups, hashlib.sha256(target.encode()).hexdigest() + ".bak")
+        os.link(outside, backup)
+
+        proc, report = self.persist({"operation": "update", "path": path,
+                                     "expected_version": created["version"],
+                                     "frontmatter": {"status": "complete"}})
+
+        self.assertEqual((proc.returncode, report["outcome"]), (3, "failed_before_apply"), report)
+        with open(outside, "rb") as fh:
+            self.assertEqual(fh.read(), b"outside sentinel\n")
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), prior)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".brain", "journal", "intents",
+                                                     path.replace("/", "__") + ".json")))
+
+    def test_fifo_backup_name_fails_before_apply_without_hanging(self):
+        path = "documents/backup-fifo/backup-fifo.md"
+        created = self._create(path)
+        target = os.path.join(self.root, path)
+        with open(target, "rb") as fh:
+            prior = fh.read()
+        backups = os.path.join(self.root, ".brain", "state", "backups")
+        os.makedirs(backups)
+        backup = os.path.join(backups, hashlib.sha256(target.encode()).hexdigest() + ".bak")
+        os.mkfifo(backup)
+
+        proc = support.run_brain(
+            ["persist", "--root", self.root],
+            input_data=json.dumps({"operation": "update", "path": path,
+                                   "expected_version": created["version"],
+                                   "frontmatter": {"status": "complete"}}),
+            timeout=5,
+        )
+        report = support.parse_single_json(proc.stdout)
+
+        self.assertEqual((proc.returncode, report["outcome"]), (3, "failed_before_apply"), report)
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), prior)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".brain", "journal", "intents",
+                                                     path.replace("/", "__") + ".json")))
+
+    def test_dangling_intent_link_refuses_without_writing_outside(self):
+        path = "documents/linked/linked.md"
+        intents = os.path.join(self.root, ".brain", "journal", "intents")
+        os.makedirs(intents)
+        outside = os.path.join(tempfile.mkdtemp(prefix="brain-outside-"), "intent.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(outside), ignore_errors=True)
+        os.symlink(outside, os.path.join(intents, "documents__linked__linked.md.json"))
+        proc, doc = self.persist({"operation": "create", "path": path,
+                                  "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"})
+        self.assertEqual((proc.returncode, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+        self.assertFalse(os.path.lexists(outside))
+        self.assertFalse(os.path.exists(os.path.join(self.root, path)))
+
+    def test_linked_intents_or_journal_directory_refuses(self):
+        for component in ("intents", "journal"):
+            with self.subTest(component=component):
+                outside = tempfile.mkdtemp(prefix="brain-outside-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                linked = os.path.join(self.root, ".brain", "journal")
+                if component == "intents":
+                    linked = os.path.join(linked, "intents")
+                else:
+                    shutil.rmtree(linked)
+                os.symlink(outside, linked)
+                proc, doc = self.persist({"operation": "create", "path": "documents/linked/linked.md",
+                                          "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"})
+                self.assertEqual(proc.returncode, 2, doc)
+                self.assertEqual(doc["outcome"], "refused")
+                self.assertEqual(os.listdir(outside), [])
+                os.unlink(linked)
+                if component == "journal":
+                    build_brain(self.root)
+
+    def test_linked_backup_file_or_directory_refuses_update_before_intent(self):
+        path = "documents/linked/linked.md"
+        created = self._create(path)
+        backup_dir = os.path.join(self.root, ".brain", "state", "backups")
+        for linked_dir in (False, True):
+            with self.subTest(linked_dir=linked_dir):
+                outside = tempfile.mkdtemp(prefix="brain-outside-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                os.makedirs(os.path.dirname(backup_dir), exist_ok=True)
+                if os.path.islink(backup_dir):
+                    os.unlink(backup_dir)
+                elif os.path.isdir(backup_dir):
+                    shutil.rmtree(backup_dir)
+                if linked_dir:
+                    os.symlink(outside, backup_dir)
+                    link = backup_dir
+                else:
+                    os.makedirs(backup_dir, exist_ok=True)
+                    import hashlib
+                    name = hashlib.sha256(os.path.join(self.root, path).encode()).hexdigest() + ".bak"
+                    link = os.path.join(backup_dir, name)
+                    os.symlink(os.path.join(outside, "backup.bak"), link)
+                proc, doc = self.persist({"operation": "update", "path": path,
+                                          "expected_version": created["version"],
+                                          "frontmatter": {"status": "complete"}})
+                self.assertEqual((proc.returncode, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+                self.assertEqual(os.listdir(outside), [])
+                os.unlink(link)
+                if not linked_dir:
+                    os.rmdir(backup_dir)
+                elif os.path.isdir(backup_dir):
+                    os.rmdir(backup_dir)
+
+    def test_linked_change_records_refuses_before_target_or_intent(self):
+        outside = tempfile.mkdtemp(prefix="brain-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        os.symlink(outside, os.path.join(self.root, ".brain", "journal", "change_records"))
+        path = "documents/linked/linked.md"
+        proc, doc = self.persist({"operation": "create", "path": path,
+                                  "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"})
+        self.assertEqual((proc.returncode, doc), (2, {"outcome": "refused", "reason": "unsafe_journal"}))
+        self.assertFalse(os.path.exists(os.path.join(self.root, path)))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".brain", "journal", "intents")))
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_symlinked_brain_root_still_accepts_create(self):
+        linked_root = os.path.join(tempfile.mkdtemp(prefix="brain-root-link-"), "root")
+        self.addCleanup(shutil.rmtree, os.path.dirname(linked_root), ignore_errors=True)
+        os.symlink(self.root, linked_root)
+        path = "documents/linked/linked.md"
+        proc, doc = self.persist({"operation": "create", "path": path,
+                                  "frontmatter": dict(NOTE_FRONTMATTER), "body": "Body.\n"}, root=linked_root)
+        self.assertEqual((proc.returncode, doc["outcome"]), (0, "written"), doc)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, path)))
 
 
 if __name__ == "__main__":

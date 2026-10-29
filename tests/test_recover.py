@@ -171,6 +171,33 @@ class RouteTests(RecoverTestCase):
         self.assertEqual(proc.returncode, 2, proc)
         self.assertEqual(doc, {"outcome": "refused", "reason": "journal_missing"})
 
+    def test_non_directory_intents_is_reported_without_changing_it(self):
+        for kind in ("file", "fifo"):
+            with self.subTest(kind=kind):
+                self.tearDown_root()
+                self.fresh_brain()
+                intents = self.full(".brain/journal/intents")
+                if kind == "file":
+                    with open(intents, "wb") as fh:
+                        fh.write(b"sentinel intent bytes\n")
+                else:
+                    os.mkfifo(intents)
+                before = os.lstat(intents)
+
+                proc = support.run_brain(
+                    ["recover", "--root", self.root], env=_clean_env(), timeout=5
+                )
+                report = support.parse_single_json(proc.stdout)
+
+                self.assertEqual((proc.returncode, report["outcome"]), (3, "target_unexpected"), report)
+                self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+                self.assertEqual(os.lstat(intents).st_ino, before.st_ino)
+                self.assertEqual(os.lstat(intents).st_mode, before.st_mode)
+                if kind == "file":
+                    with open(intents, "rb") as fh:
+                        self.assertEqual(fh.read(), b"sentinel intent bytes\n")
+                self.assertFalse(os.path.exists(self.full("documents/non-directory.md")))
+
 
 class NotAppliedTests(RecoverTestCase):
     """`kill` at `after_intent` and at `before_apply` is `not_applied` --
@@ -910,6 +937,34 @@ class ModuleFolderOrphanTests(RecoverTestCase):
         self.assertEqual(doc["outcome"], "recovered")
 
 
+class RestoreCommittedBytesTests(RecoverTestCase):
+    def test_pending_empty_commit_is_finished_and_intent_closed(self):
+        path = "documents/restored/restored.md"
+        created = self.created_in_fresh_brain(path, git=True)
+        full = self.full(path)
+        with open(full, encoding="utf-8") as fh:
+            committed = fh.read()
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(committed.replace('status: "draft"', 'status: "complete"'))
+        edited_version = _sha256_file(full)
+        proc = self.persist({"operation": "update", "path": path,
+                             "expected_version": edited_version,
+                             "frontmatter": {"status": "draft"}}, fault="before_commit:fail")
+        incomplete = support.parse_single_json(proc.stdout)
+        self.assertEqual((proc.returncode, incomplete["outcome"], incomplete["pending"]),
+                         (3, "written_incomplete", ["commit"]))
+        intent = self.only_intent()
+        self.assertEqual(_sha256_file(full), created["version"])
+        self.assertEqual(self.commits_for(intent["op_key"]), [])
+
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+        self.assertEqual(report["intents"][0]["finished"], ["commit"])
+        self.assertEqual(report["intents"][0]["pending"], [])
+        self.assertEqual(self.intent_files(), [])
+        self.assertEqual(len(self.commits_for(intent["op_key"])), 1)
+
+
 class InvalidIntentTests(RecoverTestCase):
     """An intent recovery cannot trust is never acted on and never dropped: it
     is reported `target_unexpected` (the tool cannot establish what happened),
@@ -917,6 +972,159 @@ class InvalidIntentTests(RecoverTestCase):
 
     def _intent_file(self):
         return os.path.join(self.root, ".brain", "journal", "intents", self.intent_files()[0])
+
+    def _applied_intent(self):
+        self.fresh_brain(git=True)
+        self.persist_killed(self.create_request("documents/probe/probe.md"), "after_apply")
+        return self.only_intent()
+
+    def _assert_invalid_intent_stays_open(self):
+        before = self.intent_files()
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report["outcome"]), (3, "target_unexpected"), report)
+        self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+        self.assertEqual(self.intent_files(), before)
+
+    def test_linked_change_record_directory_is_invalid_and_writes_nothing_outside(self):
+        self._applied_intent()
+        outside = tempfile.mkdtemp(prefix="brain-records-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        records = self.full(".brain/journal/change_records")
+        os.symlink(outside, records)
+
+        self._assert_invalid_intent_stays_open()
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_linked_change_record_file_is_invalid_even_when_dangling(self):
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling):
+                self.tearDown_root()
+                intent = self._applied_intent()
+                outside = tempfile.mkdtemp(prefix="brain-record-outside-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                target = os.path.join(outside, "record.json")
+                if not dangling:
+                    with open(target, "w", encoding="utf-8") as fh:
+                        fh.write("sentinel\n")
+                records = self.full(".brain/journal/change_records")
+                os.makedirs(records)
+                os.symlink(target, os.path.join(records, intent["op_key"] + ".json"))
+
+                self._assert_invalid_intent_stays_open()
+                if dangling:
+                    self.assertFalse(os.path.lexists(target))
+                else:
+                    with open(target, encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), "sentinel\n")
+
+    def test_existing_change_record_name_must_hold_the_matching_regular_record(self):
+        for existing in ("fifo", "directory", "wrong_record", "valid"):
+            with self.subTest(existing=existing):
+                self.tearDown_root()
+                intent = self._applied_intent()
+                records = self.full(".brain/journal/change_records")
+                os.makedirs(records)
+                record_path = os.path.join(records, intent["op_key"] + ".json")
+                expected = {
+                    "op_key": intent["op_key"], "operation": intent["operation"],
+                    "run_id": intent["run_id"], "path": intent["path"],
+                    "sha256": intent["intended_sha256"], "prior": intent["expected_prior"],
+                }
+                if existing == "fifo":
+                    os.mkfifo(record_path)
+                elif existing == "directory":
+                    os.mkdir(record_path)
+                else:
+                    with open(record_path, "w", encoding="utf-8") as fh:
+                        json.dump(expected if existing == "valid" else {**expected, "sha256": "wrong"}, fh)
+
+                proc, report = self.recover()
+                if existing == "valid":
+                    self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+                    self.assertEqual(report["intents"][0]["finished"], ["commit"])
+                    self.assertEqual(self.intent_files(), [])
+                else:
+                    self.assertEqual((proc.returncode, report["outcome"]), (3, "target_unexpected"), report)
+                    self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+                    self.assertEqual(len(self.intent_files()), 1)
+
+    def test_255_character_op_key_is_invalid_and_writes_no_record(self):
+        intent = self._applied_intent()
+        intent["op_key"] = "a" * 255
+        with open(self._intent_file(), "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
+
+        self._assert_invalid_intent_stays_open()
+        records = self.full(".brain/journal/change_records")
+        self.assertEqual(os.listdir(records) if os.path.isdir(records) else [], [])
+
+    def test_invalid_key_forms_and_128_character_boundary(self):
+        for key in ("", "\x00", "..", "-dash", "a" * 129):
+            with self.subTest(key=repr(key)):
+                self.tearDown_root()
+                intent = self._applied_intent()
+                intent["op_key"] = key
+                with open(self._intent_file(), "w", encoding="utf-8") as fh:
+                    json.dump(intent, fh)
+                self._assert_invalid_intent_stays_open()
+        self.tearDown_root()
+        intent = self._applied_intent()
+        intent["op_key"] = "a" * 128
+        with open(self._intent_file(), "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+
+    def test_linked_intent_file_is_unreadable_and_kept(self):
+        intent = self._applied_intent()
+        path = self._intent_file()
+        outside = os.path.join(tempfile.mkdtemp(prefix="brain-outside-"), "intent.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(outside), ignore_errors=True)
+        os.replace(path, outside)
+        os.symlink(outside, path)
+        self._assert_invalid_intent_stays_open()
+        self.assertEqual(intent["op_key"], self.only_intent()["op_key"])
+
+    def test_linked_journal_ancestor_is_not_read(self):
+        self._applied_intent()
+        journal = self.full(".brain/journal")
+        outside = tempfile.mkdtemp(prefix="brain-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        os.replace(journal, os.path.join(outside, "journal"))
+        os.symlink(os.path.join(outside, "journal"), journal)
+        proc, report = self.recover()
+        self.assertEqual((proc.returncode, report), (2, {"outcome": "refused", "reason": "journal_missing"}))
+
+    def test_symlinked_brain_root_recovers_applied_intent(self):
+        self._applied_intent()
+        linked_root = os.path.join(tempfile.mkdtemp(prefix="brain-root-link-"), "root")
+        self.addCleanup(shutil.rmtree, os.path.dirname(linked_root), ignore_errors=True)
+        os.symlink(self.root, linked_root)
+        proc = support.run_brain(["recover", "--root", linked_root], env=_clean_env(), timeout=_TIMEOUT)
+        report = support.parse_single_json(proc.stdout)
+        self.assertEqual((proc.returncode, report["outcome"]), (0, "recovered"), report)
+
+    def test_op_key_traversal_is_invalid_and_writes_no_record_outside_brain(self):
+        self.fresh_brain(git=True)
+        path = "documents/probe/probe.md"
+        self.persist_killed(self.create_request(path), "after_apply")
+        intent_path = self._intent_file()
+        with open(intent_path, encoding="utf-8") as fh:
+            intent = json.load(fh)
+        outside = os.path.join(os.path.dirname(self.root), "escape-oprec-" + os.path.basename(self.root) + ".json")
+        self.addCleanup(lambda: os.path.exists(outside) and os.remove(outside))
+        intent["op_key"] = "../../../../" + os.path.basename(outside)[:-5]
+        with open(intent_path, "w", encoding="utf-8") as fh:
+            json.dump(intent, fh)
+
+        proc, report = self.recover()
+        self.assertEqual(proc.returncode, 3, report)
+        self.assertEqual(report["outcome"], "target_unexpected")
+        self.assertEqual(report["intents"][0]["reason"], "invalid_intent")
+        self.assertFalse(os.path.exists(outside))
+        self.assertEqual(self.intent_files(), [os.path.basename(intent_path)])
+        records = os.path.join(self.root, ".brain", "journal", "change_records")
+        self.assertEqual(os.listdir(records) if os.path.isdir(records) else [], [])
 
     def test_unreadable_intent_is_reported_and_kept_and_the_others_still_recover(self):
         self.fresh_brain(git=True)
